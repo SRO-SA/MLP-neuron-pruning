@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------
+# qwen_swiglu_pruning — default experiment configuration
+# ---------------------------------------------------------------
+
+# Hugging Face model identifier.
+# Falls back to the Instruct variant if the base model fails to load.
+model_name: "Qwen/Qwen2.5-0.5B"
+model_name_fallback: "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Hardware
+device: "auto"      # "auto" = CUDA if available, else CPU
+dtype: "float32"    # "float32" | "float16" | "bfloat16"
+
+# Experiment grid
+pruning_ratios:
+  - 0.0
+  - 0.05
+  - 0.10
+  - 0.20
+  - 0.30
+  - 0.40
+
+pruning_methods:
+  - random
+  - down_norm
+  - product_norm
+  - rmsnorm_bound_angle
+
+# Evaluation
+max_eval_samples: 512    # number of WikiText-2 samples used for perplexity
+max_seq_len: 512         # tokens per sample (truncated/padded)
+batch_size: 4
+
+# Output
+output_dir: "results"
+
+# Reproducibility
+seed: 42

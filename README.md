@@ -1,0 +1,200 @@
+# qwen_swiglu_pruning
+
+> **Research prototype — not a production optimisation.**
+> This project tests a static RMSNorm-bounded SwiGLU neuron pruning score for
+> structured MLP width reduction.  No novelty is claimed.
+
+---
+
+## Project goal
+
+Measure how much of a Qwen2.5-0.5B language model's MLP capacity can be
+removed statically (without training or fine-tuning) while minimising the
+impact on perplexity.
+
+The target reductions are:
+- **MLP parameter count** — fewer stored weights, smaller checkpoint
+- **Theoretical MLP FLOPs** — proportional to the surviving intermediate width
+- **Generation quality** — tracked via perplexity and greedy-decode samples
+
+---
+
+## Theory
+
+### SwiGLU MLP
+
+Each transformer layer contains a three-projection MLP:
+
+```
+g  = r · W_gate.T            # [seq, d_ff]
+u  = r · W_up.T              # [seq, d_ff]
+a  = SiLU(g) ⊙ u             # SwiGLU gating
+m  = a · W_down.T            # [seq, d_model]
+```
+
+Neuron `i`'s contribution (for a single token vector `r ∈ ℝ^d_model`) is:
+
+```
+c_i(r) = SiLU(r · w_gate_i) × (r · w_up_i) × w_down_i
+```
+
+where:
+- `w_gate_i = W_gate[i, :]`  (row i of gate_proj, shape `[d_model]`)
+- `w_up_i   = W_up[i,   :]`  (row i of up_proj,   shape `[d_model]`)
+- `w_down_i = W_down[:, i]`  (col i of down_proj, shape `[d_model]`)
+
+### RMSNorm input bound
+
+The MLP input `r` passes through a RMSNorm with learnable scale `γ`.  For any
+input `x`:
+
+```
+r_k = x_k / RMS(x) × γ_k   →   ||r||_2 ≤ R = √d_model × ||γ||_∞
+```
+
+### Proposed score (method `rmsnorm_bound_angle`)
+
+Using `|SiLU(x)| ≤ |x|` and Cauchy–Schwarz:
+
+```
+||c_i(r)|| ≤ R² × ( ||w_gate_i|| × ||w_up_i|| + |w_gate_i · w_up_i| ) / 2
+                 × ||w_down_i||
+```
+
+The `(norm_product + dot_product) / 2` term is tighter than the pure
+norm-product bound: it penalises neurons whose gate and up vectors are nearly
+**orthogonal** (small dot product → small output regardless of input norm).
+
+---
+
+## Pruning methods
+
+| ID | Name | Score formula |
+|----|------|---------------|
+| A  | `random`              | Uniform random (baseline) |
+| B  | `down_norm`           | `‖w_down_i‖` |
+| C  | `product_norm`        | `‖w_gate_i‖ × ‖w_up_i‖ × ‖w_down_i‖` |
+| D  | `rmsnorm_bound_angle` | `R² × (‖w_gate_i‖ × ‖w_up_i‖ + |w_gate_i · w_up_i|) / 2 × ‖w_down_i‖` |
+
+Neurons with the **lowest score** are pruned first.
+
+---
+
+## File layout
+
+```
+qwen_swiglu_pruning/
+├── run_experiment.py      ← single entry point
+├── requirements.txt
+├── configs/
+│   └── default.yaml       ← all hyperparameters live here
+├── src/
+│   ├── model_utils.py     ← load model, get_mlp_weights, count_parameters
+│   ├── scoring.py         ← compute_scores, get_keep_indices
+│   ├── pruning.py         ← prune_layer_mlp, prune_model
+│   ├── evaluation.py      ← evaluate_perplexity, run_generation_tests
+│   ├── flops.py           ← estimate_mlp_flops
+│   └── diagnostics.py     ← per-layer MLP norm logging (no pruning)
+├── results/               ← CSV + JSON output written here
+└── scripts/
+    └── run_qwen05b.sh     ← convenience shell wrapper
+```
+
+---
+
+## Install
+
+```bash
+# Python 3.10+, CUDA optional
+pip install -r requirements.txt
+```
+
+The script downloads `Qwen/Qwen2.5-0.5B` from the HuggingFace Hub on first
+run (~1 GB).  Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` if you
+have already cached the model locally.
+
+---
+
+## Run
+
+### Full experiment (all methods × all ratios)
+
+```bash
+python run_experiment.py --config configs/default.yaml
+```
+
+Or using the shell script:
+
+```bash
+bash scripts/run_qwen05b.sh
+```
+
+### Quick smoke test (one method, two ratios)
+
+```bash
+python run_experiment.py --config configs/default.yaml \
+    --methods rmsnorm_bound_angle \
+    --pruning-ratios 0.0 0.2
+```
+
+### Diagnostic mode (no pruning — logs per-layer MLP output norms)
+
+```bash
+python run_experiment.py --config configs/default.yaml --diagnostics-only
+```
+
+### Override device / dtype inline
+
+Edit `configs/default.yaml` or pass a modified config.
+
+---
+
+## Expected outputs
+
+After a run, the `results/` directory will contain:
+
+```
+results/
+├── results_YYYYMMDD_HHMMSS.csv   ← summary table (one row per run)
+├── results_YYYYMMDD_HHMMSS.json  ← full results incl. generation examples
+└── generations_YYYYMMDD_HHMMSS.json  ← per-prompt generated text
+```
+
+The CSV columns are:
+
+```
+model_name, pruning_method, pruning_ratio,
+total_params_before, total_params_after,
+mlp_params_before, mlp_params_after, mlp_params_reduction_pct,
+mlp_flops_before, mlp_flops_after, mlp_flops_reduction_pct,
+perplexity, perplexity_delta, forward_pass_ok, notes
+```
+
+---
+
+## What to expect (rough ballpark)
+
+| Ratio | PPL increase (typical) | MLP FLOP reduction |
+|-------|------------------------|--------------------|
+| 5%    | ~0.1–0.5               | ~5%                |
+| 10%   | ~0.5–2.0               | ~10%               |
+| 20%   | ~2.0–10                | ~20%               |
+| 30%   | may diverge            | ~30%               |
+
+The proposed `rmsnorm_bound_angle` method is expected to outperform `random`
+and roughly match or beat `down_norm` at low-to-moderate ratios.
+
+---
+
+## Limitations / caveats
+
+- **No fine-tuning.** Accuracy degrades monotonically with pruning ratio.
+  Recovery requires at least a few steps of post-pruning training.
+- **Static scores only.** No activation statistics are used.  Dynamic or
+  calibration-based scores (e.g. Wanda, SparseGPT) typically perform better.
+- **Uniform per-layer pruning.** The same ratio is applied to every layer.
+  Layer-adaptive allocation (e.g. sensitivity-based) is left for future work.
+- **Small model.** Qwen2.5-0.5B is relatively small; larger models tend to be
+  more compressible.
+- This is a **research prototype**.  No stability guarantees.  Do not use in
+  production.
