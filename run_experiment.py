@@ -42,7 +42,7 @@ from src.bound_analysis import (
     run_bound_ppl_mode,
     run_activation_verification_mode,
 )
-from src.merging import run_bound_merge_mode
+from src.merging import run_bound_merge_mode, run_debug_merge_mode
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
@@ -185,6 +185,11 @@ def run_experiment(cfg: Dict, args) -> None:
     # ── BOUND MERGE MODE ───────────────────────────────────────────────────────
     if args.bound_merge:
         run_bound_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── DEBUG MERGE MODE ───────────────────────────────────────────────────────
+    if args.debug_merge:
+        run_debug_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── DEBUG MODE ─────────────────────────────────────────────────────────────
@@ -405,9 +410,18 @@ def parse_args():
     p.add_argument(
         "--bound-merge", action="store_true",
         help=(
-            "Compare pure_delete vs merge_weight_similarity vs merge_activation_similarity\n"
+            "Compare pure_delete vs merge_weight vs merge_activation vs down_reconstruction\n"
             "for cumulative-budget candidates at alpha=1e-4/1e-3/1e-2.\n"
             "Saves PPL comparison table and per-neuron diagnostics."
+        ),
+    )
+    p.add_argument(
+        "--debug-merge", action="store_true",
+        help=(
+            "Diagnose merging quality WITHOUT running PPL.\n"
+            "Reports: beta statistics, down-proj update magnitudes,\n"
+            "isolated per-layer MLP reconstruction errors,\n"
+            "end-to-end logit diffs, end-to-end MLP output errors."
         ),
     )
     p.add_argument(
@@ -422,11 +436,11 @@ def parse_args():
     # ── Modifiers for --bound-analysis ──────────────────────────────────────
     p.add_argument(
         "--no-ppl", action="store_true",
-        help="(--bound-analysis only) Skip PPL experiments; show distributions and count tables only.",
+        help="(--bound-analysis only) Skip PPL; show distributions and count tables only.",
     )
     p.add_argument(
         "--no-activation-verification", action="store_true",
-        help="(--bound-analysis only) Run PPL experiments but skip activation verification.",
+        help="(--bound-analysis only) Run PPL but skip activation verification.",
     )
 
     # ── Main experiment overrides ────────────────────────────────────────────

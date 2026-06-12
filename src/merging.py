@@ -1,7 +1,7 @@
 """
 merging.py
 ==========
-Compensated neuron merging for SwiGLU MLP pruning.
+Compensated neuron merging and down-projection reconstruction for SwiGLU MLP pruning.
 
 MOTIVATION
 ----------
@@ -20,29 +20,30 @@ So we can remove i and compensate by updating d_j BEFORE physical pruning:
 This conserves the linear part of the output transformation at the cost of
 a small approximation error from the nonlinear activation.
 
-TWO MERGE STRATEGIES
---------------------
+MERGE STRATEGIES
+----------------
 A. merge_weight_similarity
-   Find the best target j using weight-space distance:
-     beta_u = (u_i · u_j) / (||u_j||² + ε)
-     dist   = ||g_i − g_j|| / (||g_i|| + ε)
-            + ||u_i − beta_u · u_j|| / (||u_i|| + ε)
-   The second term is the residual after projecting u_i onto u_j's direction.
+   beta_u = (u_i · u_j) / (||u_j||² + ε)
+   dist   = ||g_i − g_j|| / (||g_i|| + ε) + ||u_i − beta_u·u_j|| / (||u_i|| + ε)
 
 B. merge_activation_similarity
-   Collect actual MLP-input hidden states {r_t} from calibration data.
-   Compute activation vectors: a_i = SiLU(R @ g_i) * (R @ u_i)  [N_tokens]
-     beta_a    = (a_i · a_j) / (||a_j||² + ε)
-     residual  = ||a_i − beta_a · a_j|| / (||a_i|| + ε)
-   Choose j with smallest residual.
+   beta_a = (a_i · a_j) / (||a_j||² + ε)  where a_i = SiLU(R@g_i)*(R@u_i) over calibration
 
-PHYSICAL PRUNING
-----------------
-In both cases, after all compensation updates are applied (accumulating multiple
-merges onto the same target), prune_model_by_layer_indices() does the physical
-removal — dropping the pruned neurons' rows from gate/up and columns from down.
+RECONSTRUCTION STRATEGY
+-----------------------
+C. down_reconstruction
+   Let A = SiLU(R @ W_gate.T) * (R @ W_up.T)  [N, d_ff]   (all neurons, original weights)
+       Y = A @ W_down.T                          [N, d_model] (original MLP output)
+   After selecting keep set K:
+       A_K = A[:, K]                             [N, k]
+   Find B [k, d_model] minimising ||A_K @ B - Y||²
 
-KEY: All down_proj compensation updates are applied BEFORE any physical pruning.
+   Variants:
+     lstsq  — minimum-norm least squares (via torch.linalg.lstsq)
+     ridge  — ridge regression at lambda ∈ {1e-6, 1e-5, 1e-4, 1e-3}
+              Uses kernel trick (N×N inversion) when N < k for efficiency.
+
+KEY: All down_proj updates are applied BEFORE any physical pruning.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ import json
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -71,7 +72,7 @@ EPS = 1e-8
 
 
 # ===========================================================================
-# Calibration data collection
+# Calibration data collection — inputs
 # ===========================================================================
 
 def collect_mlp_inputs(
@@ -82,8 +83,8 @@ def collect_mlp_inputs(
     max_seq_len: int = 128,
 ) -> List[torch.Tensor]:
     """
-    Collect MLP input hidden states (post-RMSNorm) for all transformer layers
-    by registering forward pre-hooks.
+    Collect MLP input hidden states (post-RMSNorm) for all transformer layers.
+    Uses register_forward_pre_hook — 2-arg signature: hook(module, inputs).
 
     Returns
     -------
@@ -105,9 +106,7 @@ def collect_mlp_inputs(
             )
         model.eval()
         with torch.no_grad():
-            for prompt in tqdm(
-                prompts, desc="  Collecting calibration states", leave=False
-            ):
+            for prompt in tqdm(prompts, desc="  Collecting calibration inputs", leave=False):
                 enc = tokenizer(
                     prompt, return_tensors="pt",
                     truncation=True, max_length=max_seq_len,
@@ -132,6 +131,65 @@ def collect_mlp_inputs(
 
 
 # ===========================================================================
+# Calibration data collection — outputs
+# ===========================================================================
+
+def collect_mlp_outputs(
+    model,
+    tokenizer,
+    prompts: List[str],
+    device: str,
+    max_seq_len: int = 128,
+) -> List[torch.Tensor]:
+    """
+    Collect MLP output tensors for all transformer layers.
+    Uses register_forward_hook — 3-arg signature: hook(module, inputs, output).
+
+    Returns
+    -------
+    List[Tensor]  —  one [N_tokens, d_model] float32 CPU tensor per layer.
+    """
+    layers   = get_transformer_layers(model)
+    n_layers = len(layers)
+    captured = [[] for _ in range(n_layers)]
+    handles  = []
+
+    try:
+        for idx, layer in enumerate(layers):
+            def _make_hook(i):
+                def _hook(module, inputs, output):
+                    captured[i].append(output.detach().float().cpu())
+                return _hook
+            handles.append(
+                get_mlp_module(layer).register_forward_hook(_make_hook(idx))
+            )
+        model.eval()
+        with torch.no_grad():
+            for prompt in tqdm(prompts, desc="  Collecting calibration outputs", leave=False):
+                enc = tokenizer(
+                    prompt, return_tensors="pt",
+                    truncation=True, max_length=max_seq_len,
+                ).to(device)
+                model(**enc)
+    finally:
+        for h in handles:
+            h.remove()
+
+    result = []
+    for i in range(n_layers):
+        if captured[i]:
+            all_out = torch.cat(
+                [x.reshape(-1, x.shape[-1]) for x in captured[i]], dim=0
+            )
+        else:
+            w = get_mlp_weights(layers[i])
+            all_out = torch.zeros(1, w["d_model"])
+        result.append(all_out)
+
+    return result
+
+
+# ===========================================================================
 # Merge target selection
 # ===========================================================================
 
@@ -142,20 +200,15 @@ def compute_merge_assignments_weight(
     eps: float = EPS,
 ) -> List[dict]:
     """
-    For each pruned neuron i, find the best kept neuron j using weight-space
-    similarity, then compute beta_u for the down-projection update.
+    For each pruned neuron i, find the best kept neuron j by weight-space distance.
 
         beta_u  = (u_i · u_j) / (||u_j||² + ε)
         dist(i,j) = ||g_i − g_j|| / (||g_i|| + ε)
                   + ||u_i − beta_u · u_j|| / (||u_i|| + ε)
 
-    The update rule is:  down_proj[:, j] += beta_u * down_proj[:, i]
+    Update rule:  down_proj[:, j] += beta_u * down_proj[:, i]
 
-    All computations are fully vectorised over (n_prune × n_keep) pairs.
-
-    Returns
-    -------
-    List[dict] with keys: i, j, beta, dist
+    Returns List[dict] with keys: i, j, beta, dist
     """
     if len(prune_indices) == 0:
         return []
@@ -164,59 +217,49 @@ def compute_merge_assignments_weight(
     w_gate = w["gate"].detach().float().cpu()   # [d_ff, d_model]
     w_up   = w["up"].detach().float().cpu()     # [d_ff, d_model]
 
-    G_prune = w_gate[prune_indices]    # [n_prune, d_model]
-    U_prune = w_up[prune_indices]      # [n_prune, d_model]
-    G_keep  = w_gate[keep_indices]     # [n_keep,  d_model]
-    U_keep  = w_up[keep_indices]       # [n_keep,  d_model]
+    G_prune = w_gate[prune_indices]
+    U_prune = w_up[prune_indices]
+    G_keep  = w_gate[keep_indices]
+    U_keep  = w_up[keep_indices]
 
-    n_prune = G_prune.shape[0]
     prune_list = prune_indices.tolist()
     keep_list  = keep_indices.tolist()
+    n_prune    = len(prune_list)
 
-    norms_g_p = G_prune.norm(dim=1)    # [n_prune]
-    norms_g_k = G_keep.norm(dim=1)     # [n_keep]
-    norms_u_p = U_prune.norm(dim=1)    # [n_prune]
-    norms_u_k = U_keep.norm(dim=1)     # [n_keep]
+    norms_g_p  = G_prune.norm(dim=1)
+    norms_g_k  = G_keep.norm(dim=1)
+    norms_u_p  = U_prune.norm(dim=1)
+    norms_u_k  = U_keep.norm(dim=1)
+    norms_u_ksq = norms_u_k ** 2
 
-    # ── Gate distance ─────────────────────────────────────────────────────────
-    # ||g_i − g_j||² = ||g_i||² + ||g_j||² − 2·(g_i·g_j)
-    dots_g    = G_prune @ G_keep.T                          # [n_prune, n_keep]
+    # Gate distance (vectorised)
+    dots_g    = G_prune @ G_keep.T
     dist_g_sq = (
-        norms_g_p.unsqueeze(1) ** 2
-        + norms_g_k.unsqueeze(0) ** 2
-        - 2.0 * dots_g
+        norms_g_p.unsqueeze(1) ** 2 + norms_g_k.unsqueeze(0) ** 2 - 2.0 * dots_g
     ).clamp(min=0.0)
-    dist_g_norm = dist_g_sq.sqrt() / (norms_g_p.unsqueeze(1) + eps)  # [n_prune, n_keep]
+    dist_g_norm = dist_g_sq.sqrt() / (norms_g_p.unsqueeze(1) + eps)
 
-    # ── Up residual distance ──────────────────────────────────────────────────
-    # beta_u[i,j] = (u_i·u_j) / (||u_j||² + ε)
-    # ||u_i − beta_u·u_j||² = ||u_i||² − 2·beta_u·(u_i·u_j) + beta_u²·||u_j||²
-    dots_u     = U_prune @ U_keep.T                         # [n_prune, n_keep]
-    norms_u_ksq = norms_u_k ** 2                            # [n_keep]
-    betas_u    = dots_u / (norms_u_ksq.unsqueeze(0) + eps)  # [n_prune, n_keep]
-
+    # Up residual distance (vectorised, no O(n²d) memory)
+    dots_u   = U_prune @ U_keep.T
+    betas_u  = dots_u / (norms_u_ksq.unsqueeze(0) + eps)
     dist_u_sq = (
         norms_u_p.unsqueeze(1) ** 2
         - 2.0 * betas_u * dots_u
         + betas_u ** 2 * norms_u_ksq.unsqueeze(0)
     ).clamp(min=0.0)
-    dist_u_norm = dist_u_sq.sqrt() / (norms_u_p.unsqueeze(1) + eps)   # [n_prune, n_keep]
+    dist_u_norm = dist_u_sq.sqrt() / (norms_u_p.unsqueeze(1) + eps)
 
-    total_dist    = dist_g_norm + dist_u_norm      # [n_prune, n_keep]
-    best_j_local  = total_dist.argmin(dim=1)       # [n_prune]
+    total_dist   = dist_g_norm + dist_u_norm
+    best_j_local = total_dist.argmin(dim=1)
 
     assignments = []
     for idx in range(n_prune):
         jl   = int(best_j_local[idx])
-        i_g  = prune_list[idx]
-        j_g  = keep_list[jl]
-        beta = float(betas_u[idx, jl])
-        dist = float(total_dist[idx, jl])
         assignments.append({
-            "i":    i_g,
-            "j":    j_g,
-            "beta": round(beta, 8),
-            "dist": round(dist, 8),
+            "i":    prune_list[idx],
+            "j":    keep_list[jl],
+            "beta": round(float(betas_u[idx, jl]), 8),
+            "dist": round(float(total_dist[idx, jl]), 8),
         })
 
     return assignments
@@ -230,83 +273,64 @@ def compute_merge_assignments_activation(
     eps:           float = EPS,
 ) -> List[dict]:
     """
-    For each pruned neuron i, find the best kept neuron j using activation-space
-    similarity from calibration data.
+    For each pruned neuron i, find the best kept neuron j by activation-space similarity.
 
-    Activation vector for neuron i over calibration tokens:
-        a_i = SiLU(R @ g_i) * (R @ u_i)   shape [N_tokens]
-
+        a_i = SiLU(R @ g_i) * (R @ u_i)   [N_tokens]
         beta_a  = (a_i · a_j) / (||a_j||² + ε)
         residual = ||a_i − beta_a · a_j|| / (||a_i|| + ε)
 
-    The update rule is:  down_proj[:, j] += beta_a * down_proj[:, i]
+    Update rule:  down_proj[:, j] += beta_a * down_proj[:, i]
 
-    Parameters
-    ----------
-    all_r : [N_tokens, d_model] CPU float32 tensor of MLP inputs from calibration.
-
-    Returns
-    -------
-    List[dict] with keys: i, j, beta, residual
+    Parameters: all_r [N_tokens, d_model] CPU float32 MLP inputs from calibration.
+    Returns List[dict] with keys: i, j, beta, residual
     """
     if len(prune_indices) == 0:
         return []
 
     w = get_mlp_weights(layer)
-    w_gate = w["gate"].detach().float().cpu()   # [d_ff, d_model]
-    w_up   = w["up"].detach().float().cpu()     # [d_ff, d_model]
+    w_gate = w["gate"].detach().float().cpu()
+    w_up   = w["up"].detach().float().cpu()
 
     prune_list = prune_indices.tolist()
     keep_list  = keep_indices.tolist()
     n_prune    = len(prune_list)
 
-    R = all_r.float().cpu()    # [N_tokens, d_model]
+    R = all_r.float().cpu()
 
-    # Compute activations for all neurons: [N_tokens, d_ff]
-    # Then select prune / keep subsets.
     with torch.no_grad():
-        G_all = R @ w_gate.T   # [N_tokens, d_ff]
-        U_all = R @ w_up.T     # [N_tokens, d_ff]
-        A_all = F.silu(G_all) * U_all   # [N_tokens, d_ff]
+        A_all = F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N, d_ff]
 
-    A_prune = A_all[:, prune_indices]   # [N_tokens, n_prune]
-    A_keep  = A_all[:, keep_indices]    # [N_tokens, n_keep]
+    A_prune = A_all[:, prune_indices]   # [N, n_prune]
+    A_keep  = A_all[:, keep_indices]    # [N, n_keep]
 
-    # beta_a[i,j] = (a_i · a_j) / (||a_j||² + ε)
-    dots_a      = A_prune.T @ A_keep                     # [n_prune, n_keep]
-    norms_k_sq  = A_keep.norm(dim=0) ** 2                # [n_keep]
-    betas_a     = dots_a / (norms_k_sq.unsqueeze(0) + eps)  # [n_prune, n_keep]
+    dots_a      = A_prune.T @ A_keep
+    norms_k_sq  = A_keep.norm(dim=0) ** 2
+    betas_a     = dots_a / (norms_k_sq.unsqueeze(0) + eps)
 
-    # ||a_i − beta·a_j||² = ||a_i||² − 2·beta·(a_i·a_j) + beta²·||a_j||²
-    norms_p     = A_prune.norm(dim=0)                    # [n_prune]
+    norms_p     = A_prune.norm(dim=0)
     residual_sq = (
         norms_p.unsqueeze(1) ** 2
         - 2.0 * betas_a * dots_a
         + betas_a ** 2 * norms_k_sq.unsqueeze(0)
     ).clamp(min=0.0)
-
-    residual_norm = residual_sq.sqrt() / (norms_p.unsqueeze(1) + eps)  # [n_prune, n_keep]
-    best_j_local  = residual_norm.argmin(dim=1)   # [n_prune]
+    residual_norm = residual_sq.sqrt() / (norms_p.unsqueeze(1) + eps)
+    best_j_local  = residual_norm.argmin(dim=1)
 
     assignments = []
     for idx in range(n_prune):
-        jl       = int(best_j_local[idx])
-        i_g      = prune_list[idx]
-        j_g      = keep_list[jl]
-        beta     = float(betas_a[idx, jl])
-        residual = float(residual_norm[idx, jl])
+        jl = int(best_j_local[idx])
         assignments.append({
-            "i":        i_g,
-            "j":        j_g,
-            "beta":     round(beta, 8),
-            "residual": round(residual, 8),
+            "i":        prune_list[idx],
+            "j":        keep_list[jl],
+            "beta":     round(float(betas_a[idx, jl]), 8),
+            "residual": round(float(residual_norm[idx, jl]), 8),
         })
 
     return assignments
 
 
 # ===========================================================================
-# Apply compensation and prune
+# Apply compensation and prune (pairwise merge)
 # ===========================================================================
 
 def apply_merge_and_prune(
@@ -316,28 +340,15 @@ def apply_merge_and_prune(
     label: str = "",
 ) -> Tuple[object, dict]:
     """
-    Apply beta compensation updates to down_proj, then physically prune.
+    Accumulate beta compensation on down_proj, then physically prune.
 
-    Steps
-    -----
-    1. Deep-copy the model.
-    2. For each layer: for each (i, j, beta) accumulate
-           down_proj[:, j] += beta * down_proj[:, i]
-       across ALL assignments BEFORE physical removal.
-    3. Call prune_model_by_layer_indices() to physically remove pruned neurons.
+    Multiple pruned neurons can target the same j — accumulation is safe
+    because we always read prune columns and write keep columns (no aliasing).
 
-    IMPORTANT: Multiple pruned neurons can merge into the same kept target j.
-    The updates are additive and order-independent (we only read prune columns,
-    only write keep columns, so there is no aliasing).
-
-    Returns
-    -------
-    pruned_model : model with compensated down_proj and neurons physically removed
-    info         : dict from prune_model_by_layer_indices
+    Returns (pruned_model, info).
     """
     from .pruning import prune_model_by_layer_indices
 
-    # Step 1: Clone the original model so we can modify down_proj safely
     merged = clone_model(model)
     layers = get_transformer_layers(merged)
 
@@ -347,26 +358,173 @@ def apply_merge_and_prune(
         ):
             if len(pi) == 0 or not assignments:
                 continue
-
             w    = get_mlp_weights(layer)
-            down = w["down"]  # [d_model, d_ff]  — actual parameter tensor
-
-            # Accumulate all compensation updates before any removal
+            down = w["down"]
             for asn in assignments:
-                i_g  = asn["i"]
-                j_g  = asn["j"]
-                beta = asn["beta"]
-                # Clone the source column to avoid aliasing
-                # (safe because i_g is always in prune_indices, never updated)
-                col_i = down.data[:, i_g].clone()
-                down.data[:, j_g].add_(beta * col_i)
+                col_i = down.data[:, asn["i"]].clone()
+                down.data[:, asn["j"]].add_(asn["beta"] * col_i)
 
-    # Step 2: Physically prune (prune_model_by_layer_indices clones merged internally)
     pruned_model, info = prune_model_by_layer_indices(
         merged, prune_indices_per_layer, label=label
     )
-
     del merged
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return pruned_model, info
+
+
+# ===========================================================================
+# Down-projection reconstruction (new)
+# ===========================================================================
+
+def _compute_reconstruction_for_layer(
+    layer,
+    r:            torch.Tensor,        # [N, d_model] calibration MLP inputs
+    keep_indices: torch.Tensor,        # [k] keep neuron indices
+    method:       str   = "lstsq",
+    ridge_lambda: float = 1e-5,
+    eps:          float = EPS,
+) -> Tuple[torch.Tensor, dict]:
+    """
+    Solve for new down_proj weights B [k, d_model] that best reconstruct
+    the ORIGINAL layer's MLP output from only the surviving neurons.
+
+    Setup
+    -----
+    A  = SiLU(R @ W_gate.T) * (R @ W_up.T)   [N, d_ff]   (original weights)
+    Y  = A @ W_down.T                          [N, d_model] (original output)
+    A_K = A[:, keep_indices]                   [N, k]
+
+    Goal: min_B  ||A_K @ B - Y||²
+
+    Methods
+    -------
+    lstsq : minimum-norm least squares via torch.linalg.lstsq
+    ridge : B = A_K.T @ (A_K @ A_K.T + λI)^{-1} @ Y   (kernel trick, N×N)
+            equivalent to (A_K.T A_K + λI)^{-1} A_K.T Y but cheaper when N < k.
+
+    Sanity info returned
+    --------------------
+    delete_relative_err : ||Y - A_K W_down_K.T|| / ||Y||  (pure deletion baseline)
+    recon_relative_err  : ||Y - A_K B|| / ||Y||            (after reconstruction)
+    improvement_pct     : relative improvement over deletion
+    """
+    w = get_mlp_weights(layer)
+    w_gate = w["gate"].detach().float().cpu()   # [d_ff, d_model]
+    w_up   = w["up"].detach().float().cpu()
+    w_down = w["down"].detach().float().cpu()   # [d_model, d_ff]
+
+    R = r.float().cpu()     # [N, d_model]
+    N = R.shape[0]
+    k = keep_indices.shape[0]
+
+    with torch.no_grad():
+        A   = F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N, d_ff]
+        Y   = A @ w_down.T                           # [N, d_model]
+        A_K = A[:, keep_indices]                     # [N, k]
+
+        # Deletion baseline
+        Y_del    = A_K @ w_down[:, keep_indices].T   # [N, d_model]
+        del_err  = float((Y - Y_del).norm() / (Y.norm() + eps))
+
+        if method == "lstsq":
+            result = torch.linalg.lstsq(A_K, Y, rcond=None)
+            B = result.solution   # [k, d_model]
+
+        elif method.startswith("ridge"):
+            if N < k:
+                # Kernel (dual) form: N×N inversion — efficient when N << k
+                AAt  = A_K @ A_K.T                                    # [N, N]
+                reg  = ridge_lambda * torch.eye(N, dtype=AAt.dtype)
+                coeffs = torch.linalg.solve(AAt + reg, Y)             # [N, d_model]
+                B    = A_K.T @ coeffs                                  # [k, d_model]
+            else:
+                # Primal form: k×k inversion
+                AtA  = A_K.T @ A_K                                    # [k, k]
+                AtY  = A_K.T @ Y                                       # [k, d_model]
+                reg  = ridge_lambda * torch.eye(k, dtype=AtA.dtype)
+                B    = torch.linalg.solve(AtA + reg, AtY)             # [k, d_model]
+        else:
+            raise ValueError(f"Unknown reconstruction method: {method}")
+
+        # Sanity check
+        Y_hat     = A_K @ B                                           # [N, d_model]
+        recon_err = float((Y - Y_hat).norm() / (Y.norm() + eps))
+
+    sanity = {
+        "N_tokens":           N,
+        "k_kept":             k,
+        "delete_relative_err": round(del_err, 6),
+        "recon_relative_err":  round(recon_err, 6),
+        "improvement_pct":    round(100.0 * (del_err - recon_err) / (del_err + eps), 2),
+    }
+    return B, sanity
+
+
+def apply_down_reconstruction(
+    model,
+    prune_indices_per_layer:  List[torch.Tensor],
+    keep_indices_per_layer:   List[torch.Tensor],
+    all_r_per_layer:          List[torch.Tensor],
+    method:                   str   = "lstsq",
+    ridge_lambda:             float = 1e-5,
+    eps:                      float = EPS,
+) -> Tuple[object, dict]:
+    """
+    Prune gate/up rows and refit down_proj weights via least squares.
+
+    Steps
+    -----
+    1. Clone model.
+    2. For each layer: compute optimal B [k, d_model] on calibration data,
+       set clone.down_proj.weight[:, keep_indices] = B.T.
+    3. Call prune_model_by_layer_indices on the clone (selects keep columns).
+
+    The clone's down_proj for pruned columns is irrelevant (they get removed).
+    Only keep_indices columns matter, and they now hold the reconstructed weights.
+
+    Returns (pruned_model, info) where info["sanity_per_layer"] has per-layer errors.
+    """
+    from .pruning import prune_model_by_layer_indices
+
+    recon_clone = clone_model(model)
+    orig_layers  = get_transformer_layers(model)
+    clone_layers = get_transformer_layers(recon_clone)
+
+    sanity_per_layer = []
+
+    with torch.no_grad():
+        for layer_idx, (orig_l, clone_l, pi, ki, r) in enumerate(
+            zip(orig_layers, clone_layers,
+                prune_indices_per_layer, keep_indices_per_layer, all_r_per_layer)
+        ):
+            if len(pi) == 0:
+                sanity_per_layer.append({"layer_idx": layer_idx, "n_pruned": 0})
+                continue
+            if len(ki) == 0:
+                sanity_per_layer.append({"layer_idx": layer_idx, "note": "all neurons pruned"})
+                continue
+
+            B, sanity = _compute_reconstruction_for_layer(
+                orig_l, r, ki, method=method, ridge_lambda=ridge_lambda, eps=eps
+            )
+            sanity["layer_idx"] = layer_idx
+            sanity_per_layer.append(sanity)
+
+            # Set clone's down_proj columns for keep_indices to B.T
+            # prune_model_by_layer_indices will then select exactly these columns.
+            w_clone = get_mlp_weights(clone_l)
+            down    = w_clone["down"]       # [d_model, d_ff]  (actual param ref)
+            B_T = B.T.to(dtype=down.dtype).to(device=down.device)  # [d_model, k]
+            down.data[:, ki] = B_T
+
+    pruned_model, info = prune_model_by_layer_indices(
+        recon_clone, prune_indices_per_layer,
+        label=f"recon_{method}",
+    )
+    info["sanity_per_layer"] = sanity_per_layer
+
+    del recon_clone
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -374,85 +532,483 @@ def apply_merge_and_prune(
 
 
 # ===========================================================================
-# Diagnostics
+# Diagnostic helpers for --debug-merge
 # ===========================================================================
 
-def _build_layer_diagnostics(
-    all_scores:              List[torch.Tensor],
-    prune_indices_per_layer: List[torch.Tensor],
-    assignments_per_layer:   List[List[dict]],
-) -> List[dict]:
-    """Build per-layer and per-neuron diagnostic summary for a merge method."""
-    layers_diag = []
+def _debug_beta_stats(all_asns_per_layer: List[List[dict]]) -> dict:
+    """Aggregate beta statistics across all layers."""
+    betas = [
+        asn["beta"]
+        for layer_asns in all_asns_per_layer
+        for asn in layer_asns
+    ]
+    if not betas:
+        return {"n": 0}
 
+    bt = torch.tensor(betas, dtype=torch.float32)
+    abt = bt.abs()
+    sorted_abs = abt.sort().values
+    n = len(betas)
+    return {
+        "n":              n,
+        "mean_beta":      round(float(bt.mean()), 6),
+        "mean_abs_beta":  round(float(abt.mean()), 6),
+        "median_abs_beta": round(float(sorted_abs[n // 2]), 6),
+        "max_abs_beta":   round(float(abt.max()), 6),
+        "pct_lt_1e-6":    round(100.0 * float((abt < 1e-6).sum()) / n, 2),
+        "pct_lt_1e-4":    round(100.0 * float((abt < 1e-4).sum()) / n, 2),
+        "pct_lt_1e-2":    round(100.0 * float((abt < 1e-2).sum()) / n, 2),
+        "pct_lt_0.1":     round(100.0 * float((abt < 0.1).sum()) / n, 2),
+    }
+
+
+def _debug_update_magnitudes(
+    layers,
+    all_asns_per_layer: List[List[dict]],
+    eps: float = EPS,
+) -> dict:
+    """
+    For each assignment (i → j with beta), compute the down_proj column update:
+        update_j += beta * d_i
+
+    Accumulate updates for all pruned neurons targeting the same j,
+    then report statistics on ||update_j|| and ||update_j|| / ||d_j||.
+    """
+    all_abs_update_norms  = []
+    all_relative_updates  = []
+
+    for layer, asns in zip(layers, all_asns_per_layer):
+        if not asns:
+            continue
+        w    = get_mlp_weights(layer)
+        down = w["down"].detach().float().cpu()  # [d_model, d_ff]
+
+        # Accumulate updates per target
+        updates: defaultdict = defaultdict(lambda: torch.zeros(down.shape[0]))
+        for asn in asns:
+            updates[asn["j"]] += asn["beta"] * down[:, asn["i"]].clone()
+
+        for j, upd in updates.items():
+            u_norm = float(upd.norm())
+            d_norm = float(down[:, j].norm())
+            all_abs_update_norms.append(u_norm)
+            all_relative_updates.append(u_norm / (d_norm + eps))
+
+    if not all_abs_update_norms:
+        return {"n_targets": 0}
+
+    un = torch.tensor(all_abs_update_norms)
+    rn = torch.tensor(all_relative_updates)
+    return {
+        "n_targets":          len(all_abs_update_norms),
+        "mean_update_norm":   round(float(un.mean()), 6),
+        "median_update_norm": round(float(un.median()), 6),
+        "max_update_norm":    round(float(un.max()), 6),
+        "mean_rel_update":    round(float(rn.mean()), 6),
+        "median_rel_update":  round(float(rn.median()), 6),
+    }
+
+
+def _debug_isolated_layer_comparison(
+    layers,
+    prune_indices_per_layer: List[torch.Tensor],
+    keep_indices_per_layer:  List[torch.Tensor],
+    all_r_per_layer:         List[torch.Tensor],
+    weight_asns_per_layer:   List[List[dict]],
+    act_asns_per_layer:      List[List[dict]],
+    eps: float = EPS,
+) -> List[dict]:
+    """
+    For each layer: compute MLP outputs for original, pure_delete, merge_weight,
+    merge_activation on the SAME calibration inputs. This is the 'fair' per-layer
+    comparison that isolates reconstruction quality from error accumulation
+    across layers.
+
+    Returns list of per-layer dicts with relative errors.
+    """
+    layer_results = []
+
+    for layer_idx, (layer, pi, ki, r, w_asns, a_asns) in enumerate(zip(
+        layers, prune_indices_per_layer, keep_indices_per_layer,
+        all_r_per_layer, weight_asns_per_layer, act_asns_per_layer,
+    )):
+        if len(pi) == 0:
+            layer_results.append({"layer_idx": layer_idx, "n_pruned": 0})
+            continue
+
+        w      = get_mlp_weights(layer)
+        w_gate = w["gate"].detach().float().cpu()
+        w_up   = w["up"].detach().float().cpu()
+        w_down = w["down"].detach().float().cpu()   # [d_model, d_ff]
+
+        R = r.float().cpu()
+
+        with torch.no_grad():
+            A   = F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N, d_ff]
+            Y   = A @ w_down.T                           # [N, d_model]
+            Y_norm = float(Y.norm()) + eps
+
+            # Pure deletion
+            A_K    = A[:, ki]
+            Y_del  = A_K @ w_down[:, ki].T
+            del_err = float((Y - Y_del).norm()) / Y_norm
+
+            # Merge weight
+            w_down_mw = w_down.clone()
+            for asn in w_asns:
+                col_i = w_down_mw[:, asn["i"]].clone()
+                w_down_mw[:, asn["j"]].add_(asn["beta"] * col_i)
+            Y_mw   = A_K @ w_down_mw[:, ki].T
+            mw_err = float((Y - Y_mw).norm()) / Y_norm
+
+            # Merge activation
+            w_down_ma = w_down.clone()
+            for asn in a_asns:
+                col_i = w_down_ma[:, asn["i"]].clone()
+                w_down_ma[:, asn["j"]].add_(asn["beta"] * col_i)
+            Y_ma   = A_K @ w_down_ma[:, ki].T
+            ma_err = float((Y - Y_ma).norm()) / Y_norm
+
+        layer_results.append({
+            "layer_idx":          layer_idx,
+            "n_pruned":           int(len(pi)),
+            "delete_rel_err":     round(del_err, 6),
+            "merge_weight_rel_err":  round(mw_err, 6),
+            "merge_act_rel_err":  round(ma_err, 6),
+            "weight_vs_delete":   round(100.0 * (del_err - mw_err) / (del_err + eps), 2),
+            "act_vs_delete":      round(100.0 * (del_err - ma_err) / (del_err + eps), 2),
+        })
+
+    return layer_results
+
+
+def _debug_logit_comparison(
+    model_dict:  Dict[str, object],
+    tokenizer,
+    device:      str,
+    test_prompt: str = "The capital of France is",
+) -> dict:
+    """
+    Run each model through test_prompt and compare final-token logits.
+
+    model_dict: {"original": model, "pure_delete": model, ...}
+    Returns dict with ||logits_a - logits_b|| norms for all pairs vs. original.
+    """
+    enc = tokenizer(
+        test_prompt, return_tensors="pt",
+        truncation=True, max_length=64,
+    )
+
+    logits = {}
+    for name, m in model_dict.items():
+        enc_dev = {k: v.to(device) for k, v in enc.items()}
+        m.eval()
+        with torch.no_grad():
+            out = m(**enc_dev)
+        # Last token logits, float32 CPU
+        logits[name] = out.logits[0, -1, :].detach().float().cpu()
+
+    orig = logits.get("original")
+    result = {"prompt": test_prompt}
+    for name, lg in logits.items():
+        result[f"logit_norm_{name}"] = round(float(lg.norm()), 4)
+        if orig is not None and name != "original":
+            diff = float((orig - lg).norm())
+            result[f"diff_vs_original_{name}"] = round(diff, 6)
+            result[f"cosine_vs_original_{name}"] = round(
+                float(F.cosine_similarity(orig.unsqueeze(0), lg.unsqueeze(0))), 6
+            )
+
+    return result
+
+
+
+def _debug_end_to_end_mlp_comparison(
+    orig_outputs:  list,
+    other_outputs: dict,
+    eps: float = 1e-8,
+) -> dict:
+    """
+    Compare per-layer MLP outputs from full model forward passes.
+    orig_outputs: List[Tensor [N, d_model]] from the original model.
+    other_outputs: {method_name: List[Tensor [N, d_model]]} for pruned models.
+    Returns aggregate and per-layer relative errors.
+    """
+    import torch
+    n_layers = len(orig_outputs)
+    per_layer = []
+    agg = {name: [] for name in other_outputs}
+
+    for layer_idx in range(n_layers):
+        Y_orig = orig_outputs[layer_idx].float()
+        Y_norm = float(Y_orig.norm()) + eps
+        entry  = {"layer_idx": layer_idx}
+        for name, out_list in other_outputs.items():
+            Y_other = out_list[layer_idx].float()
+            n_min   = min(Y_orig.shape[0], Y_other.shape[0])
+            err     = float((Y_orig[:n_min] - Y_other[:n_min]).norm()) / (
+                float(Y_orig[:n_min].norm()) + eps
+            )
+            entry[f"rel_err_{name}"] = round(err, 6)
+            agg[name].append(err)
+        per_layer.append(entry)
+
+    aggregate = {}
+    for name, errs in agg.items():
+        t = torch.tensor(errs)
+        aggregate[name] = {
+            "mean_rel_err":   round(float(t.mean()), 6),
+            "max_rel_err":    round(float(t.max()), 6),
+            "median_rel_err": round(float(t.median()), 6),
+        }
+
+    return {"aggregate": aggregate, "per_layer": per_layer}
+
+
+# ===========================================================================
+# Diagnostics helper
+# ===========================================================================
+
+def _build_layer_diagnostics(all_scores, prune_indices_per_layer, assignments_per_layer):
+    layers_diag = []
     for layer_idx, (scores, pi, assignments) in enumerate(
         zip(all_scores, prune_indices_per_layer, assignments_per_layer)
     ):
         if len(pi) == 0:
             layers_diag.append({"layer_idx": layer_idx, "n_pruned": 0})
             continue
-
-        # Per-neuron details
         neuron_detail = []
         for asn in assignments:
-            # 'dist' for weight-sim, 'residual' for activation-sim
             metric_val = asn.get("dist", asn.get("residual", 0.0))
             neuron_detail.append({
-                "layer_idx":    layer_idx,
-                "i":            asn["i"],
-                "j":            asn["j"],
-                "beta":         round(asn.get("beta", 0.0), 8),
-                "metric":       round(metric_val, 8),
-                "bound_score":  round(float(scores[asn["i"]]), 8),
+                "layer_idx":   layer_idx,
+                "i":           asn["i"],
+                "j":           asn["j"],
+                "beta":        round(asn.get("beta", 0.0), 8),
+                "metric":      round(metric_val, 8),
+                "bound_score": round(float(scores[asn["i"]]), 8),
             })
-
         betas   = [a.get("beta", 0.0) for a in assignments]
         metrics = [a.get("dist", a.get("residual", 0.0)) for a in assignments]
         targets = [a["j"] for a in assignments]
-        target_counts = Counter(targets)
-
+        from collections import Counter
+        tc = Counter(targets)
         layers_diag.append({
             "layer_idx":              layer_idx,
             "n_pruned":               int(len(pi)),
             "n_unique_targets":       len(set(targets)),
-            "max_neurons_per_target": max(target_counts.values()) if target_counts else 0,
+            "max_neurons_per_target": max(tc.values()) if tc else 0,
             "avg_beta":               round(float(sum(betas) / max(len(betas), 1)), 8),
             "avg_metric":             round(float(sum(metrics) / max(len(metrics), 1)), 8),
             "max_metric":             round(float(max(metrics)) if metrics else 0.0, 8),
             "neurons":                neuron_detail,
         })
-
     return layers_diag
 
 
 # ===========================================================================
-# Entry point
+# --debug-merge entry point
 # ===========================================================================
 
-def run_bound_merge_mode(
-    model,
-    tokenizer,
-    cfg:        dict,
-    device:     str,
-    output_dir: str = "results",
-) -> None:
+def run_debug_merge_mode(model, tokenizer, cfg, device, output_dir="results"):
     """
-    Compare pure deletion vs compensated merging for the same candidate neurons
-    selected by cumul_score_sum at alpha = 1e-4, 1e-3, 1e-2.
-
-    For each alpha, runs three methods:
-      pure_delete                — remove neurons, no compensation
-      merge_weight_similarity    — compensate using gate/up weight distance
-      merge_activation_similarity — compensate using calibration activation similarity
-
-    Saves PPL comparison table, generation examples, and per-neuron diagnostics.
+    Diagnose whether pairwise merging improves MLP output reconstruction.
+    Reports beta statistics, update magnitudes, isolated per-layer errors,
+    end-to-end logit diffs, and end-to-end MLP output errors.
+    No PPL evaluation — diagnostic only.
     """
-    from .bound_analysis import (
-        CALIBRATION_PROMPTS,
-        _k,
-        compute_bound_scores_and_R,
-        select_by_budget,
+    import json, os, time
+    import torch
+    from .bound_analysis import CALIBRATION_PROMPTS, _k, compute_bound_scores_and_R, select_by_budget
+    from .pruning import prune_model_by_layer_indices
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts     = time.strftime("%Y%m%d_%H%M%S")
+    layers = get_transformer_layers(model)
+    ALPHAS = [1e-4, 1e-3, 1e-2]
+
+    print("\nComputing bound scores ...")
+    all_scores = [compute_bound_scores_and_R(l)[0] for l in layers]
+
+    print("Collecting calibration inputs ...")
+    all_r_per_layer = collect_mlp_inputs(
+        model, tokenizer, CALIBRATION_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
     )
+    print("Collecting original MLP outputs ...")
+    orig_mlp_outputs = collect_mlp_outputs(
+        model, tokenizer, CALIBRATION_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+
+    all_debug = []
+
+    for alpha in ALPHAS:
+        prune_indices_per_layer = []
+        for scores in all_scores:
+            pi, _ = select_by_budget(scores, alpha, float(scores.sum()))
+            prune_indices_per_layer.append(pi)
+
+        total_pruned = sum(len(pi) for pi in prune_indices_per_layer)
+        if total_pruned == 0:
+            print(f"\nalpha={_k(alpha)}: no neurons selected - skipping")
+            continue
+
+        keep_indices_per_layer = []
+        for scores, pi in zip(all_scores, prune_indices_per_layer):
+            p_set = set(pi.tolist())
+            ki    = torch.tensor([j for j in range(scores.numel()) if j not in p_set], dtype=torch.long)
+            keep_indices_per_layer.append(ki)
+
+        total_n = sum(s.numel() for s in all_scores)
+        pct     = 100.0 * total_pruned / total_n
+
+        print(f"\n{'=' * 64}")
+        print(f"alpha={_k(alpha)}  pruned={total_pruned} ({pct:.3f}%)")
+        print(f"{'=' * 64}")
+
+        print("  Computing weight assignments ...")
+        weight_asns = [
+            compute_merge_assignments_weight(l, pi, ki) if len(pi) > 0 else []
+            for l, pi, ki in zip(layers, prune_indices_per_layer, keep_indices_per_layer)
+        ]
+        print("  Computing activation assignments ...")
+        act_asns = [
+            compute_merge_assignments_activation(l, pi, ki, r) if len(pi) > 0 else []
+            for l, pi, ki, r in zip(layers, prune_indices_per_layer, keep_indices_per_layer, all_r_per_layer)
+        ]
+
+        # 1. Beta statistics
+        beta_stats_weight = _debug_beta_stats(weight_asns)
+        beta_stats_act    = _debug_beta_stats(act_asns)
+        print(f"\n  Beta stats (weight): mean_abs={beta_stats_weight['mean_abs_beta']:.4f}  "
+              f"median_abs={beta_stats_weight['median_abs_beta']:.4f}  "
+              f"max_abs={beta_stats_weight['max_abs_beta']:.4f}  "
+              f"pct<0.01={beta_stats_weight['pct_lt_1e-2']:.1f}%  "
+              f"pct<0.1={beta_stats_weight['pct_lt_0.1']:.1f}%")
+        print(f"  Beta stats (act):    mean_abs={beta_stats_act['mean_abs_beta']:.4f}  "
+              f"median_abs={beta_stats_act['median_abs_beta']:.4f}  "
+              f"max_abs={beta_stats_act['max_abs_beta']:.4f}  "
+              f"pct<0.01={beta_stats_act['pct_lt_1e-2']:.1f}%  "
+              f"pct<0.1={beta_stats_act['pct_lt_0.1']:.1f}%")
+
+        # 2. Update magnitudes
+        upd_weight = _debug_update_magnitudes(layers, weight_asns)
+        upd_act    = _debug_update_magnitudes(layers, act_asns)
+        if upd_weight.get("n_targets", 0) > 0:
+            print(f"\n  Down updates (weight): mean_norm={upd_weight['mean_update_norm']:.4f}  "
+                  f"mean_rel={upd_weight['mean_rel_update']:.4f}")
+        if upd_act.get("n_targets", 0) > 0:
+            print(f"  Down updates (act):    mean_norm={upd_act['mean_update_norm']:.4f}  "
+                  f"mean_rel={upd_act['mean_rel_update']:.4f}")
+
+        # 3. Isolated per-layer comparison
+        print("\n  Computing isolated per-layer reconstruction quality ...")
+        layer_comp = _debug_isolated_layer_comparison(
+            layers, prune_indices_per_layer, keep_indices_per_layer,
+            all_r_per_layer, weight_asns, act_asns,
+        )
+        active = [l for l in layer_comp if l.get("n_pruned", 0) > 0]
+        if active:
+            avg_del = sum(l["delete_rel_err"] for l in active) / len(active)
+            avg_mw  = sum(l["merge_weight_rel_err"] for l in active) / len(active)
+            avg_ma  = sum(l["merge_act_rel_err"] for l in active) / len(active)
+            print(f"  Isolated mean rel-err ({len(active)} layers):")
+            print(f"    pure_delete:       {avg_del:.6f}")
+            print(f"    merge_weight:      {avg_mw:.6f}  ({100*(avg_del-avg_mw)/(avg_del+EPS):+.2f}%)")
+            print(f"    merge_activation:  {avg_ma:.6f}  ({100*(avg_del-avg_ma)/(avg_del+EPS):+.2f}%)")
+
+        # 4 & 5. End-to-end comparison
+        print("\n  Building models for end-to-end comparison ...")
+        end2end_models = {"original": model}
+        built_models   = {}
+        logit_info     = {}
+        e2e_comp       = {}
+
+        try:
+            built_models["pure_delete"], _ = prune_model_by_layer_indices(
+                model, prune_indices_per_layer, label=f"dbg_del_a{_k(alpha)}"
+            )
+            built_models["merge_weight"], _ = apply_merge_and_prune(
+                model, prune_indices_per_layer, weight_asns, label=f"dbg_mw_a{_k(alpha)}"
+            )
+            built_models["merge_act"], _ = apply_merge_and_prune(
+                model, prune_indices_per_layer, act_asns, label=f"dbg_ma_a{_k(alpha)}"
+            )
+            end2end_models.update(built_models)
+
+            logit_info = _debug_logit_comparison(end2end_models, tokenizer, device)
+            print(f"\n  Logit comparison ('{logit_info['prompt']}'):")
+            for name in built_models:
+                dk = f"diff_vs_original_{name}"
+                ck = f"cosine_vs_original_{name}"
+                if dk in logit_info:
+                    print(f"    {name:<22}  diff={logit_info[dk]:.4f}  cosine={logit_info[ck]:.4f}")
+
+            print("\n  Collecting end-to-end MLP outputs from pruned models ...")
+            other_outputs = {}
+            for name, m in built_models.items():
+                other_outputs[name] = collect_mlp_outputs(
+                    m, tokenizer, CALIBRATION_PROMPTS, device,
+                    max_seq_len=cfg.get("max_seq_len", 128),
+                )
+
+            e2e_comp = _debug_end_to_end_mlp_comparison(orig_mlp_outputs, other_outputs)
+            print(f"\n  End-to-end MLP aggregate errors:")
+            for name, stats in e2e_comp["aggregate"].items():
+                print(f"    {name:<22}  mean={stats['mean_rel_err']:.6f}  max={stats['max_rel_err']:.6f}")
+
+        except Exception as exc:
+            logger.error("End-to-end comparison failed for alpha=%s: %s", _k(alpha), exc, exc_info=True)
+            logit_info = {"error": str(exc)}
+            e2e_comp   = {"error": str(exc)}
+        finally:
+            for m in built_models.values():
+                del m
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        alpha_report = {
+            "alpha":                       alpha,
+            "total_pruned":                total_pruned,
+            "pct_pruned":                  round(pct, 4),
+            "beta_stats":                  {"weight": beta_stats_weight, "activation": beta_stats_act},
+            "update_magnitudes":           {"weight": upd_weight, "activation": upd_act},
+            "isolated_layer_comparison":   layer_comp,
+            "logit_comparison":            logit_info,
+            "end2end_mlp_comparison":      e2e_comp,
+        }
+        all_debug.append(alpha_report)
+        p = os.path.join(output_dir, f"debug_merge_alpha{_k(alpha)}_{ts}.json")
+        with open(p, "w") as f:
+            json.dump(alpha_report, f, indent=2, default=str)
+        print(f"\n  Debug report: {p}")
+
+    full_path = os.path.join(output_dir, f"debug_merge_full_{ts}.json")
+    with open(full_path, "w") as f:
+        json.dump({"timestamp": ts, "alphas": all_debug}, f, indent=2, default=str)
+    logger.info("Full debug report: %s", full_path)
+    print(f"\nFull debug report: {full_path}\n")
+
+
+# ===========================================================================
+# --bound-merge entry point (updated with reconstruction methods)
+# ===========================================================================
+
+def run_bound_merge_mode(model, tokenizer, cfg, device, output_dir="results"):
+    """
+    Compare pure deletion, pairwise merging, and down-projection reconstruction.
+
+    Methods per alpha:
+      pure_delete
+      merge_weight_similarity
+      merge_activation_similarity
+      down_reconstruction_lstsq
+      down_reconstruction_ridge_1e-6 / 1e-5 / 1e-4 / 1e-3
+    """
+    import json, os, time
+    import torch
+    from .bound_analysis import CALIBRATION_PROMPTS, _k, compute_bound_scores_and_R, select_by_budget
     from .evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
     from .flops import estimate_mlp_flops
     from .model_utils import count_parameters
@@ -461,29 +1017,42 @@ def run_bound_merge_mode(
     os.makedirs(output_dir, exist_ok=True)
     ts     = time.strftime("%Y%m%d_%H%M%S")
     layers = get_transformer_layers(model)
+    ALPHAS = [1e-4, 1e-3, 1e-2]
 
-    ALPHAS  = [1e-4, 1e-3, 1e-2]
+    def _build_pure_delete(model, pi, ki, all_r, wa, aa):
+        return prune_model_by_layer_indices(model, pi, label="pure_delete")
+
+    def _build_weight(model, pi, ki, all_r, wa, aa):
+        return apply_merge_and_prune(model, pi, wa, label="merge_weight")
+
+    def _build_act(model, pi, ki, all_r, wa, aa):
+        return apply_merge_and_prune(model, pi, aa, label="merge_act")
+
+    def _make_recon(method, lam):
+        def _build(model, pi, ki, all_r, wa, aa):
+            return apply_down_reconstruction(model, pi, ki, all_r, method=method, ridge_lambda=lam)
+        return _build
+
     METHODS = [
-        "pure_delete",
-        "merge_weight_similarity",
-        "merge_activation_similarity",
+        ("pure_delete",                    _build_pure_delete),
+        ("merge_weight_similarity",        _build_weight),
+        ("merge_activation_similarity",    _build_act),
+        ("down_reconstruction_lstsq",      _make_recon("lstsq", 1e-5)),
+        ("down_reconstruction_ridge_1e-6", _make_recon("ridge", 1e-6)),
+        ("down_reconstruction_ridge_1e-5", _make_recon("ridge", 1e-5)),
+        ("down_reconstruction_ridge_1e-4", _make_recon("ridge", 1e-4)),
+        ("down_reconstruction_ridge_1e-3", _make_recon("ridge", 1e-3)),
     ]
 
-    # ── Pre-compute bound scores (weight-only, fast) ──────────────────────────
-    print("\nComputing bound scores for all layers …")
-    all_scores: List[torch.Tensor] = []
-    for layer in layers:
-        s, _ = compute_bound_scores_and_R(layer)
-        all_scores.append(s)
+    print("\nComputing bound scores for all layers ...")
+    all_scores = [compute_bound_scores_and_R(l)[0] for l in layers]
 
-    # ── Collect calibration hidden states (one pass, shared across all alphas) ─
-    print("Collecting calibration hidden states (used for activation merge) …")
+    print("Collecting calibration hidden states ...")
     all_r_per_layer = collect_mlp_inputs(
         model, tokenizer, CALIBRATION_PROMPTS, device,
         max_seq_len=cfg.get("max_seq_len", 128),
     )
 
-    # ── Dataset + baseline PPL ────────────────────────────────────────────────
     use_fallback = cfg.get("use_fallback_corpus", True)
     n_eval       = cfg.get("bound_analysis_eval_samples", 64)
     eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
@@ -491,7 +1060,7 @@ def run_bound_merge_mode(
     baseline_params = count_parameters(model)
     baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
 
-    print("Computing baseline PPL …")
+    print("Computing baseline PPL ...")
     bp           = evaluate_perplexity(
         model, tokenizer, texts=eval_texts,
         max_seq_len=cfg.get("max_seq_len", 512),
@@ -501,14 +1070,12 @@ def run_bound_merge_mode(
     baseline_ppl = bp["perplexity"]
     print(f"Baseline PPL: {baseline_ppl:.4f}\n")
 
-    all_results: List[dict] = []
+    all_results = []
 
     for alpha in ALPHAS:
-        # ── Select candidate neurons ──────────────────────────────────────────
-        prune_indices_per_layer: List[torch.Tensor] = []
-        for i, scores in enumerate(all_scores):
-            ref = float(scores.sum())
-            pi, _ = select_by_budget(scores, alpha, ref)
+        prune_indices_per_layer = []
+        for scores in all_scores:
+            pi, _ = select_by_budget(scores, alpha, float(scores.sum()))
             prune_indices_per_layer.append(pi)
 
         total_pruned = sum(len(pi) for pi in prune_indices_per_layer)
@@ -516,73 +1083,47 @@ def run_bound_merge_mode(
         pct          = 100.0 * total_pruned / total_n if total_n else 0.0
 
         if total_pruned == 0:
-            print(f"alpha={_k(alpha)}: 0 neurons selected — skipping\n")
+            print(f"alpha={_k(alpha)}: 0 neurons selected - skipping\n")
             continue
 
-        # ── Compute keep_indices per layer ────────────────────────────────────
-        keep_indices_per_layer: List[torch.Tensor] = []
-        for i, scores in enumerate(all_scores):
-            d_ff    = scores.numel()
-            p_set   = set(prune_indices_per_layer[i].tolist())
-            keep    = torch.tensor(
-                [j for j in range(d_ff) if j not in p_set], dtype=torch.long
+        keep_indices_per_layer = []
+        for scores, pi in zip(all_scores, prune_indices_per_layer):
+            p_set = set(pi.tolist())
+            ki    = torch.tensor(
+                [j for j in range(scores.numel()) if j not in p_set], dtype=torch.long
             )
-            keep_indices_per_layer.append(keep)
+            keep_indices_per_layer.append(ki)
 
-        print(f"{'=' * 64}")
+        print(f"{'=' * 72}")
         print(f"alpha={_k(alpha)}  pruned={total_pruned} ({pct:.3f}%)")
-        print(f"{'=' * 64}\n")
+        print(f"{'=' * 72}\n")
 
-        # ── Compute merge assignments (shared across methods B and C) ─────────
-        print("  Computing weight-similarity assignments …")
-        weight_asns: List[List[dict]] = []
-        for layer_idx, layer in enumerate(tqdm(layers, desc="    weight", leave=False)):
-            pi = prune_indices_per_layer[layer_idx]
-            ki = keep_indices_per_layer[layer_idx]
-            weight_asns.append(
-                compute_merge_assignments_weight(layer, pi, ki)
-                if len(pi) > 0 else []
+        weight_asns = [
+            compute_merge_assignments_weight(l, pi, ki) if len(pi) > 0 else []
+            for l, pi, ki in zip(layers, prune_indices_per_layer, keep_indices_per_layer)
+        ]
+        act_asns = [
+            compute_merge_assignments_activation(l, pi, ki, r) if len(pi) > 0 else []
+            for l, pi, ki, r in zip(
+                layers, prune_indices_per_layer, keep_indices_per_layer, all_r_per_layer
             )
+        ]
 
-        print("  Computing activation-similarity assignments …")
-        act_asns: List[List[dict]] = []
-        for layer_idx, layer in enumerate(tqdm(layers, desc="    activation", leave=False)):
-            pi    = prune_indices_per_layer[layer_idx]
-            ki    = keep_indices_per_layer[layer_idx]
-            all_r = all_r_per_layer[layer_idx]
-            act_asns.append(
-                compute_merge_assignments_activation(layer, pi, ki, all_r)
-                if len(pi) > 0 else []
-            )
-
-        # ── Run all three methods ─────────────────────────────────────────────
-        for method in METHODS:
-            print(f"\n  [{method}]")
-            row: dict = {
-                "alpha":         alpha,
-                "method":        method,
-                "total_pruned":  total_pruned,
-                "pct_pruned":    round(pct, 4),
-                "baseline_ppl":  round(baseline_ppl, 4),
+        for method_name, builder in METHODS:
+            print(f"\n  [{method_name}]")
+            row = {
+                "alpha":        alpha,
+                "method":       method_name,
+                "total_pruned": total_pruned,
+                "pct_pruned":   round(pct, 4),
+                "baseline_ppl": round(baseline_ppl, 4),
             }
             pruned_model = None
             try:
-                if method == "pure_delete":
-                    pruned_model, _ = prune_model_by_layer_indices(
-                        model, prune_indices_per_layer,
-                        label=f"pure_delete_a{_k(alpha)}",
-                    )
-                elif method == "merge_weight_similarity":
-                    pruned_model, _ = apply_merge_and_prune(
-                        model, prune_indices_per_layer, weight_asns,
-                        label=f"merge_weight_a{_k(alpha)}",
-                    )
-                elif method == "merge_activation_similarity":
-                    pruned_model, _ = apply_merge_and_prune(
-                        model, prune_indices_per_layer, act_asns,
-                        label=f"merge_act_a{_k(alpha)}",
-                    )
-
+                pruned_model, build_info = builder(
+                    model, prune_indices_per_layer, keep_indices_per_layer,
+                    all_r_per_layer, weight_asns, act_asns,
+                )
                 fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
                 ppl_info = evaluate_perplexity(
                     pruned_model, tokenizer, texts=eval_texts,
@@ -593,36 +1134,41 @@ def run_bound_merge_mode(
                 ppl = ppl_info["perplexity"]
 
                 p_params = count_parameters(pruned_model)
-                p_flops  = estimate_mlp_flops(
-                    pruned_model, seq_len=cfg.get("max_seq_len", 512)
-                )
-                flop_red = 100.0 * (
-                    1.0 - p_flops["total_flops"] / baseline_flops["total_flops"]
-                )
-                mlp_red = 100.0 * (
-                    1.0 - p_params["mlp"] / baseline_params["mlp"]
-                )
+                p_flops  = estimate_mlp_flops(pruned_model, seq_len=cfg.get("max_seq_len", 512))
+                flop_red = 100.0 * (1.0 - p_flops["total_flops"] / baseline_flops["total_flops"])
+                mlp_red  = 100.0 * (1.0 - p_params["mlp"] / baseline_params["mlp"])
 
                 gens = run_generation_tests(pruned_model, tokenizer, device=device)
 
                 row.update({
-                    "perplexity":         round(ppl, 4),
-                    "perplexity_delta":   round(ppl - baseline_ppl, 4),
-                    "forward_pass_ok":    fp_ok,
-                    "mlp_params_red_pct": round(mlp_red, 4),
-                    "flops_red_pct":      round(flop_red, 4),
+                    "perplexity":          round(ppl, 4),
+                    "perplexity_delta":    round(ppl - baseline_ppl, 4),
+                    "forward_pass_ok":     fp_ok,
+                    "mlp_params_red_pct":  round(mlp_red, 4),
+                    "flops_red_pct":       round(flop_red, 4),
                     "generation_examples": gens,
                 })
+                if "sanity_per_layer" in build_info:
+                    row["sanity_per_layer"] = build_info["sanity_per_layer"]
+
                 print(
                     f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
                     f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
                 )
+                if "sanity_per_layer" in build_info:
+                    active_s = [s for s in build_info["sanity_per_layer"]
+                                if s.get("n_pruned", 1) > 0 and "recon_relative_err" in s]
+                    if active_s:
+                        avg_recon = sum(s["recon_relative_err"] for s in active_s) / len(active_s)
+                        avg_del   = sum(s["delete_relative_err"] for s in active_s) / len(active_s)
+                        print(
+                            f"    Isolated layer err: delete={avg_del:.6f}  "
+                            f"recon={avg_recon:.6f}  "
+                            f"improvement={100*(avg_del-avg_recon)/(avg_del+EPS):.2f}%"
+                        )
 
             except Exception as exc:
-                logger.error(
-                    "Method [%s] alpha=%s failed: %s",
-                    method, _k(alpha), exc, exc_info=True,
-                )
+                logger.error("Method [%s] alpha=%s failed: %s", method_name, _k(alpha), exc, exc_info=True)
                 row["notes"] = f"ERROR: {exc}"
             finally:
                 if pruned_model is not None:
@@ -632,11 +1178,9 @@ def run_bound_merge_mode(
 
             all_results.append(row)
 
-        # ── Save per-neuron diagnostics for this alpha ────────────────────────
         diag = {
             "alpha":                  alpha,
             "total_pruned":           total_pruned,
-            "pct_pruned":             round(pct, 4),
             "weight_diagnostics":     _build_layer_diagnostics(
                 all_scores, prune_indices_per_layer, weight_asns
             ),
@@ -644,46 +1188,39 @@ def run_bound_merge_mode(
                 all_scores, prune_indices_per_layer, act_asns
             ),
         }
-        diag_path = os.path.join(
-            output_dir, f"merge_diagnostics_alpha{_k(alpha)}_{ts}.json"
-        )
+        diag_path = os.path.join(output_dir, f"merge_diagnostics_alpha{_k(alpha)}_{ts}.json")
         with open(diag_path, "w") as f:
             json.dump(diag, f, indent=2, default=str)
-        logger.info("Diagnostics saved: %s", diag_path)
         print(f"\n  Diagnostics: {diag_path}")
 
-    # ── Summary table ─────────────────────────────────────────────────────────
+    # Summary
     print(f"\n{'=' * 80}")
-    print("BOUND MERGE SUMMARY")
+    print("BOUND MERGE + RECONSTRUCTION SUMMARY")
     print(f"  Baseline PPL: {baseline_ppl:.4f}")
     print(f"{'─' * 80}")
     print(
-        f"  {'alpha':>9}  {'method':<32}  {'pruned':>7}"
+        f"  {'alpha':>9}  {'method':<38}  {'pruned':>7}"
         f"  {'PPL':>9}  {'dPPL':>9}  {'MLP-':>7}"
     )
     print(f"{'─' * 80}")
     for r in all_results:
         if "perplexity" in r:
             print(
-                f"  {_k(r['alpha']):>9}  {r['method']:<32}"
+                f"  {_k(r['alpha']):>9}  {r['method']:<38}"
                 f"  {r['total_pruned']:>7}"
                 f"  {r['perplexity']:>9.4f}"
                 f"  {r['perplexity_delta']:>+9.4f}"
                 f"  {r.get('mlp_params_red_pct', 0.0):>6.2f}%"
             )
         else:
-            print(
-                f"  {_k(r['alpha']):>9}  {r['method']:<32}"
-                f"  {r.get('notes', 'ERROR')}"
-            )
+            print(f"  {_k(r['alpha']):>9}  {r['method']:<38}  {r.get('notes', 'ERROR')}")
     print(f"{'=' * 80}\n")
 
-    # ── Save full report ───────────────────────────────────────────────────────
     report = {
-        "timestamp":   ts,
-        "mode":        "bound_merge",
+        "timestamp":    ts,
+        "mode":         "bound_merge",
         "baseline_ppl": baseline_ppl,
-        "results":     all_results,
+        "results":      all_results,
     }
     path = os.path.join(output_dir, f"bound_merge_{ts}.json")
     with open(path, "w") as f:
