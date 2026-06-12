@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------
+# qwen_swiglu_pruning — 3B validation + local reconstruction config
+# Run: python run_experiment.py --config configs/scaling_3b_validate.yaml --scaling-recon
+#
+# Purpose: validate 3B result and benchmark local residual variants
+# for scalability to larger models.
+# ---------------------------------------------------------------
+
+model_name: "Qwen/Qwen2.5-3B"
+model_name_fallback: "Qwen/Qwen2.5-3B-Instruct"
+
+device: "auto"
+dtype: "float32"
+
+scaling_models:
+  - "Qwen/Qwen2.5-3B"
+
+scaling_alphas:
+  - 0.0005   # 5e-4
+  - 0.001    # 1e-3  (best from initial 3B run)
+  - 0.0015   # 1.5e-3
+  - 0.002    # 2e-3
+
+scaling_methods:
+  - "pure_delete"
+  - "residual_full"           # all kept neurons — best quality baseline
+  - "residual_local_top128"   # smallest local variant
+  - "residual_local_top256"
+  - "residual_local_top512"   # target: matches full quality at fraction of cost
+  - "residual_local_top1024"
+
+scaling_dtype: "auto"   # bfloat16 if supported, else float32
+
+# Evaluation
+reconstruction_eval_samples: 512
+bound_analysis_eval_samples: 64
+max_seq_len: 512
+batch_size: 4
+
+# Output
+output_dir: "results"
+
+# Dataset
+eval_dataset: "wikitext"
+use_fallback_corpus: false
+
+# Reproducibility
+seed: 42

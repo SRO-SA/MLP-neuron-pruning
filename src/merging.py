@@ -3117,3 +3117,335 @@ def run_reconstruction_best_mode(model, tokenizer, cfg, device, output_dir="resu
     logger.info("Best-config reconstruction report: %s", jpath)
     print(f"Report: {jpath}")
     print(f"CSV:    {cpath}\n")
+
+
+# ===========================================================================
+# Local residual correction (scalable variant)
+# ===========================================================================
+
+def _compute_residual_correction_local(
+    layer,
+    train_r:       "torch.Tensor",
+    keep_indices:  "torch.Tensor",
+    prune_indices: "torch.Tensor",
+    ridge_lambda:  float,
+    tau:           float = 1.0,
+    top_k:         int   = 512,
+    eps:           float = EPS,
+) -> "Tuple[Optional[torch.Tensor], dict]":
+    """
+    Local residual correction: select the top_k kept neurons most correlated
+    with the lost signal E, solve ridge only over those, update only those
+    down_proj columns.
+
+    Why local?
+    ----------
+    Full residual correction builds an [N x k] system where k can be thousands
+    (e.g., k~8000 for 7B after 1% prune).  Local selection reduces the solve to
+    [N x top_k], keeping memory and time bounded regardless of model size.
+
+    Selection criterion
+    -------------------
+    score_j = ||(A_K[:, j])^T @ E||_2  (correlation of kept neuron j with residual)
+    Top-K by this score are selected; the rest are left as their original W_K values.
+
+    Returns (W_new [d_model, k] float32,  diagnostics dict)
+            or (None, diagnostics)  if NaN/Inf or all solvers fail.
+    W_new[: , j] == W_K[:, j]  for  j NOT in local_sel  (unchanged columns).
+    """
+    import torch.nn.functional as _F
+
+    d: dict = {}
+    w = get_mlp_weights(layer)
+    w_gate = w["gate"].detach().float().cpu()
+    w_up   = w["up"].detach().float().cpu()
+    w_down = w["down"].detach().float().cpu()   # [d_model, d_ff]
+
+    R = train_r.float().cpu()
+    N = R.shape[0]
+    k = keep_indices.shape[0]
+    p = prune_indices.shape[0]
+    top_k_actual = min(top_k, k)
+
+    with torch.no_grad():
+        A   = _F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N, d_ff]
+        A_K = A[:, keep_indices]                        # [N, k]
+        A_P = A[:, prune_indices]                       # [N, p]
+        W_K = w_down[:, keep_indices]                   # [d_model, k]
+        W_P = w_down[:, prune_indices]                  # [d_model, p]
+
+        # Lost signal from pure deletion
+        E = A_P @ W_P.T                                 # [N, d_model]
+
+        # Full reference output
+        Y_full  = A_K @ W_K.T + E                      # [N, d_model]
+        Y_norm  = float(Y_full.norm()) + eps
+        del_err = float(E.norm()) / Y_norm
+
+        d.update({
+            "N_tokens": N, "k_kept": k, "p_pruned": p,
+            "top_k_used": top_k_actual,
+            "E_norm": round(float(E.norm()), 6),
+            "train_delete_err": round(del_err, 6),
+        })
+
+        # ── Local neuron selection ──────────────────────────────────────────
+        # score_j = ||(A_K.T @ E)[j, :]||_2  — how well neuron j explains E
+        A_K64 = A_K.double()
+        E64   = E.double()
+        W_K64 = W_K.double()
+
+        proj_scores = (A_K64.T @ E64).norm(dim=1)          # [k]
+        if top_k_actual < k:
+            local_sel = proj_scores.topk(top_k_actual).indices  # [top_k]
+        else:
+            local_sel = torch.arange(k, dtype=torch.long)
+
+        score_sum = float(proj_scores.sum().clamp(min=1e-10))
+        coverage  = float(proj_scores[local_sel].sum()) / score_sum
+        d["coverage_pct"] = round(100.0 * coverage, 2)
+
+        A_local = A_K64[:, local_sel]   # [N, top_k_actual]
+        K_loc   = top_k_actual
+
+        # ── Scaled-ridge solve (dual/primal auto) ───────────────────────────
+        if N <= K_loc:
+            AAt   = A_local @ A_local.T                   # [N, N]
+            scale = float(AAt.diagonal().mean().clamp(min=1e-10))
+            reg   = (ridge_lambda * scale) * torch.eye(N, dtype=torch.float64)
+            d.update({"system_form": "dual",   "system_size": N})
+        else:
+            AtA   = A_local.T @ A_local                   # [K_loc, K_loc]
+            AtE   = A_local.T @ E64
+            scale = float(AtA.diagonal().mean().clamp(min=1e-10))
+            reg   = (ridge_lambda * scale) * torch.eye(K_loc, dtype=torch.float64)
+            d.update({"system_form": "primal", "system_size": K_loc})
+
+        d["scale"]         = round(scale, 6)
+        d["lambda_scaled"] = round(ridge_lambda * scale, 6)
+
+        delta_B_local = None
+        solve_label   = "failed"
+        for jm in [0.0, 1e-6, 1e-5, 1e-4]:
+            jitter = jm * scale
+            try:
+                if N <= K_loc:
+                    M = AAt + reg + jitter * torch.eye(N, dtype=torch.float64)
+                    delta_B_local = A_local.T @ torch.linalg.solve(M, E64)  # [K_loc, d_model]
+                else:
+                    M = AtA + reg + jitter * torch.eye(K_loc, dtype=torch.float64)
+                    delta_B_local = torch.linalg.solve(M, AtE)              # [K_loc, d_model]
+                solve_label = f"solve+jitter{jm}"
+                break
+            except RuntimeError:
+                continue
+
+        if delta_B_local is None:
+            try:
+                delta_B_local = torch.linalg.lstsq(A_local, E64, rcond=None).solution
+                solve_label   = "lstsq_fallback"
+            except Exception:
+                pass
+
+        if delta_B_local is None:
+            try:
+                delta_B_local = torch.linalg.pinv(A_local) @ E64
+                solve_label   = "pinv_fallback"
+            except Exception:
+                pass
+
+        d["solve_method"] = solve_label
+
+        if delta_B_local is None:
+            d["error"] = "all_solvers_failed"
+            return None, d
+
+        # Apply correction — only to the local_sel columns of W_K
+        dB_f32 = (tau * delta_B_local).float()          # [K_loc, d_model]
+        W_new  = W_K.clone()                             # [d_model, k]
+        W_new[:, local_sel] = W_new[:, local_sel] + dB_f32.T
+
+        # Diagnostics
+        delta_applied     = W_new - W_K                 # [d_model, k]
+        delta_norm        = float(delta_applied.norm())
+        w_k_norm          = float(W_K.norm())
+        w_down_full_norm  = float(w_down.norm())
+        delta_rel         = delta_norm / (w_k_norm + eps)
+        update_norm_ratio = delta_norm / (w_down_full_norm + eps)
+        max_abs_new       = float(W_new.abs().max())
+        max_abs_old       = float(W_K.abs().max())
+        has_nan           = bool(W_new.isnan().any() or W_new.isinf().any())
+
+        Y_new       = A_K @ W_new.T                     # [N, d_model]
+        recon_train = float((Y_full - Y_new).norm()) / Y_norm
+
+        d.update({
+            "tau":                   tau,
+            "ridge_lambda":          ridge_lambda,
+            "delta_norm":            round(delta_norm, 6),
+            "w_k_norm":              round(w_k_norm, 6),
+            "w_down_full_norm":      round(w_down_full_norm, 6),
+            "delta_rel_norm":        round(delta_rel, 6),
+            "update_norm_ratio":     round(update_norm_ratio, 6),
+            "max_abs_new":           round(max_abs_new, 6),
+            "max_abs_old":           round(max_abs_old, 6),
+            "max_abs_ratio":         round(max_abs_new / (max_abs_old + eps), 4),
+            "has_nan_inf":           has_nan,
+            "train_recon_err":       round(recon_train, 6),
+            "train_improvement_pct": round(100.0 * (del_err - recon_train) / (del_err + eps), 2),
+        })
+
+        if has_nan:
+            d["error"] = "NaN/Inf_in_W_new"
+            return None, d
+
+    return W_new, d
+
+
+# ===========================================================================
+# Timed residual reconstruction (full or local)
+# ===========================================================================
+
+def apply_residual_down_reconstruction_timed(
+    model,
+    prune_indices_per_layer: "List[torch.Tensor]",
+    keep_indices_per_layer:  "List[torch.Tensor]",
+    train_r_per_layer:       "List[torch.Tensor]",
+    heldout_r_per_layer:     "List[torch.Tensor]",
+    ridge_lambda:            float,
+    tau:                     float = 1.0,
+    top_k:                   "Optional[int]" = None,
+    eps:                     float = EPS,
+    max_delta_rel:           float = 2.0,
+    max_abs_ratio:           float = 10.0,
+) -> "Tuple[Optional[object], dict]":
+    """
+    Residual down-projection correction with per-layer timing and peak-GPU tracking.
+
+    top_k=None   →  residual_full   (all kept neurons; same algorithm as
+                                     apply_residual_down_reconstruction)
+    top_k=K      →  residual_local_topK  (selects K kept neurons by correlation
+                                          with residual E before solving)
+
+    info additionally contains
+    --------------------------
+        recon_time_per_layer_s : per-layer solve time (seconds)
+        total_recon_time_s     : sum across all layers
+        peak_gpu_mb            : peak CUDA memory during reconstruction (MB)
+    """
+    import time as _time
+    from .pruning import prune_model_by_layer_indices
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        pass  # CPU path: peak_gpu_mb = 0
+
+    orig_layers  = get_transformer_layers(model)
+    recon_clone  = clone_model(model)
+    clone_layers = get_transformer_layers(recon_clone)
+
+    sanity      = []
+    n_stable    = 0
+    n_bad       = 0
+    layer_times: "List[float]" = []
+
+    with torch.no_grad():
+        for idx, (orig_l, clone_l, pi, ki, r_tr, r_ho) in enumerate(zip(
+            orig_layers, clone_layers,
+            prune_indices_per_layer, keep_indices_per_layer,
+            train_r_per_layer, heldout_r_per_layer,
+        )):
+            if len(pi) == 0:
+                sanity.append({"layer_idx": idx, "n_pruned": 0, "stable": True})
+                n_stable += 1
+                layer_times.append(0.0)
+                continue
+
+            t0 = _time.perf_counter()
+            if top_k is not None:
+                W_new, d = _compute_residual_correction_local(
+                    orig_l, r_tr, ki, pi,
+                    ridge_lambda=ridge_lambda, tau=tau, top_k=top_k, eps=eps,
+                )
+            else:
+                W_new, d = _compute_residual_correction_for_layer(
+                    orig_l, r_tr, ki, pi,
+                    ridge_lambda=ridge_lambda, tau=tau, eps=eps,
+                )
+            layer_times.append(_time.perf_counter() - t0)
+
+            d["layer_idx"] = idx
+            d["n_pruned"]  = len(pi)
+
+            if W_new is None:
+                d["stable"]        = False
+                d["reject_reason"] = d.get("error", "solver_failed")
+                n_bad += 1
+                sanity.append(d)
+                continue
+
+            # Held-out evaluation (W_new.T as B  [k, d_model])
+            ho = _eval_recon_heldout(orig_l, r_ho, ki, W_new.T, eps=eps)
+            d.update(ho)
+            d["overfit_gap_pct"] = round(
+                d["train_improvement_pct"] - ho["heldout_improvement_pct"], 2
+            )
+
+            # Stability checks
+            reject_reason = None
+            if ho["heldout_recon_err"] > ho["heldout_delete_err"]:
+                reject_reason = (
+                    f"heldout_recon({ho['heldout_recon_err']:.4f})"
+                    f" > del({ho['heldout_delete_err']:.4f})"
+                )
+            elif d["delta_rel_norm"] > max_delta_rel:
+                reject_reason = f"delta_rel_norm={d['delta_rel_norm']:.4f} > {max_delta_rel}"
+            elif d["max_abs_ratio"] > max_abs_ratio:
+                reject_reason = f"max_abs_ratio={d['max_abs_ratio']:.2f} > {max_abs_ratio}"
+
+            if reject_reason:
+                d["stable"]        = False
+                d["reject_reason"] = reject_reason
+                n_bad += 1
+                sanity.append(d)
+                continue
+
+            # Apply W_new to clone's down_proj
+            w_clone = get_mlp_weights(clone_l)
+            down    = w_clone["down"]            # [d_model, d_ff]
+            down.data[:, ki] = W_new.to(dtype=down.dtype, device=down.device)
+
+            d["stable"] = True
+            n_stable += 1
+            sanity.append(d)
+
+    if torch.cuda.is_available():
+        peak_gpu_mb = torch.cuda.max_memory_allocated() / 1e6
+    else:
+        peak_gpu_mb = 0.0
+
+    total_recon_time = sum(layer_times)
+
+    info = {
+        "n_stable_layers":        n_stable,
+        "n_unstable_layers":      n_bad,
+        "all_unstable":           False,
+        "sanity_per_layer":       sanity,
+        "recon_time_per_layer_s": [round(t, 4) for t in layer_times],
+        "total_recon_time_s":     round(total_recon_time, 3),
+        "peak_gpu_mb":            round(peak_gpu_mb, 1),
+    }
+    n_pruned_layers    = sum(1 for s in sanity if s.get("n_pruned", 0) > 0)
+    info["all_unstable"] = (n_bad == n_pruned_layers) and n_pruned_layers > 0
+
+    pruned_model, prune_info = prune_model_by_layer_indices(
+        recon_clone, prune_indices_per_layer, label="residual_recon"
+    )
+    info.update({k_: v_ for k_, v_ in prune_info.items() if k_ != "sanity_per_layer"})
+
+    del recon_clone
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return pruned_model, info

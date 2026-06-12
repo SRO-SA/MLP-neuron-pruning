@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------
+# qwen_swiglu_pruning — 7B scaling experiment config
+# Run: python run_experiment.py --config configs/scaling_7b.yaml --scaling-recon
+#
+# Purpose: test whether 3B results hold at 7B scale; use residual_local_top512
+# as the scalable reconstruction method.
+#
+# WARNING: Qwen2.5-7B requires ~16 GB VRAM in bfloat16.
+#          If OOM, reduce batch_size to 2 or set scaling_dtype: "float16".
+# ---------------------------------------------------------------
+
+model_name: "Qwen/Qwen2.5-7B"
+model_name_fallback: "Qwen/Qwen2.5-7B-Instruct"
+
+device: "auto"
+dtype: "float32"
+
+scaling_models:
+  - "Qwen/Qwen2.5-7B"
+
+scaling_alphas:
+  - 0.0005   # 5e-4
+  - 0.001    # 1e-3
+  - 0.002    # 2e-3
+
+scaling_methods:
+  - "pure_delete"
+  - "residual_full"          # run if memory allows; skip if OOM
+  - "residual_local_top512"  # primary scalable method
+
+scaling_dtype: "auto"   # bfloat16 if supported
+
+# Evaluation
+reconstruction_eval_samples: 256
+bound_analysis_eval_samples: 64
+max_seq_len: 512
+batch_size: 4
+
+# Output
+output_dir: "results"
+
+# Dataset
+eval_dataset: "wikitext"
+use_fallback_corpus: false
+
+# Reproducibility
+seed: 42
