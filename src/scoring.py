@@ -213,28 +213,30 @@ def compute_activation_scores_all_layers(
     layers   = get_transformer_layers(model)
     n_layers = len(layers)
 
-    # Capture MLP inputs via forward pre-hooks
+    # Capture MLP inputs via forward pre-hooks.
+    # register_forward_pre_hook calls hook(module, inputs) — 2 args, NOT 3.
     captured = [[] for _ in range(n_layers)]
-    hooks    = []
+    handles  = []
 
-    for i, layer in enumerate(layers):
-        def _make_hook(idx):
-            def _hook(module, inp, out):  # noqa: ARG001
-                captured[idx].append(inp[0].detach().float().cpu())
-            return _hook
-        hooks.append(get_mlp_module(layer).register_forward_pre_hook(_make_hook(i)))
+    try:
+        for i, layer in enumerate(layers):
+            def _make_hook(idx):
+                def _hook(module, inputs):
+                    captured[idx].append(inputs[0].detach().float().cpu())
+                return _hook
+            handles.append(get_mlp_module(layer).register_forward_pre_hook(_make_hook(i)))
 
-    model.eval()
-    with torch.no_grad():
-        for prompt in prompts:
-            enc = tokenizer(
-                prompt, return_tensors="pt",
-                truncation=True, max_length=max_seq_len,
-            ).to(device)
-            model(**enc)
-
-    for h in hooks:
-        h.remove()
+        model.eval()
+        with torch.no_grad():
+            for prompt in prompts:
+                enc = tokenizer(
+                    prompt, return_tensors="pt",
+                    truncation=True, max_length=max_seq_len,
+                ).to(device)
+                model(**enc)
+    finally:
+        for h in handles:
+            h.remove()
 
     scores_per_layer = []
 

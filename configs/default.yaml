@@ -35,10 +35,20 @@ batch_size: 4
 # Output
 output_dir: "results"
 
-# Bound analysis mode (--bound-analysis)
+# Bound analysis mode (--bound-analysis / --bound-ppl-only)
 # Uses a smaller eval set so the threshold experiments finish faster.
-# Set to 0 to skip PPL evaluation and only print the distribution + count tables.
 bound_analysis_eval_samples: 64
+
+# Evaluation dataset
+# eval_dataset: which dataset to use for perplexity evaluation.
+#   Currently only "wikitext" (WikiText-2-raw-v1 test split) is supported.
+eval_dataset: "wikitext"
+
+# use_fallback_corpus: what to do when the eval dataset cannot be loaded.
+#   false (recommended) — fail with an error so PPL numbers are trustworthy.
+#   true               — silently fall back to a built-in 12-sample corpus
+#                        (useful for offline/CI testing, but PPL is unreliable).
+use_fallback_corpus: false
 
 # Reproducibility
 seed: 42

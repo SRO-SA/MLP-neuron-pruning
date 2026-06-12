@@ -143,6 +143,25 @@ python run_experiment.py --config configs/default.yaml \
 python run_experiment.py --config configs/default.yaml --diagnostics-only
 ```
 
+### Bound analysis mode (threshold-based pruning, not fixed ratios)
+
+```bash
+# Full pipeline: distributions + calibration + PPL experiments
+python run_experiment.py --config configs/default.yaml --bound-analysis
+
+# Distributions and count tables only (no PPL)
+python run_experiment.py --config configs/default.yaml --bound-analysis --no-ppl
+
+# PPL without activation verification
+python run_experiment.py --config configs/default.yaml --bound-analysis --no-activation-verification
+
+# Quick PPL: only cumul_score_sum at alpha=1e-4/1e-3/1e-2
+python run_experiment.py --config configs/default.yaml --bound-ppl-only
+
+# Compare static bound scores to calibration-data activation scores
+python run_experiment.py --config configs/default.yaml --activation-verification-only
+```
+
 ### Override device / dtype inline
 
 Edit `configs/default.yaml` or pass a modified config.
@@ -174,6 +193,8 @@ perplexity, perplexity_delta, forward_pass_ok, notes
 
 ## What to expect (rough ballpark)
 
+### Fixed-ratio pruning (--main experiment)
+
 | Ratio | PPL increase (typical) | MLP FLOP reduction |
 |-------|------------------------|--------------------|
 | 5%    | ~0.1–0.5               | ~5%                |
@@ -181,8 +202,35 @@ perplexity, perplexity_delta, forward_pass_ok, notes
 | 20%   | ~2.0–10                | ~20%               |
 | 30%   | may diverge            | ~30%               |
 
-The proposed `rmsnorm_bound_angle` method is expected to outperform `random`
-and roughly match or beat `down_norm` at low-to-moderate ratios.
+### Bound analysis mode (--bound-analysis)
+
+**Finding: the RMSNorm worst-case bound is highly conservative for Qwen2.5-0.5B.**
+
+When running `--bound-analysis` on Qwen2.5-0.5B:
+
+- **Zero neurons** fall below any tested absolute threshold (up to 1e-2).
+- **Zero neurons** fall below any tested relative threshold (score/median < 1e-2).
+- Only the **cumulative budget** criterion (cumul_score_sum) selects any neurons:
+  - α = 1e-4 → ~25 neurons (≈ 0.021% of all MLP neurons)
+  - α = 1e-3 → ~315 neurons (≈ 0.270%)
+  - α = 1e-2 → ~2452 neurons (≈ 2.100%)
+- The **calibrated budget** (cumul_mlp_norm) selects zero neurons at all α
+  because each neuron's worst-case bound score is small relative to the actual
+  MLP output norm — confirming how conservative the bound is.
+
+The α = 1e-4 result (25 neurons removed) produced a PPL change of approximately
++0.21 on a preliminary 12-sample corpus. **This must be reproduced on real
+WikiText-2 before drawing conclusions** (set `use_fallback_corpus: false` in the
+config to ensure the real dataset is used).
+
+**Interpretation:** The theory is not wrong — it is simply very conservative.
+The static weight-based worst-case bound cannot certify most neurons as
+near-zero because their theoretical maximum contribution is non-negligible.
+Data-driven calibration (activation scores, Wanda-style) is likely necessary
+for practical structured pruning at useful sparsity levels.
+
+Use `--activation-verification-only` to measure how well the static bound
+correlates with actual activation magnitudes on calibration data.
 
 ---
 

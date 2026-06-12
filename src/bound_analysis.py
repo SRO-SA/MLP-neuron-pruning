@@ -36,6 +36,15 @@ B. cumul_score_sum / cumul_mlp_norm:
      - mlp_output_norm: reference = E[||MLP(r)||] from calibration data
    If the sum of ALL S_i is already below the budget, prune all.
    If the smallest S_i exceeds the budget, prune zero.
+
+CLI ENTRY POINTS
+----------------
+--bound-analysis                    Full pipeline (dist + calibration + PPL)
+--bound-analysis --no-ppl           Distributions + count tables only
+--bound-analysis --no-activation-verification
+                                    PPL without activation verification
+--bound-ppl-only                    Only cumul_score_sum α=1e-4/1e-3/1e-2 + PPL
+--activation-verification-only      Hook-based activation scores + correlations
 """
 
 from __future__ import annotations
@@ -293,11 +302,8 @@ def compute_mlp_output_norms_all_layers(
     """
     Compute mean ||MLP(r)||_2 per layer via forward hooks on calibration prompts.
 
-    Used as a reference for the cumulative budget mode:
-        sum_{i in P} S_i <= alpha * E[||MLP(r)||]
-
-    This compares the potential worst-case contribution loss against the
-    actual MLP output magnitude.
+    Uses register_forward_hook (3-arg signature: module, inp, out) — correct
+    for post-hooks, which receive the output tensor as the third argument.
 
     Returns
     -------
@@ -306,25 +312,26 @@ def compute_mlp_output_norms_all_layers(
     layers   = get_transformer_layers(model)
     n_layers = len(layers)
     captured = [[] for _ in range(n_layers)]
-    hooks    = []
+    handles  = []
 
-    for idx, layer in enumerate(layers):
-        def _make_hook(i):
-            def _hook(module, inp, out):
-                norms = out.detach().float().norm(dim=-1)   # [B, T]
-                captured[i].append(float(norms.mean()))
-            return _hook
-        hooks.append(get_mlp_module(layer).register_forward_hook(_make_hook(idx)))
+    try:
+        for idx, layer in enumerate(layers):
+            def _make_hook(i):
+                def _hook(module, inp, out):
+                    norms = out.detach().float().norm(dim=-1)   # [B, T]
+                    captured[i].append(float(norms.mean()))
+                return _hook
+            handles.append(get_mlp_module(layer).register_forward_hook(_make_hook(idx)))
 
-    model.eval()
-    with torch.no_grad():
-        for prompt in tqdm(prompts, desc="  Calibrating MLP norms", leave=False):
-            enc = tokenizer(prompt, return_tensors="pt",
-                            truncation=True, max_length=max_seq_len).to(device)
-            model(**enc)
-
-    for h in hooks:
-        h.remove()
+        model.eval()
+        with torch.no_grad():
+            for prompt in tqdm(prompts, desc="  Calibrating MLP norms", leave=False):
+                enc = tokenizer(prompt, return_tensors="pt",
+                                truncation=True, max_length=max_seq_len).to(device)
+                model(**enc)
+    finally:
+        for h in handles:
+            h.remove()
 
     return [
         float(sum(vals) / len(vals)) if vals else 0.0
@@ -402,29 +409,39 @@ def verify_activation_contributions(
 
     This answers: "Are the bound-certified neurons also empirically unimportant?"
 
+    Hook notes
+    ----------
+    Uses register_forward_pre_hook, which calls hook(module, inputs) — 2 args.
+    The try/finally ensures hooks are removed even if forward passes crash,
+    preventing stale hooks from corrupting subsequent runs.
+
     Returns a dict with per-layer stats.
     """
     layers   = get_transformer_layers(model)
     n_layers = len(layers)
     captured = [[] for _ in range(n_layers)]
-    hooks    = []
+    handles  = []
 
-    for idx, layer in enumerate(layers):
-        def _make_hook(i):
-            def _hook(module, inp, out):
-                captured[i].append(inp[0].detach().float().cpu())
-            return _hook
-        hooks.append(get_mlp_module(layer).register_forward_pre_hook(_make_hook(idx)))
+    try:
+        for idx, layer in enumerate(layers):
+            def _make_hook(i):
+                # register_forward_pre_hook: hook(module, inputs) — 2 args only
+                def _hook(module, inputs):
+                    captured[i].append(inputs[0].detach().float().cpu())
+                return _hook
+            handles.append(
+                get_mlp_module(layer).register_forward_pre_hook(_make_hook(idx))
+            )
 
-    model.eval()
-    with torch.no_grad():
-        for prompt in prompts:
-            enc = tokenizer(prompt, return_tensors="pt",
-                            truncation=True, max_length=max_seq_len).to(device)
-            model(**enc)
-
-    for h in hooks:
-        h.remove()
+        model.eval()
+        with torch.no_grad():
+            for prompt in prompts:
+                enc = tokenizer(prompt, return_tensors="pt",
+                                truncation=True, max_length=max_seq_len).to(device)
+                model(**enc)
+    finally:
+        for h in handles:
+            h.remove()
 
     per_layer = []
     for i, layer in enumerate(layers):
@@ -574,7 +591,24 @@ def print_pruning_count_table(
 
 
 # ===========================================================================
-# Entry point
+# Shared serializer helper
+# ===========================================================================
+
+def _ser(obj):
+    """Recursively convert tensors and non-JSON types to JSON-safe types."""
+    if isinstance(obj, dict):
+        return {k: _ser(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_ser(v) for v in obj]
+    if isinstance(obj, torch.Tensor):
+        return obj.tolist()
+    if isinstance(obj, (float, int, str, bool, type(None))):
+        return obj
+    return str(obj)
+
+
+# ===========================================================================
+# Entry points
 # ===========================================================================
 
 def run_bound_analysis_mode(
@@ -583,6 +617,8 @@ def run_bound_analysis_mode(
     cfg: dict,
     device: str,
     output_dir: str = "results",
+    skip_ppl: bool = False,
+    skip_activation: bool = False,
 ) -> None:
     """
     Full bound analysis pipeline.
@@ -591,20 +627,22 @@ def run_bound_analysis_mode(
     Phase 2: Calibration — MLP output norms
     Phase 3: Pruning count preview (no PPL — answers "how many certified?")
     Phase 4: PPL experiments for configs that prune > 0 neurons
+             (skipped when skip_ppl=True)
     Phase 5: Save JSON report
+
+    Parameters
+    ----------
+    skip_ppl : bool
+        Skip Phase 4 entirely. Pass --no-ppl on CLI.
+    skip_activation : bool
+        Within Phase 4, skip activation verification.
+        PPL results are saved regardless.  Pass --no-activation-verification on CLI.
 
     INTERPRETATION
     ---------------
     If Phase 3 shows near-zero pruned counts for all configs:
         The bound is too conservative to certify pruning in this model.
         This is a valid scientific finding, not a code failure.
-        It means the static RMSNorm bound alone cannot guarantee safe removal
-        of any neuron — the actual activations dominate over the theoretical
-        worst-case structure.
-
-    If some configs prune neurons and Phase 4 shows low DELTA_PPL:
-        Those neurons are genuinely dispensable per this bound.
-        The activation verification should confirm low actual contributions.
     """
     os.makedirs(output_dir, exist_ok=True)
     ts     = time.strftime("%Y%m%d_%H%M%S")
@@ -613,7 +651,7 @@ def run_bound_analysis_mode(
     # ── Phase 1: Distribution analysis ────────────────────────────────────────
     dist_results = run_distribution_analysis(model)
 
-    # Pre-compute scores and R for all layers (reuse in Phase 3)
+    # Pre-compute scores and R for all layers (reuse in later phases)
     all_scores: List[torch.Tensor] = []
     all_R:      List[float]        = []
     for layer in layers:
@@ -638,156 +676,169 @@ def run_bound_analysis_mode(
     exps = build_experiment_configs(all_scores, mlp_norms)
     print_pruning_count_table(exps, all_scores)
 
-    # ── Phase 4: PPL experiments ───────────────────────────────────────────────
-    from .pruning import prune_model_by_layer_indices, verify_forward_pass
-    from .evaluation import evaluate_perplexity, load_eval_dataset
-    from .flops import estimate_mlp_flops
-    from .model_utils import count_parameters
+    baseline_ppl = None
 
-    n_eval          = cfg.get("bound_analysis_eval_samples", 64)
-    eval_texts      = load_eval_dataset(n_eval)
-    baseline_ppl    = None
-    baseline_params = count_parameters(model)
-    baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
-
-    nonzero_exps = [e for e in exps if e["total_pruned"] > 0]
-
-    if not nonzero_exps:
-        print("  No configurations prune any neurons.")
-        print("  Skipping PPL experiments.\n")
+    if skip_ppl:
+        print("  [--no-ppl] Skipping PPL experiments.\n")
     else:
-        print(f"\n{'=' * 82}")
-        print(f"PPL EXPERIMENTS  ({len(nonzero_exps)} configs, eval_samples={n_eval})")
-        print(f"{'=' * 82}\n")
+        # ── Phase 4: PPL experiments ───────────────────────────────────────────
+        from .pruning import prune_model_by_layer_indices, verify_forward_pass
+        from .evaluation import evaluate_perplexity, load_eval_dataset
+        from .flops import estimate_mlp_flops
+        from .model_utils import count_parameters
 
-        for exp in nonzero_exps:
-            # Lazy baseline
-            if baseline_ppl is None:
-                print("  Computing baseline PPL …")
-                bp           = evaluate_perplexity(
-                    model, tokenizer, texts=eval_texts,
-                    max_seq_len=cfg.get("max_seq_len", 512),
-                    batch_size=cfg.get("batch_size", 4),
-                    device=device,
-                )
-                baseline_ppl = bp["perplexity"]
-                print(f"  Baseline PPL: {baseline_ppl:.4f}\n")
+        use_fallback = cfg.get("use_fallback_corpus", True)
+        n_eval       = cfg.get("bound_analysis_eval_samples", 64)
+        eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
 
-            label   = exp["label"]
-            indices = exp["prune_indices_per_layer"]
-            counts  = [len(pi) for pi in indices]
+        baseline_params = count_parameters(model)
+        baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
+        nonzero_exps    = [e for e in exps if e["total_pruned"] > 0]
+
+        if not nonzero_exps:
+            print("  No configurations prune any neurons.")
+            print("  Skipping PPL experiments.\n")
+        else:
+            print(f"\n{'=' * 82}")
             print(
-                f"  [{label}]  total_pruned={exp['total_pruned']}"
-                f" ({exp['pct_pruned']:.3f}%)"
+                f"PPL EXPERIMENTS  ({len(nonzero_exps)} configs, "
+                f"eval_samples={n_eval}"
+                + ("  [no activation verification]" if skip_activation else "")
+                + ")"
             )
+            print(f"{'=' * 82}\n")
 
-            try:
-                pruned_model, _ = prune_model_by_layer_indices(
-                    model, indices, label=label
-                )
-                fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
-                ppl_info = evaluate_perplexity(
-                    pruned_model, tokenizer, texts=eval_texts,
-                    max_seq_len=cfg.get("max_seq_len", 512),
-                    batch_size=cfg.get("batch_size", 4),
-                    device=device,
-                )
-                ppl = ppl_info["perplexity"]
+            for exp in nonzero_exps:
+                # Lazy baseline (compute once)
+                if baseline_ppl is None:
+                    print("  Computing baseline PPL …")
+                    bp = evaluate_perplexity(
+                        model, tokenizer, texts=eval_texts,
+                        max_seq_len=cfg.get("max_seq_len", 512),
+                        batch_size=cfg.get("batch_size", 4),
+                        device=device,
+                    )
+                    baseline_ppl = bp["perplexity"]
+                    print(f"  Baseline PPL: {baseline_ppl:.4f}\n")
 
-                pruned_params = count_parameters(pruned_model)
-                pruned_flops  = estimate_mlp_flops(
-                    pruned_model, seq_len=cfg.get("max_seq_len", 512)
-                )
-                flop_red = 100.0 * (
-                    1.0 - pruned_flops["total_flops"] / baseline_flops["total_flops"]
-                )
-                mlp_red = 100.0 * (
-                    1.0 - pruned_params["mlp"] / baseline_params["mlp"]
-                )
-
-                exp["perplexity"]         = round(ppl, 4)
-                exp["perplexity_delta"]   = round(ppl - baseline_ppl, 4)
-                exp["baseline_ppl"]       = round(baseline_ppl, 4)
-                exp["forward_pass_ok"]    = fp_ok
-                exp["mlp_params_before"]  = baseline_params["mlp"]
-                exp["mlp_params_after"]   = pruned_params["mlp"]
-                exp["mlp_params_red_pct"] = round(mlp_red, 4)
-                exp["flops_red_pct"]      = round(flop_red, 4)
-
-                # Activation verification
-                act_info = verify_activation_contributions(
-                    model, tokenizer,
-                    prompts=CALIBRATION_PROMPTS,
-                    device=device,
-                    prune_indices_per_layer=indices,
-                )
-                exp["activation_verification"] = act_info
-
-                layer_detail = " ".join(
-                    f"L{i}:{counts[i]}" for i in range(len(counts)) if counts[i] > 0
-                )
+                label   = exp["label"]
+                indices = exp["prune_indices_per_layer"]
+                counts  = [len(pi) for pi in indices]
                 print(
-                    f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
-                    f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
+                    f"  [{label}]  total_pruned={exp['total_pruned']}"
+                    f" ({exp['pct_pruned']:.3f}%)"
                 )
-                if layer_detail:
-                    print(f"    Layers: {layer_detail}")
 
-                del pruned_model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                pruned_model = None
+                try:
+                    pruned_model, _ = prune_model_by_layer_indices(
+                        model, indices, label=label
+                    )
+                    fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
+                    ppl_info = evaluate_perplexity(
+                        pruned_model, tokenizer, texts=eval_texts,
+                        max_seq_len=cfg.get("max_seq_len", 512),
+                        batch_size=cfg.get("batch_size", 4),
+                        device=device,
+                    )
+                    ppl = ppl_info["perplexity"]
 
-            except Exception as exc:
-                logger.error("Experiment [%s] failed: %s", label, exc, exc_info=True)
-                exp["notes"] = f"ERROR: {exc}"
+                    pruned_params = count_parameters(pruned_model)
+                    pruned_flops  = estimate_mlp_flops(
+                        pruned_model, seq_len=cfg.get("max_seq_len", 512)
+                    )
+                    flop_red = 100.0 * (
+                        1.0 - pruned_flops["total_flops"] / baseline_flops["total_flops"]
+                    )
+                    mlp_red = 100.0 * (
+                        1.0 - pruned_params["mlp"] / baseline_params["mlp"]
+                    )
 
-    # ── Summary table ──────────────────────────────────────────────────────────
-    ran = [e for e in exps if e.get("perplexity") is not None]
-    if baseline_ppl is not None and ran:
-        print(f"\n{'=' * 90}")
-        print("BOUND ANALYSIS SUMMARY")
-        print(f"  Baseline PPL: {baseline_ppl:.4f}")
-        print(f"{'─' * 90}")
-        print(
-            f"  {'Label':<44}  {'Pruned':>7}  {'%':>7}"
-            f"  {'PPL':>9}  {'dPPL':>9}  {'MLP-':>7}  {'Fl-':>7}"
-        )
-        print(f"{'─' * 90}")
-        for e in ran:
+                    # Store PPL result immediately — activation verification is separate
+                    exp["perplexity"]         = round(ppl, 4)
+                    exp["perplexity_delta"]   = round(ppl - baseline_ppl, 4)
+                    exp["baseline_ppl"]       = round(baseline_ppl, 4)
+                    exp["forward_pass_ok"]    = fp_ok
+                    exp["mlp_params_before"]  = baseline_params["mlp"]
+                    exp["mlp_params_after"]   = pruned_params["mlp"]
+                    exp["mlp_params_red_pct"] = round(mlp_red, 4)
+                    exp["flops_red_pct"]      = round(flop_red, 4)
+
+                    layer_detail = " ".join(
+                        f"L{i}:{counts[i]}" for i in range(len(counts)) if counts[i] > 0
+                    )
+                    print(
+                        f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
+                        f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
+                    )
+                    if layer_detail:
+                        print(f"    Layers: {layer_detail}")
+
+                    # Activation verification: diagnostic only — failure does NOT
+                    # invalidate the PPL result already stored above.
+                    if not skip_activation:
+                        try:
+                            act_info = verify_activation_contributions(
+                                model, tokenizer,
+                                prompts=CALIBRATION_PROMPTS,
+                                device=device,
+                                prune_indices_per_layer=indices,
+                            )
+                            exp["activation_verification"] = act_info
+                        except Exception as act_exc:
+                            logger.warning(
+                                "Activation verification failed for [%s]: %s",
+                                label, act_exc,
+                            )
+                            exp["activation_verification"] = {"error": str(act_exc)}
+
+                except Exception as exc:
+                    logger.error("Experiment [%s] failed: %s", label, exc, exc_info=True)
+                    exp["notes"] = f"ERROR: {exc}"
+                finally:
+                    if pruned_model is not None:
+                        del pruned_model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        # ── Summary table ──────────────────────────────────────────────────────
+        ran = [e for e in exps if e.get("perplexity") is not None]
+        if baseline_ppl is not None and ran:
+            print(f"\n{'=' * 90}")
+            print("BOUND ANALYSIS SUMMARY")
+            print(f"  Baseline PPL: {baseline_ppl:.4f}")
+            print(f"{'─' * 90}")
             print(
-                f"  {e['label']:<44}"
-                f"  {e['total_pruned']:>7}"
-                f"  {e['pct_pruned']:>6.3f}%"
-                f"  {e['perplexity']:>9.4f}"
-                f"  {e['perplexity_delta']:>+9.4f}"
-                f"  {e.get('mlp_params_red_pct', 0.0):>6.2f}%"
-                f"  {e.get('flops_red_pct', 0.0):>6.2f}%"
+                f"  {'Label':<44}  {'Pruned':>7}  {'%':>7}"
+                f"  {'PPL':>9}  {'dPPL':>9}  {'MLP-':>7}  {'Fl-':>7}"
             )
-        print(f"{'=' * 90}\n")
-    elif not nonzero_exps:
-        print(
-            "\n  KEY FINDING: The RMSNorm worst-case bound found no neurons below\n"
-            "  any tested threshold in this model. This means the bound is too\n"
-            "  conservative to certify the removal of any neuron purely from\n"
-            "  weight norms — every neuron's worst-case contribution exceeds the\n"
-            "  tested safety budgets. Consider using the activation-based score\n"
-            "  (--debug-pruning) or a data-calibrated pruning approach.\n"
-        )
+            print(f"{'─' * 90}")
+            for e in ran:
+                print(
+                    f"  {e['label']:<44}"
+                    f"  {e['total_pruned']:>7}"
+                    f"  {e['pct_pruned']:>6.3f}%"
+                    f"  {e['perplexity']:>9.4f}"
+                    f"  {e['perplexity_delta']:>+9.4f}"
+                    f"  {e.get('mlp_params_red_pct', 0.0):>6.2f}%"
+                    f"  {e.get('flops_red_pct', 0.0):>6.2f}%"
+                )
+            print(f"{'=' * 90}\n")
+        elif not nonzero_exps:
+            print(
+                "\n  KEY FINDING: The RMSNorm worst-case bound found no neurons below\n"
+                "  any tested threshold in this model. This means the bound is too\n"
+                "  conservative to certify the removal of any neuron purely from\n"
+                "  weight norms — every neuron's worst-case contribution exceeds the\n"
+                "  tested safety budgets. Consider using the activation-based score\n"
+                "  (--debug-pruning) or a data-calibrated pruning approach.\n"
+            )
 
     # ── Save report ────────────────────────────────────────────────────────────
-    def _ser(obj):
-        if isinstance(obj, dict):
-            return {k: _ser(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_ser(v) for v in obj]
-        if isinstance(obj, torch.Tensor):
-            return obj.tolist()
-        if isinstance(obj, (float, int, str, bool, type(None))):
-            return obj
-        return str(obj)
-
     report = {
         "timestamp":    ts,
+        "mode":         "bound_analysis",
+        "skip_ppl":     skip_ppl,
         "distribution": dist_results,
         "mlp_norms":    mlp_norms,
         "experiments":  _ser(exps),
@@ -798,3 +849,347 @@ def run_bound_analysis_mode(
         json.dump(report, f, indent=2, default=str)
     logger.info("Bound analysis report -> %s", path)
     print(f"Full report saved to: {path}\n")
+
+
+# ---------------------------------------------------------------------------
+
+def run_bound_ppl_mode(
+    model,
+    tokenizer,
+    cfg: dict,
+    device: str,
+    output_dir: str = "results",
+) -> None:
+    """
+    Focused PPL mode: only cumul_score_sum at alpha = 1e-4, 1e-3, 1e-2.
+    No activation verification.  Extra detail saved for alpha=1e-4.
+
+    Use this after --bound-analysis has already confirmed which alpha values
+    actually prune neurons, and you want clean PPL numbers without the full
+    distribution overhead.
+    """
+    from .pruning import prune_model_by_layer_indices, verify_forward_pass
+    from .evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
+    from .flops import estimate_mlp_flops
+    from .model_utils import count_parameters
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts      = time.strftime("%Y%m%d_%H%M%S")
+    layers  = get_transformer_layers(model)
+    ALPHAS  = [1e-4, 1e-3, 1e-2]
+
+    # Pre-compute scores
+    print("\nComputing bound scores for all layers …")
+    all_scores: List[torch.Tensor] = []
+    for layer in layers:
+        s, _ = compute_bound_scores_and_R(layer)
+        all_scores.append(s)
+
+    # Dataset
+    use_fallback = cfg.get("use_fallback_corpus", True)
+    n_eval       = cfg.get("bound_analysis_eval_samples", 64)
+    eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
+
+    baseline_params = count_parameters(model)
+    baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
+
+    print("  Computing baseline PPL …")
+    bp           = evaluate_perplexity(
+        model, tokenizer, texts=eval_texts,
+        max_seq_len=cfg.get("max_seq_len", 512),
+        batch_size=cfg.get("batch_size", 4),
+        device=device,
+    )
+    baseline_ppl = bp["perplexity"]
+    print(f"  Baseline PPL: {baseline_ppl:.4f}\n")
+
+    results = []
+
+    for alpha in ALPHAS:
+        # Select neurons via cumulative budget (reference = layer score sum)
+        indices      = []
+        budget_used_per_layer = []
+        for i, scores in enumerate(all_scores):
+            ref = float(scores.sum())
+            pi, bu = select_by_budget(scores, alpha, ref)
+            indices.append(pi)
+            budget_used_per_layer.append(bu)
+
+        total_pruned = sum(len(pi) for pi in indices)
+        label        = f"cumul_score_sum a={_k(alpha)}"
+
+        if total_pruned == 0:
+            print(f"  [{label}] 0 neurons pruned — skipping PPL")
+            results.append({
+                "alpha": alpha,
+                "label": label,
+                "total_pruned": 0,
+                "total_neurons": sum(s.numel() for s in all_scores),
+                "pct_pruned": 0.0,
+                "notes": "0 neurons pruned, PPL skipped",
+            })
+            continue
+
+        pct_pruned = 100.0 * total_pruned / sum(s.numel() for s in all_scores)
+        print(f"  [{label}]  pruned={total_pruned} ({pct_pruned:.3f}%)")
+
+        pruned_model = None
+        row = {
+            "alpha":         alpha,
+            "label":         label,
+            "total_pruned":  total_pruned,
+            "total_neurons": sum(s.numel() for s in all_scores),
+            "pct_pruned":    round(pct_pruned, 4),
+        }
+
+        try:
+            pruned_model, _ = prune_model_by_layer_indices(
+                model, indices, label=label
+            )
+            fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
+            ppl_info = evaluate_perplexity(
+                pruned_model, tokenizer, texts=eval_texts,
+                max_seq_len=cfg.get("max_seq_len", 512),
+                batch_size=cfg.get("batch_size", 4),
+                device=device,
+            )
+            ppl = ppl_info["perplexity"]
+
+            pruned_params = count_parameters(pruned_model)
+            pruned_flops  = estimate_mlp_flops(
+                pruned_model, seq_len=cfg.get("max_seq_len", 512)
+            )
+            flop_red = 100.0 * (
+                1.0 - pruned_flops["total_flops"] / baseline_flops["total_flops"]
+            )
+            mlp_red = 100.0 * (
+                1.0 - pruned_params["mlp"] / baseline_params["mlp"]
+            )
+
+            row.update({
+                "baseline_ppl":       round(baseline_ppl, 4),
+                "perplexity":         round(ppl, 4),
+                "perplexity_delta":   round(ppl - baseline_ppl, 4),
+                "forward_pass_ok":    fp_ok,
+                "mlp_params_red_pct": round(mlp_red, 4),
+                "flops_red_pct":      round(flop_red, 4),
+            })
+            print(
+                f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
+                f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
+            )
+
+            # ── Extra detail for alpha=1e-4 ────────────────────────────────────
+            if abs(alpha - 1e-4) < 1e-10 and total_pruned > 0:
+                print("  [alpha=1e-4] Saving detailed pruning log …")
+
+                # Generation examples before pruning (use original model)
+                gens_before = run_generation_tests(model, tokenizer, device=device)
+
+                # Generation examples after pruning
+                gens_after = run_generation_tests(pruned_model, tokenizer, device=device)
+
+                detail: dict = {
+                    "alpha":          alpha,
+                    "label":          label,
+                    "baseline_ppl":   round(baseline_ppl, 4),
+                    "pruned_ppl":     round(ppl, 4),
+                    "ppl_delta":      round(ppl - baseline_ppl, 4),
+                    "total_pruned":   total_pruned,
+                    "pct_pruned":     round(pct_pruned, 4),
+                    "per_layer": [],
+                    "generation_before": gens_before,
+                    "generation_after":  gens_after,
+                }
+                for i, (pi, bu) in enumerate(
+                    zip(indices, budget_used_per_layer)
+                ):
+                    if len(pi) == 0:
+                        detail["per_layer"].append({
+                            "layer_idx": i,
+                            "n_pruned":  0,
+                        })
+                        continue
+                    pruned_scores = all_scores[i][pi].tolist()
+                    detail["per_layer"].append({
+                        "layer_idx":              i,
+                        "n_pruned":               int(len(pi)),
+                        "n_total":                int(all_scores[i].numel()),
+                        "pruned_neuron_indices":  pi.tolist(),
+                        "pruned_neuron_scores":   [round(v, 8) for v in pruned_scores],
+                        "cumul_removed_bound":    round(bu, 8),
+                        "layer_score_sum":        round(float(all_scores[i].sum()), 8),
+                        "fraction_of_layer_sum":  round(bu / max(float(all_scores[i].sum()), 1e-30), 8),
+                    })
+
+                detail_path = os.path.join(
+                    output_dir, f"bound_ppl_detail_alpha1e-04_{ts}.json"
+                )
+                with open(detail_path, "w") as f:
+                    json.dump(_ser(detail), f, indent=2)
+                logger.info("Alpha=1e-4 detail log -> %s", detail_path)
+                print(f"    Detail log: {detail_path}")
+
+        except Exception as exc:
+            logger.error("PPL run [%s] failed: %s", label, exc, exc_info=True)
+            row["notes"] = f"ERROR: {exc}"
+        finally:
+            if pruned_model is not None:
+                del pruned_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        results.append(row)
+
+    # Summary
+    print(f"\n{'=' * 70}")
+    print("BOUND PPL MODE SUMMARY")
+    print(f"  Baseline PPL: {baseline_ppl:.4f}")
+    print(f"{'─' * 70}")
+    for r in results:
+        if "perplexity" in r:
+            print(
+                f"  alpha={_k(r['alpha'])}  pruned={r['total_pruned']} ({r['pct_pruned']:.3f}%)"
+                f"  PPL={r['perplexity']:.4f}  dPPL={r['perplexity_delta']:+.4f}"
+            )
+        else:
+            print(
+                f"  alpha={_k(r['alpha'])}  {r.get('notes', 'skipped')}"
+            )
+    print(f"{'=' * 70}\n")
+
+    # Save
+    report = {
+        "timestamp":    ts,
+        "mode":         "bound_ppl_only",
+        "baseline_ppl": baseline_ppl,
+        "results":      results,
+    }
+    path = os.path.join(output_dir, f"bound_ppl_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    logger.info("Bound PPL report -> %s", path)
+    print(f"Report saved to: {path}\n")
+
+
+# ---------------------------------------------------------------------------
+
+def run_activation_verification_mode(
+    model,
+    tokenizer,
+    cfg: dict,
+    device: str,
+    output_dir: str = "results",
+) -> None:
+    """
+    Compute activation-based neuron scores and compare them to the static
+    RMSNorm bound scores.  No pruning is performed.
+
+    Reports per-layer Pearson and Spearman correlation between bound scores
+    and actual activation contributions, plus a bottom-20% rank overlap.
+
+    High correlation would mean the static bound score is a good proxy for
+    empirical importance. Low correlation means calibration data is needed.
+    """
+    from .scoring import (
+        compute_activation_scores_all_layers,
+        pearson_corr,
+        spearman_corr,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts     = time.strftime("%Y%m%d_%H%M%S")
+    layers = get_transformer_layers(model)
+
+    print(f"\n{'=' * 70}")
+    print("ACTIVATION VERIFICATION MODE")
+    print("Comparing static bound scores to calibration-data activation scores")
+    print(f"{'=' * 70}\n")
+
+    # Compute activation scores (uses fixed 2-arg pre-hook with try/finally)
+    print("Computing activation-based scores via calibration data …")
+    act_scores_per_layer = compute_activation_scores_all_layers(
+        model, tokenizer,
+        prompts=CALIBRATION_PROMPTS,
+        device=device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+
+    # Compute static bound scores
+    print("Computing static bound scores …")
+    bound_scores_per_layer: List[torch.Tensor] = []
+    for layer in layers:
+        s, _ = compute_bound_scores_and_R(layer)
+        bound_scores_per_layer.append(s)
+
+    # Per-layer correlation analysis
+    print(f"\n  {'Layer':>5}  {'d_ff':>5}  {'Pearson':>9}  {'Spearman':>10}  {'Bot-20% overlap':>16}")
+    print(f"  {'-' * 60}")
+
+    correlations = []
+    for i, (bound_s, act_s) in enumerate(
+        zip(bound_scores_per_layer, act_scores_per_layer)
+    ):
+        d_ff = bound_s.numel()
+        if d_ff == 0 or act_s.numel() == 0:
+            continue
+
+        # Align lengths (act_s might be shorter if layer had no captures)
+        min_len = min(d_ff, act_s.numel())
+        b = bound_s[:min_len].float().cpu()
+        a = act_s[:min_len].float().cpu()
+
+        p = pearson_corr(b, a)
+        s = spearman_corr(b, a)
+
+        # Rank overlap: bottom 20% by bound vs bottom 20% by activation
+        k = max(1, min_len // 5)
+        bottom_bound = set(torch.argsort(b)[:k].tolist())
+        bottom_act   = set(torch.argsort(a)[:k].tolist())
+        overlap      = len(bottom_bound & bottom_act) / k
+
+        correlations.append({
+            "layer_idx":         i,
+            "d_ff":              d_ff,
+            "pearson":           round(p, 4),
+            "spearman":          round(s, 4),
+            "bottom20_overlap":  round(overlap, 4),
+        })
+        print(
+            f"  {i:>5}  {d_ff:>5}"
+            f"  {p:>9.4f}  {s:>10.4f}  {overlap:>16.4f}"
+        )
+
+    if correlations:
+        n = len(correlations)
+        mean_p = sum(c["pearson"] for c in correlations) / n
+        mean_s = sum(c["spearman"] for c in correlations) / n
+        mean_o = sum(c["bottom20_overlap"] for c in correlations) / n
+        print(f"  {'-' * 60}")
+        print(
+            f"  {'Mean':>5}         "
+            f"  {mean_p:>9.4f}  {mean_s:>10.4f}  {mean_o:>16.4f}"
+        )
+        print(f"\n  Interpretation:")
+        print(f"    Spearman ≥ 0.8  → bound score is a good proxy for activation importance")
+        print(f"    Spearman < 0.5  → calibration data is required for reliable pruning")
+        print(f"    Bot-20% overlap → fraction of lowest-bound neurons also lowest-activation")
+
+    summary = {
+        "mean_pearson":         round(mean_p, 4) if correlations else None,
+        "mean_spearman":        round(mean_s, 4) if correlations else None,
+        "mean_bottom20_overlap": round(mean_o, 4) if correlations else None,
+    }
+
+    # Save
+    report = {
+        "timestamp":    ts,
+        "mode":         "activation_verification_only",
+        "correlations": correlations,
+        "summary":      summary,
+    }
+    path = os.path.join(output_dir, f"activation_verification_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    logger.info("Activation verification report -> %s", path)
+    print(f"\nReport saved to: {path}\n")

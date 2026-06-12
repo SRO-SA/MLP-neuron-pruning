@@ -37,7 +37,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.bound_analysis import run_bound_analysis_mode
+from src.bound_analysis import (
+    run_bound_analysis_mode,
+    run_bound_ppl_mode,
+    run_activation_verification_mode,
+)
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
@@ -156,7 +160,25 @@ def run_experiment(cfg: Dict, args) -> None:
 
     # ── BOUND ANALYSIS MODE ────────────────────────────────────────────────────
     if args.bound_analysis:
-        run_bound_analysis_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        run_bound_analysis_mode(
+            model, tokenizer, cfg,
+            device=device,
+            output_dir=output_dir,
+            skip_ppl=args.no_ppl,
+            skip_activation=args.no_activation_verification,
+        )
+        return
+
+    # ── BOUND PPL ONLY MODE ────────────────────────────────────────────────────
+    if args.bound_ppl_only:
+        run_bound_ppl_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── ACTIVATION VERIFICATION ONLY MODE ─────────────────────────────────────
+    if args.activation_verification_only:
+        run_activation_verification_mode(
+            model, tokenizer, cfg, device=device, output_dir=output_dir
+        )
         return
 
     # ── DEBUG MODE ─────────────────────────────────────────────────────────────
@@ -177,7 +199,10 @@ def run_experiment(cfg: Dict, args) -> None:
 
     # ── BASELINE ───────────────────────────────────────────────────────────────
     logger.info("Evaluating BASELINE model …")
-    eval_texts = load_eval_dataset(cfg.get("max_eval_samples", 512))
+    eval_texts = load_eval_dataset(
+        cfg.get("max_eval_samples", 512),
+        use_fallback_corpus=cfg.get("use_fallback_corpus", True),
+    )
 
     baseline_ppl_info = evaluate_perplexity(
         model, tokenizer,
@@ -342,20 +367,54 @@ def run_experiment(cfg: Dict, args) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Qwen SwiGLU MLP Pruning Experiment")
+    p = argparse.ArgumentParser(
+        description="Qwen SwiGLU MLP Pruning Experiment",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     p.add_argument("--config", default="configs/default.yaml")
+
+    # ── Main modes ──────────────────────────────────────────────────────────
     p.add_argument(
         "--bound-analysis", action="store_true",
-        help="Compute score distributions + threshold-based pruning (no forced ratios).",
+        help=(
+            "Score distributions + threshold-based PPL experiments.\n"
+            "Combine with --no-ppl / --no-activation-verification to reduce scope."
+        ),
+    )
+    p.add_argument(
+        "--bound-ppl-only", action="store_true",
+        help=(
+            "Run only cumul_score_sum PPL experiments at alpha=1e-4/1e-3/1e-2.\n"
+            "No activation verification. Saves extra detail for alpha=1e-4."
+        ),
+    )
+    p.add_argument(
+        "--activation-verification-only", action="store_true",
+        help=(
+            "Compute hook-based activation scores and correlations with bound scores.\n"
+            "No pruning performed."
+        ),
     )
     p.add_argument(
         "--debug-pruning", action="store_true",
-        help="Run full debug suite: shape checks, zero-mask test, score correlations, etc.",
+        help="Full debug suite: shape checks, zero-mask test, score correlations, etc.",
     )
     p.add_argument(
         "--diagnostics-only", action="store_true",
-        help="Log per-layer MLP norms (no pruning)",
+        help="Log per-layer MLP norms (no pruning).",
     )
+
+    # ── Modifiers for --bound-analysis ──────────────────────────────────────
+    p.add_argument(
+        "--no-ppl", action="store_true",
+        help="(--bound-analysis only) Skip PPL experiments; show distributions and count tables only.",
+    )
+    p.add_argument(
+        "--no-activation-verification", action="store_true",
+        help="(--bound-analysis only) Run PPL experiments but skip activation verification.",
+    )
+
+    # ── Main experiment overrides ────────────────────────────────────────────
     p.add_argument("--pruning-ratios", nargs="+", type=float, default=None)
     p.add_argument("--methods", nargs="+", default=None)
     return p.parse_args()

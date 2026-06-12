@@ -110,10 +110,22 @@ FALLBACK_TEXTS = [
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_eval_dataset(max_samples: int = 512) -> List[str]:
+def load_eval_dataset(
+    max_samples: int = 512,
+    use_fallback_corpus: bool = True,
+) -> List[str]:
     """
     Try to load WikiText-2 test split.
-    Falls back to FALLBACK_TEXTS if datasets / network is unavailable.
+
+    Parameters
+    ----------
+    max_samples : int
+        Maximum number of text samples to return.
+    use_fallback_corpus : bool
+        If True (default), silently fall back to the built-in FALLBACK_TEXTS
+        when WikiText-2 cannot be loaded (useful for offline / CI runs).
+        If False, raise the exception so the caller knows real data is unavailable.
+        Set to False in the config when you need trustworthy perplexity numbers.
     """
     try:
         from datasets import load_dataset  # type: ignore
@@ -125,10 +137,18 @@ def load_eval_dataset(max_samples: int = 512) -> List[str]:
         logger.info("WikiText-2 loaded: %d samples (filtered)", len(texts))
         return texts
     except Exception as exc:  # noqa: BLE001
+        if not use_fallback_corpus:
+            logger.error(
+                "Could not load WikiText-2: %s\n"
+                "  Re-run with use_fallback_corpus: true in the config if you want to\n"
+                "  proceed with the built-in fallback corpus (PPL will be unreliable).",
+                exc,
+            )
+            raise
         logger.warning(
             "Could not load WikiText-2 (%s). Using built-in fallback corpus "
-            "(note: PPL computed on 12 short samples — values are indicative only).",
-            exc,
+            "(note: PPL computed on %d short samples — values are indicative only).",
+            exc, len(FALLBACK_TEXTS),
         )
         return FALLBACK_TEXTS
 
