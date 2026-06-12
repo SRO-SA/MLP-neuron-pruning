@@ -42,7 +42,7 @@ from src.bound_analysis import (
     run_bound_ppl_mode,
     run_activation_verification_mode,
 )
-from src.merging import run_bound_merge_mode, run_debug_merge_mode
+from src.merging import run_bound_merge_mode, run_bound_merge_stable_mode, run_debug_merge_mode
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
@@ -185,6 +185,11 @@ def run_experiment(cfg: Dict, args) -> None:
     # ── BOUND MERGE MODE ───────────────────────────────────────────────────────
     if args.bound_merge:
         run_bound_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── STABLE MERGE MODE ─────────────────────────────────────────────────────
+    if args.bound_merge_stable:
+        run_bound_merge_stable_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── DEBUG MERGE MODE ───────────────────────────────────────────────────────
@@ -413,6 +418,16 @@ def parse_args():
             "Compare pure_delete vs merge_weight vs merge_activation vs down_reconstruction\n"
             "for cumulative-budget candidates at alpha=1e-4/1e-3/1e-2.\n"
             "Saves PPL comparison table and per-neuron diagnostics."
+        ),
+    )
+    p.add_argument(
+        "--bound-merge-stable", action="store_true",
+        help=(
+            "Test stabilized activation-merge variants at alpha=1e-4/1e-3/1e-2.\n"
+            "Variants: clipped beta (4 clip levels), ridge-regularized beta (5 lambdas),\n"
+            "and ridge+clip combinations (3 configs).\n"
+            "Reports: beta stats, update magnitudes, train+held-out reconstruction error\n"
+            "(overfitting detection), and WikiText-2 PPL for each variant."
         ),
     )
     p.add_argument(

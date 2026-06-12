@@ -70,6 +70,32 @@ logger = logging.getLogger(__name__)
 
 EPS = 1e-8
 
+# ---------------------------------------------------------------------------
+# Calibration prompts split — used by run_bound_merge_stable_mode
+#   TRAIN  → compute merge assignments (beta)
+#   HELDOUT → evaluate reconstruction generalization (detect overfitting)
+# ---------------------------------------------------------------------------
+RECONSTRUCTION_TRAIN_PROMPTS = [
+    "The transformer architecture was introduced in the paper Attention Is All You Need.",
+    "Python is a high-level, general-purpose programming language.",
+    "The human brain is the central organ of the human nervous system.",
+    "Machine learning automates analytical model building using statistical methods.",
+    "Quantum mechanics describes the physical properties of matter at atomic scale.",
+    "The Internet is a global system of interconnected computer networks.",
+    "Neural networks are computing systems loosely inspired by biological brains.",
+    "The capital of France is Paris; the city has a population of about two million.",
+    "Deep learning uses multiple layers to extract progressively higher-level features.",
+    "Language models are trained to predict the next token in sequences of text.",
+    "Gradient descent iteratively minimizes a loss function during neural network training.",
+    "Attention mechanisms allow sequence models to focus on relevant input positions.",
+]
+RECONSTRUCTION_HELDOUT_PROMPTS = [
+    "The solar system consists of eight major planets orbiting the Sun.",
+    "Photosynthesis converts sunlight into chemical energy stored as glucose.",
+    "The Pythagorean theorem relates the lengths of the sides of a right triangle.",
+    "Computers process information using binary representations of numerical data.",
+]
+
 
 # ===========================================================================
 # Calibration data collection — inputs
@@ -271,18 +297,30 @@ def compute_merge_assignments_activation(
     keep_indices:  torch.Tensor,
     all_r:         torch.Tensor,
     eps:           float = EPS,
+    ridge_lambda:  float = 0.0,
+    clip_value:    Optional[float] = None,
 ) -> List[dict]:
     """
     For each pruned neuron i, find the best kept neuron j by activation-space similarity.
 
         a_i = SiLU(R @ g_i) * (R @ u_i)   [N_tokens]
-        beta_a  = (a_i · a_j) / (||a_j||² + ε)
-        residual = ||a_i − beta_a · a_j|| / (||a_i|| + ε)
 
-    Update rule:  down_proj[:, j] += beta_a * down_proj[:, i]
+    Stabilized beta computation:
+        beta_raw  = (a_i · a_j) / (||a_j||² + ε + ridge_lambda)
+        beta_used = clip(beta_raw, -clip_value, clip_value)  if clip_value is not None
 
-    Parameters: all_r [N_tokens, d_model] CPU float32 MLP inputs from calibration.
-    Returns List[dict] with keys: i, j, beta, residual
+    ridge_lambda > 0 shrinks beta toward zero (prevents large updates for weakly-aligned pairs).
+    clip_value   sets a hard ceiling on |beta| (prevents single outlier neurons from dominating).
+
+    Update rule:  down_proj[:, j] += beta_used * down_proj[:, i]
+
+    Parameters
+    ----------
+    all_r       : [N_tokens, d_model] CPU float32 MLP inputs from calibration.
+    ridge_lambda: regularization added to denominator (default 0.0 = no ridge)
+    clip_value  : if set, beta is clipped to [-clip_value, +clip_value]
+
+    Returns List[dict] with keys: i, j, beta, beta_raw, residual
     """
     if len(prune_indices) == 0:
         return []
@@ -303,9 +341,10 @@ def compute_merge_assignments_activation(
     A_prune = A_all[:, prune_indices]   # [N, n_prune]
     A_keep  = A_all[:, keep_indices]    # [N, n_keep]
 
-    dots_a      = A_prune.T @ A_keep
-    norms_k_sq  = A_keep.norm(dim=0) ** 2
-    betas_a     = dots_a / (norms_k_sq.unsqueeze(0) + eps)
+    dots_a      = A_prune.T @ A_keep                              # [n_prune, n_keep]
+    norms_k_sq  = A_keep.norm(dim=0) ** 2                        # [n_keep]
+    # Ridge regularization: larger lambda → smaller, more stable beta
+    betas_a     = dots_a / (norms_k_sq.unsqueeze(0) + eps + ridge_lambda)  # [n_prune, n_keep]
 
     norms_p     = A_prune.norm(dim=0)
     residual_sq = (
@@ -318,11 +357,15 @@ def compute_merge_assignments_activation(
 
     assignments = []
     for idx in range(n_prune):
-        jl = int(best_j_local[idx])
+        jl        = int(best_j_local[idx])
+        beta_raw  = float(betas_a[idx, jl])
+        # Apply clipping after ridge regularization
+        beta_used = float(max(-clip_value, min(clip_value, beta_raw))) if clip_value is not None else beta_raw
         assignments.append({
             "i":        prune_list[idx],
             "j":        keep_list[jl],
-            "beta":     round(float(betas_a[idx, jl]), 8),
+            "beta":     round(beta_used, 8),
+            "beta_raw": round(beta_raw, 8),
             "residual": round(float(residual_norm[idx, jl]), 8),
         })
 
@@ -1227,3 +1270,447 @@ def run_bound_merge_mode(model, tokenizer, cfg, device, output_dir="results"):
         json.dump(report, f, indent=2, default=str)
     logger.info("Bound merge report: %s", path)
     print(f"Report saved to: {path}\n")
+
+
+# ===========================================================================
+# Held-out reconstruction evaluator
+# ===========================================================================
+
+def _compute_held_out_reconstruction(
+    layers,
+    prune_indices_per_layer,
+    keep_indices_per_layer,
+    assignments_per_layer,
+    train_r_per_layer,
+    heldout_r_per_layer,
+    eps: float = EPS,
+) -> list:
+    """
+    Evaluate merge assignment quality on both training and held-out calibration data.
+
+    For each pruned layer, compute:
+      - In-sample reconstruction error  (using train_r — same data used to compute beta)
+      - Held-out reconstruction error   (using heldout_r — unseen at assignment time)
+
+    A large gap between in-sample and held-out error indicates overfitting of beta
+    to the (small) calibration set.
+
+    Errors are relative:  ||Y - Y_approx|| / ||Y||
+    where Y = A_full @ w_down.T  (full MLP output including pruned neurons).
+    """
+    import torch.nn.functional as F
+
+    layer_results = []
+    for layer_idx, (layer, pi, ki, asns, r_tr, r_ho) in enumerate(zip(
+        layers,
+        prune_indices_per_layer,
+        keep_indices_per_layer,
+        assignments_per_layer,
+        train_r_per_layer,
+        heldout_r_per_layer,
+    )):
+        if len(pi) == 0:
+            layer_results.append({"layer_idx": layer_idx, "n_pruned": 0})
+            continue
+
+        w       = get_mlp_weights(layer)
+        w_gate  = w["gate"].detach().float().cpu()   # [d_ff, d_model]
+        w_up    = w["up"].detach().float().cpu()     # [d_ff, d_model]
+        w_down  = w["down"].detach().float().cpu()   # [d_model, d_ff]
+
+        # Build compensated down projection (same weight as used during pruning)
+        w_down_comp = w_down.clone()
+        for asn in asns:
+            i_col = w_down[:, asn["i"]].clone()
+            w_down_comp[:, asn["j"]].add_(asn["beta"] * i_col)
+
+        def _layer_errors(R: torch.Tensor):
+            """
+            Returns (delete_err, merge_err) for a given input matrix R [N, d_model].
+            """
+            with torch.no_grad():
+                A = F.silu(R @ w_gate.T) * (R @ w_up.T)  # [N, d_ff]
+                Y = A @ w_down.T                           # [N, d_model] full output
+                Y_del   = A[:, ki] @ w_down[:, ki].T      # delete-only approximation
+                Y_merge = A[:, ki] @ w_down_comp[:, ki].T # merge-compensated approx
+                Y_norm  = float(Y.norm()) + eps
+                del_err   = float((Y - Y_del).norm())   / Y_norm
+                merge_err = float((Y - Y_merge).norm()) / Y_norm
+            return del_err, merge_err
+
+        tr_del,  tr_mrg  = _layer_errors(r_tr.float().cpu())
+        ho_del,  ho_mrg  = _layer_errors(r_ho.float().cpu())
+
+        def _imp(d, m):
+            return round(100.0 * (d - m) / (d + eps), 2)
+
+        layer_results.append({
+            "layer_idx":              layer_idx,
+            "n_pruned":               int(len(pi)),
+            "train_delete_err":       round(tr_del, 6),
+            "train_merge_err":        round(tr_mrg, 6),
+            "train_improvement_pct":  _imp(tr_del, tr_mrg),
+            "heldout_delete_err":     round(ho_del, 6),
+            "heldout_merge_err":      round(ho_mrg, 6),
+            "heldout_improvement_pct": _imp(ho_del, ho_mrg),
+            # Positive = merge is overfitting train, negative = generalizes better
+            "overfit_gap_pct":        round(_imp(tr_del, tr_mrg) - _imp(ho_del, ho_mrg), 2),
+        })
+
+    return layer_results
+
+
+# ===========================================================================
+# --bound-merge-stable entry point
+# ===========================================================================
+
+def run_bound_merge_stable_mode(model, tokenizer, cfg, device, output_dir="results"):
+    """
+    Test stabilized activation-merge variants.
+
+    Variants compared (per alpha):
+      A. activation_merge_clip_{c}  — original beta, clipped to [-c, c]
+         c ∈ {2.0, 1.0, 0.5, 0.25}
+      B. activation_merge_ridge_lam{l}  — ridge-regularized beta
+         lambda ∈ {1e-4, 1e-3, 1e-2, 0.1, 1.0}
+      C. activation_merge_ridge_lam{l}_clip{c}  — ridge + clipping
+         (lambda, clip) ∈ {(1e-2, 0.5), (0.1, 0.5), (1.0, 0.5)}
+
+    Plus baselines:  pure_delete, merge_activation_original
+
+    For each variant, reports:
+      - Beta stats: mean/median/max abs, raw vs clipped
+      - Update magnitudes on down_proj
+      - In-sample AND held-out MLP reconstruction error (overfitting detection)
+      - WikiText-2 perplexity
+
+    Train/held-out split:
+      RECONSTRUCTION_TRAIN_PROMPTS  → compute beta assignments
+      RECONSTRUCTION_HELDOUT_PROMPTS → evaluate reconstruction generalization
+    """
+    import json, os, time
+    import torch
+
+    from .bound_analysis import _k, compute_bound_scores_and_R, select_by_budget
+    from .evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
+    from .flops import estimate_mlp_flops
+    from .model_utils import count_parameters
+    from .pruning import prune_model_by_layer_indices, verify_forward_pass
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts     = time.strftime("%Y%m%d_%H%M%S")
+    layers = get_transformer_layers(model)
+    ALPHAS = [1e-4, 1e-3, 1e-2]
+
+    # ------------------------------------------------------------------
+    # Variant specs: (name, ridge_lambda, clip_value)
+    # ------------------------------------------------------------------
+    VARIANTS = [
+        # baseline
+        ("pure_delete",                          None,  None),
+        ("merge_activation_original",            0.0,   None),
+        # A — clipped beta only
+        ("merge_activation_clip_2.0",            0.0,   2.0),
+        ("merge_activation_clip_1.0",            0.0,   1.0),
+        ("merge_activation_clip_0.5",            0.0,   0.5),
+        ("merge_activation_clip_0.25",           0.0,   0.25),
+        # B — ridge only
+        ("merge_activation_ridge_1e-4",          1e-4,  None),
+        ("merge_activation_ridge_1e-3",          1e-3,  None),
+        ("merge_activation_ridge_1e-2",          1e-2,  None),
+        ("merge_activation_ridge_0.1",           0.1,   None),
+        ("merge_activation_ridge_1.0",           1.0,   None),
+        # C — ridge + clip
+        ("merge_activation_ridge_1e-2_clip_0.5", 1e-2,  0.5),
+        ("merge_activation_ridge_0.1_clip_0.5",  0.1,   0.5),
+        ("merge_activation_ridge_1.0_clip_0.5",  1.0,   0.5),
+    ]
+
+    # ------------------------------------------------------------------
+    # Compute scores + collect calibration inputs
+    # ------------------------------------------------------------------
+    print("\nComputing bound scores for all layers ...")
+    all_scores = [compute_bound_scores_and_R(l)[0] for l in layers]
+
+    print("Collecting TRAIN calibration inputs ...")
+    train_r_per_layer = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_TRAIN_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+    print("Collecting HELD-OUT calibration inputs ...")
+    heldout_r_per_layer = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_HELDOUT_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+
+    # ------------------------------------------------------------------
+    # Load eval dataset + baseline
+    # ------------------------------------------------------------------
+    use_fallback = cfg.get("use_fallback_corpus", True)
+    n_eval       = cfg.get("bound_analysis_eval_samples", 64)
+    eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
+
+    baseline_params = count_parameters(model)
+    baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
+
+    print("Computing baseline PPL ...")
+    bp           = evaluate_perplexity(
+        model, tokenizer, texts=eval_texts,
+        max_seq_len=cfg.get("max_seq_len", 512),
+        batch_size=cfg.get("batch_size", 4),
+        device=device,
+    )
+    baseline_ppl = bp["perplexity"]
+    print(f"Baseline PPL: {baseline_ppl:.4f}\n")
+
+    all_results = []
+
+    # ------------------------------------------------------------------
+    # Main loop over alphas
+    # ------------------------------------------------------------------
+    for alpha in ALPHAS:
+        prune_indices_per_layer = []
+        for scores in all_scores:
+            pi, _ = select_by_budget(scores, alpha, float(scores.sum()))
+            prune_indices_per_layer.append(pi)
+
+        total_pruned = sum(len(pi) for pi in prune_indices_per_layer)
+        total_n      = sum(s.numel() for s in all_scores)
+        pct          = 100.0 * total_pruned / total_n if total_n else 0.0
+
+        if total_pruned == 0:
+            print(f"alpha={_k(alpha)}: 0 neurons selected — skipping\n")
+            continue
+
+        keep_indices_per_layer = []
+        for scores, pi in zip(all_scores, prune_indices_per_layer):
+            p_set = set(pi.tolist())
+            ki    = torch.tensor(
+                [j for j in range(scores.numel()) if j not in p_set], dtype=torch.long
+            )
+            keep_indices_per_layer.append(ki)
+
+        print(f"\n{'=' * 72}")
+        print(f"alpha={_k(alpha)}  pruned={total_pruned} ({pct:.3f}%)")
+        print(f"{'=' * 72}")
+
+        # ------------------------------------------------------------------
+        # Loop over variants
+        # ------------------------------------------------------------------
+        for vname, ridge_lam, clip_val in VARIANTS:
+            print(f"\n  [{vname}]")
+            row = {
+                "alpha":        alpha,
+                "method":       vname,
+                "total_pruned": total_pruned,
+                "pct_pruned":   round(pct, 4),
+                "baseline_ppl": round(baseline_ppl, 4),
+                "ridge_lambda": ridge_lam,
+                "clip_value":   clip_val,
+            }
+            pruned_model = None
+            try:
+                # --- Build pruned model ---
+                if vname == "pure_delete":
+                    pruned_model, _ = prune_model_by_layer_indices(
+                        model, prune_indices_per_layer, label=f"stable_del_a{_k(alpha)}"
+                    )
+                    asns_per_layer = [[] for _ in layers]
+                else:
+                    asns_per_layer = [
+                        compute_merge_assignments_activation(
+                            l, pi, ki, r,
+                            ridge_lambda=ridge_lam,
+                            clip_value=clip_val,
+                        ) if len(pi) > 0 else []
+                        for l, pi, ki, r in zip(
+                            layers, prune_indices_per_layer,
+                            keep_indices_per_layer, train_r_per_layer
+                        )
+                    ]
+                    pruned_model, _ = apply_merge_and_prune(
+                        model, prune_indices_per_layer, asns_per_layer,
+                        label=f"stable_{vname[:20]}_a{_k(alpha)}"
+                    )
+
+                # --- Beta stats ---
+                if vname != "pure_delete":
+                    beta_stats = _debug_beta_stats(asns_per_layer)
+                    row["beta_mean_abs"]   = beta_stats["mean_abs_beta"]
+                    row["beta_median_abs"] = beta_stats["median_abs_beta"]
+                    row["beta_max_abs"]    = beta_stats["max_abs_beta"]
+                    row["beta_pct_lt_0.1"] = beta_stats["pct_lt_0.1"]
+
+                    # Raw beta stats (before clipping) if clip was applied
+                    if clip_val is not None:
+                        raw_betas = [asn["beta_raw"] for asns in asns_per_layer for asn in asns]
+                        if raw_betas:
+                            row["beta_raw_mean_abs"] = round(
+                                sum(abs(b) for b in raw_betas) / len(raw_betas), 6
+                            )
+                            row["beta_raw_max_abs"]  = round(max(abs(b) for b in raw_betas), 6)
+                            row["beta_pct_clipped"]  = round(
+                                100.0 * sum(1 for b in raw_betas if abs(b) > clip_val) / len(raw_betas), 2
+                            )
+
+                    # Update magnitudes on down_proj
+                    upd = _debug_update_magnitudes(layers, asns_per_layer)
+                    row["down_update_mean_norm"]  = upd.get("mean_update_norm", 0.0)
+                    row["down_update_mean_rel"]   = upd.get("mean_rel_update", 0.0)
+
+                    # Train / held-out reconstruction
+                    ho_results = _compute_held_out_reconstruction(
+                        layers,
+                        prune_indices_per_layer,
+                        keep_indices_per_layer,
+                        asns_per_layer,
+                        train_r_per_layer,
+                        heldout_r_per_layer,
+                    )
+                    active_ho = [r for r in ho_results if r.get("n_pruned", 0) > 0]
+                    if active_ho:
+                        row["train_merge_err_mean"]      = round(
+                            sum(r["train_merge_err"]   for r in active_ho) / len(active_ho), 6
+                        )
+                        row["train_delete_err_mean"]     = round(
+                            sum(r["train_delete_err"]  for r in active_ho) / len(active_ho), 6
+                        )
+                        row["heldout_merge_err_mean"]    = round(
+                            sum(r["heldout_merge_err"]  for r in active_ho) / len(active_ho), 6
+                        )
+                        row["heldout_delete_err_mean"]   = round(
+                            sum(r["heldout_delete_err"] for r in active_ho) / len(active_ho), 6
+                        )
+                        row["train_improvement_pct"]     = round(
+                            sum(r["train_improvement_pct"]   for r in active_ho) / len(active_ho), 2
+                        )
+                        row["heldout_improvement_pct"]   = round(
+                            sum(r["heldout_improvement_pct"] for r in active_ho) / len(active_ho), 2
+                        )
+                        row["overfit_gap_pct"]           = round(
+                            sum(r["overfit_gap_pct"] for r in active_ho) / len(active_ho), 2
+                        )
+                        row["per_layer_reconstruction"]  = active_ho
+
+                        print(
+                            f"    train:  del={row['train_delete_err_mean']:.6f}  "
+                            f"merge={row['train_merge_err_mean']:.6f}  "
+                            f"imp={row['train_improvement_pct']:+.2f}%"
+                        )
+                        print(
+                            f"    heldout:del={row['heldout_delete_err_mean']:.6f}  "
+                            f"merge={row['heldout_merge_err_mean']:.6f}  "
+                            f"imp={row['heldout_improvement_pct']:+.2f}%  "
+                            f"overfit={row['overfit_gap_pct']:+.2f}%"
+                        )
+                        if clip_val is not None and "beta_pct_clipped" in row:
+                            print(
+                                f"    beta clipped: {row['beta_pct_clipped']:.1f}% of neurons  "
+                                f"raw_max={row.get('beta_raw_max_abs', 0.0):.4f}"
+                            )
+                        print(
+                            f"    beta: mean_abs={row['beta_mean_abs']:.4f}  "
+                            f"max_abs={row['beta_max_abs']:.4f}  "
+                            f"down_update_rel={row['down_update_mean_rel']:.4f}"
+                        )
+
+                # --- PPL ---
+                fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
+                ppl_info = evaluate_perplexity(
+                    pruned_model, tokenizer, texts=eval_texts,
+                    max_seq_len=cfg.get("max_seq_len", 512),
+                    batch_size=cfg.get("batch_size", 4),
+                    device=device,
+                )
+                ppl = ppl_info["perplexity"]
+
+                p_params = count_parameters(pruned_model)
+                p_flops  = estimate_mlp_flops(pruned_model, seq_len=cfg.get("max_seq_len", 512))
+                flop_red = 100.0 * (1.0 - p_flops["total_flops"] / baseline_flops["total_flops"])
+                mlp_red  = 100.0 * (1.0 - p_params["mlp"] / baseline_params["mlp"])
+
+                row.update({
+                    "perplexity":         round(ppl, 4),
+                    "perplexity_delta":   round(ppl - baseline_ppl, 4),
+                    "forward_pass_ok":    fp_ok,
+                    "mlp_params_red_pct": round(mlp_red, 4),
+                    "flops_red_pct":      round(flop_red, 4),
+                })
+                print(
+                    f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
+                    f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
+                )
+
+            except Exception as exc:
+                logger.error("Variant [%s] alpha=%s failed: %s", vname, _k(alpha), exc, exc_info=True)
+                row["notes"] = f"ERROR: {exc}"
+            finally:
+                if pruned_model is not None:
+                    del pruned_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            all_results.append(row)
+
+    # ------------------------------------------------------------------
+    # Summary table
+    # ------------------------------------------------------------------
+    print(f"\n{'=' * 90}")
+    print("STABLE ACTIVATION MERGE SUMMARY")
+    print(f"  Baseline PPL: {baseline_ppl:.4f}")
+    print(f"{'─' * 90}")
+    hdr = (f"  {'alpha':>9}  {'method':<44}  {'PPL':>9}  {'dPPL':>9}"
+           f"  {'HO-imp':>7}  {'overfit':>7}")
+    print(hdr)
+    print(f"{'─' * 90}")
+    for r in all_results:
+        if "perplexity" in r:
+            ho_imp  = r.get("heldout_improvement_pct", float("nan"))
+            overfit = r.get("overfit_gap_pct",         float("nan"))
+            print(
+                f"  {_k(r['alpha']):>9}  {r['method']:<44}"
+                f"  {r['perplexity']:>9.4f}  {r['perplexity_delta']:>+9.4f}"
+                f"  {ho_imp:>+7.2f}%  {overfit:>+7.2f}%"
+            )
+        else:
+            print(f"  {_k(r['alpha']):>9}  {r['method']:<44}  {r.get('notes', 'ERROR')}")
+    print(f"{'=' * 90}\n")
+
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
+    report = {
+        "timestamp":    ts,
+        "mode":         "bound_merge_stable",
+        "baseline_ppl": baseline_ppl,
+        "results":      all_results,
+    }
+    path = os.path.join(output_dir, f"bound_merge_stable_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
+    # CSV (summary without per-layer reconstruction lists)
+    import csv
+    csv_path = os.path.join(output_dir, f"bound_merge_stable_{ts}.csv")
+    csv_keys = [
+        "alpha", "method", "ridge_lambda", "clip_value",
+        "total_pruned", "pct_pruned", "baseline_ppl",
+        "perplexity", "perplexity_delta",
+        "beta_mean_abs", "beta_median_abs", "beta_max_abs",
+        "beta_raw_max_abs", "beta_pct_clipped",
+        "down_update_mean_norm", "down_update_mean_rel",
+        "train_delete_err_mean", "train_merge_err_mean", "train_improvement_pct",
+        "heldout_delete_err_mean", "heldout_merge_err_mean", "heldout_improvement_pct",
+        "overfit_gap_pct",
+        "mlp_params_red_pct", "flops_red_pct",
+        "forward_pass_ok", "notes",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_keys, extrasaction="ignore")
+        writer.writeheader()
+        for r in all_results:
+            writer.writerow(r)
+
+    logger.info("Stable merge report: %s", path)
+    print(f"Report saved to: {path}")
+    print(f"CSV saved to:    {csv_path}\n")
