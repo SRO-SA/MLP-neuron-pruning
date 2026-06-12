@@ -178,9 +178,11 @@ def _gather_all_scores(
 ) -> List[torch.Tensor]:
     """
     Compute per-layer RMSNorm-bound-angle scores (static; no forward pass).
-    Returns list of 1-D float32 tensors, shape [intermediate_size], one per layer.
+    Returns list of detached 1-D float32 CPU tensors, shape [intermediate_size].
     """
-    return [compute_bound_scores_fn(layer)[0] for layer in layers]
+    with torch.no_grad():
+        return [compute_bound_scores_fn(layer)[0].detach().float().cpu()
+                for layer in layers]
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +218,7 @@ def _select_global_target(
     caps = [max(1, int(max_layer_frac * sz)) for sz in layer_sizes]
 
     # Build flat sorted array
-    flat_scores  = np.concatenate([s.cpu().float().numpy() for s in all_scores])
+    flat_scores  = np.concatenate([s.detach().cpu().float().numpy() for s in all_scores])
     flat_layers  = np.concatenate(
         [np.full(sz, i, dtype=np.int32) for i, sz in enumerate(layer_sizes)]
     )
@@ -281,7 +283,7 @@ def _score_diagnostics(
     (matching the existing alpha-based selection logic exactly), so the neuron
     counts are directly comparable to --scaling-recon output.
     """
-    flat = np.concatenate([s.cpu().float().numpy() for s in all_scores])
+    flat = np.concatenate([s.detach().cpu().float().numpy() for s in all_scores])
 
     # Percentiles
     qs   = [0.1, 1.0, 5.0, 10.0, 50.0, 90.0]
@@ -305,18 +307,19 @@ def _score_diagnostics(
     }
 
     # Alpha comparisons: use per-layer sums (matching existing behavior)
-    for alpha in DIAGNOSTIC_ALPHAS:
-        count = 0
-        for scores in all_scores:
-            try:
-                pi, _ = select_by_budget_fn(scores, alpha, float(scores.sum()))
-                count += len(pi)
-            except Exception:
-                pass
-        pct    = 100.0 * count / total_mlp_neurons if total_mlp_neurons else 0.0
-        a_key  = _k(alpha)
-        diag[f"alpha_{a_key}_neurons"] = count
-        diag[f"alpha_{a_key}_pct"]     = round(pct, 4)
+    with torch.no_grad():
+        for alpha in DIAGNOSTIC_ALPHAS:
+            count = 0
+            for scores in all_scores:
+                try:
+                    pi, _ = select_by_budget_fn(scores, alpha, float(scores.sum()))
+                    count += len(pi)
+                except Exception:
+                    pass
+            pct    = 100.0 * count / total_mlp_neurons if total_mlp_neurons else 0.0
+            a_key  = _k(alpha)
+            diag[f"alpha_{a_key}_neurons"] = count
+            diag[f"alpha_{a_key}_pct"]     = round(pct, 4)
 
     return diag
 
@@ -337,7 +340,7 @@ def _make_per_layer_rows(
         sz         = int(scores.numel())
         n_pruned   = int(len(pi))
         prn_pct    = 100.0 * n_pruned / sz if sz else 0.0
-        s_all      = scores.cpu().float().numpy()
+        s_all      = scores.detach().cpu().float().numpy()
 
         row: Dict = {
             "model":                   model_name,
@@ -352,7 +355,7 @@ def _make_per_layer_rows(
             "max_score_pruned_layer":  "",
         }
         if n_pruned > 0:
-            s_pruned = s_all[pi.numpy()]
+            s_pruned = s_all[pi.detach().numpy()]
             row["mean_score_pruned_layer"] = round(float(s_pruned.mean()), 8)
             row["max_score_pruned_layer"]  = round(float(s_pruned.max()),  8)
         rows.append(row)
@@ -385,7 +388,7 @@ def _try_save_plots(
         logger.info("matplotlib not available — skipping diagnostic plots")
         return
 
-    flat      = np.concatenate([s.cpu().float().numpy() for s in all_scores])
+    flat      = np.concatenate([s.detach().cpu().float().numpy() for s in all_scores])
     total_sum = float(flat.sum()) + 1e-30
     safe_name = model_name.replace("/", "_")
 
