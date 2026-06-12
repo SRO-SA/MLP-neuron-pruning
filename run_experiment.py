@@ -37,11 +37,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.bound_analysis import (
-    run_bound_analysis_mode,
-    run_bound_ppl_mode,
-    run_activation_verification_mode,
-)
+from src.bound_analysis import run_bound_analysis_mode
 from src.merging import (
     run_bound_merge_mode,
     run_bound_merge_stable_mode,
@@ -178,13 +174,19 @@ def run_experiment(cfg: Dict, args) -> None:
 
     # ── BOUND PPL ONLY MODE ────────────────────────────────────────────────────
     if args.bound_ppl_only:
-        run_bound_ppl_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        run_bound_analysis_mode(
+            model, tokenizer, cfg,
+            device=device, output_dir=output_dir,
+            skip_ppl=False, skip_activation=True,
+        )
         return
 
     # ── ACTIVATION VERIFICATION ONLY MODE ─────────────────────────────────────
     if args.activation_verification_only:
-        run_activation_verification_mode(
-            model, tokenizer, cfg, device=device, output_dir=output_dir
+        run_bound_analysis_mode(
+            model, tokenizer, cfg,
+            device=device, output_dir=output_dir,
+            skip_ppl=True, skip_activation=False,
         )
         return
 
