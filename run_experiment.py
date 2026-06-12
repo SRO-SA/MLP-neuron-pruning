@@ -511,7 +511,7 @@ def parse_args():
 
 
 def main():
-    p    = build_arg_parser()
+    p    = parse_args()
     args = p.parse_args()
 
     with open(args.config) as fh:
