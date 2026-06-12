@@ -42,7 +42,12 @@ from src.bound_analysis import (
     run_bound_ppl_mode,
     run_activation_verification_mode,
 )
-from src.merging import run_bound_merge_mode, run_bound_merge_stable_mode, run_debug_merge_mode
+from src.merging import (
+    run_bound_merge_mode,
+    run_bound_merge_stable_mode,
+    run_debug_merge_mode,
+    run_reconstruction_merge_mode,
+)
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
@@ -185,6 +190,11 @@ def run_experiment(cfg: Dict, args) -> None:
     # ── BOUND MERGE MODE ───────────────────────────────────────────────────────
     if args.bound_merge:
         run_bound_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── RECONSTRUCTION MERGE MODE ─────────────────────────────────────────────
+    if args.reconstruction_merge:
+        run_reconstruction_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── STABLE MERGE MODE ─────────────────────────────────────────────────────
@@ -421,6 +431,16 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--reconstruction-merge", action="store_true",
+        help=(
+            "Compare pairwise activation merge vs down-proj ridge reconstruction.\n"
+            "Methods: pure_delete, merge_activation (ridge_1e-2/ridge_1.0/clip_0.5),\n"
+            "         down_recon_ridge at lam in {1e-6,1e-5,1e-4,1e-3,1e-2,0.1,1.0}.\n"
+            "Uses train/held-out calibration split for overfitting detection.\n"
+            "Reports: PPL, dPPL, reconstruction error, overfit gap."
+        ),
+    )
+    p.add_argument(
         "--bound-merge-stable", action="store_true",
         help=(
             "Test stabilized activation-merge variants at alpha=1e-4/1e-3/1e-2.\n"
@@ -448,7 +468,7 @@ def parse_args():
         help="Log per-layer MLP norms (no pruning).",
     )
 
-    # ── Modifiers for --bound-analysis ──────────────────────────────────────
+    # -- Modifiers for --bound-analysis --------------------------------------
     p.add_argument(
         "--no-ppl", action="store_true",
         help="(--bound-analysis only) Skip PPL; show distributions and count tables only.",
@@ -458,7 +478,7 @@ def parse_args():
         help="(--bound-analysis only) Run PPL but skip activation verification.",
     )
 
-    # ── Main experiment overrides ────────────────────────────────────────────
+    # -- Main experiment overrides -------------------------------------------
     p.add_argument("--pruning-ratios", nargs="+", type=float, default=None)
     p.add_argument("--methods", nargs="+", default=None)
     return p.parse_args()
@@ -467,4 +487,4 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     cfg  = load_config(args.config)
-    run_experiment(cfg, args)
+    main(args, cfg)

@@ -504,6 +504,41 @@ def _compute_reconstruction_for_layer(
     return B, sanity
 
 
+def _eval_recon_heldout(
+    layer,
+    heldout_r:    torch.Tensor,   # [N_held, d_model]
+    keep_indices: torch.Tensor,   # [k]
+    B:            torch.Tensor,   # [k, d_model] fitted reconstruction weights
+    eps:          float = EPS,
+) -> dict:
+    """
+    Evaluate a pre-fitted reconstruction matrix B on held-out calibration inputs.
+    Returns dict with delete_err, recon_err, and improvement_pct on held-out data.
+    """
+    w = get_mlp_weights(layer)
+    w_gate = w["gate"].detach().float().cpu()
+    w_up   = w["up"].detach().float().cpu()
+    w_down = w["down"].detach().float().cpu()
+
+    R = heldout_r.float().cpu()
+    with torch.no_grad():
+        A     = F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N_held, d_ff]
+        Y     = A @ w_down.T                            # [N_held, d_model]
+        A_K   = A[:, keep_indices]                      # [N_held, k]
+        Y_del = A_K @ w_down[:, keep_indices].T         # deletion baseline
+        Y_hat = A_K @ B                                 # reconstruction
+
+        Y_norm   = float(Y.norm()) + eps
+        del_err  = float((Y - Y_del).norm()) / Y_norm
+        recon_err = float((Y - Y_hat).norm()) / Y_norm
+
+    return {
+        "heldout_delete_err":  round(del_err, 6),
+        "heldout_recon_err":   round(recon_err, 6),
+        "heldout_improvement_pct": round(100.0 * (del_err - recon_err) / (del_err + eps), 2),
+    }
+
+
 def apply_down_reconstruction(
     model,
     prune_indices_per_layer:  List[torch.Tensor],
@@ -512,6 +547,7 @@ def apply_down_reconstruction(
     method:                   str   = "lstsq",
     ridge_lambda:             float = 1e-5,
     eps:                      float = EPS,
+    heldout_r_per_layer:      Optional[List[torch.Tensor]] = None,
 ) -> Tuple[object, dict]:
     """
     Prune gate/up rows and refit down_proj weights via least squares.
@@ -526,6 +562,9 @@ def apply_down_reconstruction(
     The clone's down_proj for pruned columns is irrelevant (they get removed).
     Only keep_indices columns matter, and they now hold the reconstructed weights.
 
+    If heldout_r_per_layer is provided, each sanity entry also contains
+    heldout_delete_err / heldout_recon_err / heldout_improvement_pct.
+
     Returns (pruned_model, info) where info["sanity_per_layer"] has per-layer errors.
     """
     from .pruning import prune_model_by_layer_indices
@@ -536,10 +575,13 @@ def apply_down_reconstruction(
 
     sanity_per_layer = []
 
+    held_iter = heldout_r_per_layer if heldout_r_per_layer is not None else [None] * len(orig_layers)
+
     with torch.no_grad():
-        for layer_idx, (orig_l, clone_l, pi, ki, r) in enumerate(
+        for layer_idx, (orig_l, clone_l, pi, ki, r, r_held) in enumerate(
             zip(orig_layers, clone_layers,
-                prune_indices_per_layer, keep_indices_per_layer, all_r_per_layer)
+                prune_indices_per_layer, keep_indices_per_layer,
+                all_r_per_layer, held_iter)
         ):
             if len(pi) == 0:
                 sanity_per_layer.append({"layer_idx": layer_idx, "n_pruned": 0})
@@ -552,6 +594,15 @@ def apply_down_reconstruction(
                 orig_l, r, ki, method=method, ridge_lambda=ridge_lambda, eps=eps
             )
             sanity["layer_idx"] = layer_idx
+
+            # Optionally evaluate B on held-out data (overfitting check)
+            if r_held is not None:
+                held_stats = _eval_recon_heldout(orig_l, r_held, ki, B, eps=eps)
+                sanity.update(held_stats)
+                sanity["overfit_gap_pct"] = round(
+                    sanity["improvement_pct"] - held_stats["heldout_improvement_pct"], 2
+                )
+
             sanity_per_layer.append(sanity)
 
             # Set clone's down_proj columns for keep_indices to B.T
@@ -1714,3 +1765,459 @@ def run_bound_merge_stable_mode(model, tokenizer, cfg, device, output_dir="resul
     logger.info("Stable merge report: %s", path)
     print(f"Report saved to: {path}")
     print(f"CSV saved to:    {csv_path}\n")
+
+
+# ===========================================================================
+# --reconstruction-merge entry point
+# ===========================================================================
+
+def run_reconstruction_merge_mode(model, tokenizer, cfg, device, output_dir="results"):
+    """
+    Focused comparison: pairwise activation merge vs down-projection ridge reconstruction.
+
+    Question: Can ridge regression on down_proj recover more quality than pairwise
+    activation-based merging?
+
+    Methods compared (per alpha):
+      Baselines
+        pure_delete                      — no compensation
+        merge_activation_ridge_1e-2      — best at alpha=1e-3 in prior experiments
+        merge_activation_ridge_1.0       — best at alpha=1e-4 in prior experiments
+        merge_activation_clip_0.5        — best at alpha=1e-2 in prior experiments
+
+      Down-projection ridge reconstruction (7 lambda values)
+        down_recon_ridge_1e-6 .. down_recon_ridge_1.0
+
+    Math for reconstruction:
+        A = SiLU(R @ W_gate.T) * (R @ W_up.T)   [N, d_ff]
+        Y = A @ W_down.T                          [N, d_model]  original output
+
+        A_K = A[:, K]   for kept neuron indices K
+
+        Ridge:  B = (A_K.T A_K + λI)^{-1} A_K.T Y   [k, d_model]
+        (kernel form used when N < k for efficiency)
+        new W_down = B.T   [d_model, k]
+
+    Train / held-out split:
+        RECONSTRUCTION_TRAIN_PROMPTS  → fit B (ridge regression)
+        RECONSTRUCTION_HELDOUT_PROMPTS → evaluate reconstruction generalization
+
+    Reports per row:
+        PPL, dPPL
+        train_recon_err, train_delete_err, train_improvement_pct
+        heldout_recon_err, heldout_delete_err, heldout_improvement_pct
+        overfit_gap_pct   (positive = worse generalization than train)
+        mlp_params_red_pct, flops_red_pct
+    """
+    import json, os, time
+    import torch
+
+    from .bound_analysis import _k, compute_bound_scores_and_R, select_by_budget
+    from .evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
+    from .flops import estimate_mlp_flops
+    from .model_utils import count_parameters
+    from .pruning import prune_model_by_layer_indices, verify_forward_pass
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts     = time.strftime("%Y%m%d_%H%M%S")
+    layers = get_transformer_layers(model)
+    ALPHAS = [1e-4, 1e-3, 1e-2]
+
+    # ------------------------------------------------------------------
+    # Method table:
+    # (name, kind, ridge_lambda_or_clip, clip_value)
+    #   kind = "delete" | "merge" | "recon"
+    # For "merge": ridge_lambda=ridge param, clip_value=clip param
+    # For "recon": ridge_lambda=reconstruction lambda, clip_value unused
+    # ------------------------------------------------------------------
+    METHODS = [
+        # Baselines
+        ("pure_delete",                    "delete",  None,  None),
+        ("merge_activation_ridge_1e-2",    "merge",   1e-2,  None),
+        ("merge_activation_ridge_1.0",     "merge",   1.0,   None),
+        ("merge_activation_clip_0.5",      "merge",   0.0,   0.5),
+        # Ridge reconstruction at 7 lambdas
+        ("down_recon_ridge_1e-6",          "recon",   1e-6,  None),
+        ("down_recon_ridge_1e-5",          "recon",   1e-5,  None),
+        ("down_recon_ridge_1e-4",          "recon",   1e-4,  None),
+        ("down_recon_ridge_1e-3",          "recon",   1e-3,  None),
+        ("down_recon_ridge_1e-2",          "recon",   1e-2,  None),
+        ("down_recon_ridge_0.1",           "recon",   0.1,   None),
+        ("down_recon_ridge_1.0",           "recon",   1.0,   None),
+    ]
+
+    # ------------------------------------------------------------------
+    # Compute scores + collect calibration inputs
+    # ------------------------------------------------------------------
+    print("\nComputing bound scores for all layers ...")
+    all_scores = [compute_bound_scores_and_R(l)[0] for l in layers]
+
+    print("Collecting TRAIN calibration inputs ...")
+    train_r_per_layer = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_TRAIN_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+    print("Collecting HELD-OUT calibration inputs ...")
+    heldout_r_per_layer = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_HELDOUT_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+
+    # ------------------------------------------------------------------
+    # Eval dataset + baseline
+    # ------------------------------------------------------------------
+    use_fallback = cfg.get("use_fallback_corpus", True)
+    n_eval       = cfg.get("bound_analysis_eval_samples", 64)
+    eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
+
+    baseline_params = count_parameters(model)
+    baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
+
+    print("Computing baseline PPL ...")
+    bp           = evaluate_perplexity(
+        model, tokenizer, texts=eval_texts,
+        max_seq_len=cfg.get("max_seq_len", 512),
+        batch_size=cfg.get("batch_size", 4),
+        device=device,
+    )
+    baseline_ppl = bp["perplexity"]
+    print(f"Baseline PPL: {baseline_ppl:.4f}\n")
+
+    all_results = []
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    for alpha in ALPHAS:
+        prune_indices_per_layer = []
+        for scores in all_scores:
+            pi, _ = select_by_budget(scores, alpha, float(scores.sum()))
+            prune_indices_per_layer.append(pi)
+
+        total_pruned = sum(len(pi) for pi in prune_indices_per_layer)
+        total_n      = sum(s.numel() for s in all_scores)
+        pct          = 100.0 * total_pruned / total_n if total_n else 0.0
+
+        if total_pruned == 0:
+            print(f"alpha={_k(alpha)}: 0 neurons selected — skipping\n")
+            continue
+
+        keep_indices_per_layer = []
+        for scores, pi in zip(all_scores, prune_indices_per_layer):
+            p_set = set(pi.tolist())
+            ki    = torch.tensor(
+                [j for j in range(scores.numel()) if j not in p_set], dtype=torch.long
+            )
+            keep_indices_per_layer.append(ki)
+
+        print(f"\n{'=' * 80}")
+        print(f"alpha={_k(alpha)}  pruned={total_pruned} ({pct:.3f}%)")
+        print(f"{'=' * 80}")
+
+        for mname, mkind, mlambda, mclip in METHODS:
+            print(f"\n  [{mname}]")
+            row = {
+                "alpha":        alpha,
+                "method":       mname,
+                "kind":         mkind,
+                "total_pruned": total_pruned,
+                "pct_pruned":   round(pct, 4),
+                "baseline_ppl": round(baseline_ppl, 4),
+                "ridge_lambda": mlambda,
+                "clip_value":   mclip,
+            }
+            pruned_model = None
+            try:
+                # ---- Build model ----
+                if mkind == "delete":
+                    pruned_model, _ = prune_model_by_layer_indices(
+                        model, prune_indices_per_layer,
+                        label=f"recon_del_a{_k(alpha)}"
+                    )
+                    # Held-out reconstruction (pure delete, no B)
+                    ho_del, ho_merge = _held_out_delete_error(
+                        layers, prune_indices_per_layer,
+                        keep_indices_per_layer, heldout_r_per_layer,
+                    )
+                    if ho_del is not None:
+                        row["heldout_delete_err_mean"] = round(ho_del, 6)
+
+                elif mkind == "merge":
+                    asns_per_layer = [
+                        compute_merge_assignments_activation(
+                            l, pi, ki, r,
+                            ridge_lambda=mlambda,
+                            clip_value=mclip,
+                        ) if len(pi) > 0 else []
+                        for l, pi, ki, r in zip(
+                            layers, prune_indices_per_layer,
+                            keep_indices_per_layer, train_r_per_layer
+                        )
+                    ]
+                    pruned_model, _ = apply_merge_and_prune(
+                        model, prune_indices_per_layer, asns_per_layer,
+                        label=f"recon_merge_{mname[:16]}_a{_k(alpha)}"
+                    )
+                    # Beta stats
+                    bs = _debug_beta_stats(asns_per_layer)
+                    row["beta_mean_abs"] = bs["mean_abs_beta"]
+                    row["beta_max_abs"]  = bs["max_abs_beta"]
+                    # Train + held-out reconstruction
+                    ho_results = _compute_held_out_reconstruction(
+                        layers, prune_indices_per_layer, keep_indices_per_layer,
+                        asns_per_layer, train_r_per_layer, heldout_r_per_layer,
+                    )
+                    active = [r for r in ho_results if r.get("n_pruned", 0) > 0]
+                    if active:
+                        row["train_delete_err_mean"]     = round(sum(r["train_delete_err"] for r in active) / len(active), 6)
+                        row["train_recon_err_mean"]      = round(sum(r["train_merge_err"]  for r in active) / len(active), 6)
+                        row["train_improvement_pct"]     = round(sum(r["train_improvement_pct"]    for r in active) / len(active), 2)
+                        row["heldout_delete_err_mean"]   = round(sum(r["heldout_delete_err"] for r in active) / len(active), 6)
+                        row["heldout_recon_err_mean"]    = round(sum(r["heldout_merge_err"]  for r in active) / len(active), 6)
+                        row["heldout_improvement_pct"]   = round(sum(r["heldout_improvement_pct"]  for r in active) / len(active), 2)
+                        row["overfit_gap_pct"]           = round(sum(r["overfit_gap_pct"] for r in active) / len(active), 2)
+                        print(
+                            f"    train  del={row['train_delete_err_mean']:.4f}  "
+                            f"recon={row['train_recon_err_mean']:.4f}  "
+                            f"imp={row['train_improvement_pct']:+.1f}%"
+                        )
+                        print(
+                            f"    heldout del={row['heldout_delete_err_mean']:.4f}  "
+                            f"recon={row['heldout_recon_err_mean']:.4f}  "
+                            f"imp={row['heldout_improvement_pct']:+.1f}%  "
+                            f"overfit={row['overfit_gap_pct']:+.1f}%"
+                        )
+
+                elif mkind == "recon":
+                    pruned_model, build_info = apply_down_reconstruction(
+                        model,
+                        prune_indices_per_layer,
+                        keep_indices_per_layer,
+                        train_r_per_layer,
+                        method="ridge",
+                        ridge_lambda=mlambda,
+                        heldout_r_per_layer=heldout_r_per_layer,
+                    )
+                    active_s = [
+                        s for s in build_info.get("sanity_per_layer", [])
+                        if s.get("n_pruned", 1) > 0 and "recon_relative_err" in s
+                    ]
+                    if active_s:
+                        row["train_delete_err_mean"]   = round(sum(s["delete_relative_err"] for s in active_s) / len(active_s), 6)
+                        row["train_recon_err_mean"]    = round(sum(s["recon_relative_err"]  for s in active_s) / len(active_s), 6)
+                        row["train_improvement_pct"]   = round(sum(s["improvement_pct"]     for s in active_s) / len(active_s), 2)
+                    ho_active = [s for s in active_s if "heldout_recon_err" in s]
+                    if ho_active:
+                        row["heldout_delete_err_mean"] = round(sum(s["heldout_delete_err"]       for s in ho_active) / len(ho_active), 6)
+                        row["heldout_recon_err_mean"]  = round(sum(s["heldout_recon_err"]         for s in ho_active) / len(ho_active), 6)
+                        row["heldout_improvement_pct"] = round(sum(s["heldout_improvement_pct"]   for s in ho_active) / len(ho_active), 2)
+                        row["overfit_gap_pct"]         = round(sum(s["overfit_gap_pct"]           for s in ho_active) / len(ho_active), 2)
+                    if "train_recon_err_mean" in row:
+                        print(
+                            f"    train  del={row['train_delete_err_mean']:.4f}  "
+                            f"recon={row['train_recon_err_mean']:.4f}  "
+                            f"imp={row['train_improvement_pct']:+.1f}%"
+                        )
+                    if "heldout_recon_err_mean" in row:
+                        print(
+                            f"    heldout del={row['heldout_delete_err_mean']:.4f}  "
+                            f"recon={row['heldout_recon_err_mean']:.4f}  "
+                            f"imp={row['heldout_improvement_pct']:+.1f}%  "
+                            f"overfit={row['overfit_gap_pct']:+.1f}%"
+                        )
+
+                # ---- Common: PPL + params ----
+                fp_ok    = verify_forward_pass(pruned_model, tokenizer, device)
+                ppl_info = evaluate_perplexity(
+                    pruned_model, tokenizer, texts=eval_texts,
+                    max_seq_len=cfg.get("max_seq_len", 512),
+                    batch_size=cfg.get("batch_size", 4),
+                    device=device,
+                )
+                ppl = ppl_info["perplexity"]
+
+                p_params = count_parameters(pruned_model)
+                p_flops  = estimate_mlp_flops(pruned_model, seq_len=cfg.get("max_seq_len", 512))
+                flop_red = 100.0 * (1.0 - p_flops["total_flops"] / baseline_flops["total_flops"])
+                mlp_red  = 100.0 * (1.0 - p_params["mlp"] / baseline_params["mlp"])
+
+                row.update({
+                    "perplexity":         round(ppl, 4),
+                    "perplexity_delta":   round(ppl - baseline_ppl, 4),
+                    "forward_pass_ok":    fp_ok,
+                    "mlp_params_red_pct": round(mlp_red, 4),
+                    "flops_red_pct":      round(flop_red, 4),
+                })
+                print(
+                    f"    PPL={ppl:.4f}  dPPL={ppl - baseline_ppl:+.4f}"
+                    f"  MLP-{mlp_red:.2f}%  FLOPs-{flop_red:.2f}%"
+                )
+
+            except Exception as exc:
+                logger.error("Method [%s] alpha=%s failed: %s", mname, _k(alpha), exc, exc_info=True)
+                row["notes"] = f"ERROR: {exc}"
+            finally:
+                if pruned_model is not None:
+                    del pruned_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            all_results.append(row)
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print(f"\n{'=' * 100}")
+    print("RECONSTRUCTION MERGE SUMMARY")
+    print(f"  Baseline PPL: {baseline_ppl:.4f}")
+    print(f"{'─' * 100}")
+    hdr = (
+        f"  {'alpha':>9}  {'method':<38}  {'PPL':>9}  {'dPPL':>9}"
+        f"  {'HO-imp':>7}  {'overfit':>7}  {'MLP-':>6}"
+    )
+    print(hdr)
+    print(f"{'─' * 100}")
+    for r in all_results:
+        if "perplexity" in r:
+            ho_imp  = r.get("heldout_improvement_pct", float("nan"))
+            overfit = r.get("overfit_gap_pct",         float("nan"))
+            print(
+                f"  {_k(r['alpha']):>9}  {r['method']:<38}"
+                f"  {r['perplexity']:>9.4f}  {r['perplexity_delta']:>+9.4f}"
+                f"  {ho_imp:>+7.2f}%  {overfit:>+7.2f}%"
+                f"  {r.get('mlp_params_red_pct', 0.0):>5.2f}%"
+            )
+        else:
+            print(f"  {_k(r['alpha']):>9}  {r['method']:<38}  {r.get('notes', 'ERROR')}")
+    print(f"{'=' * 100}\n")
+
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
+    report = {
+        "timestamp":    ts,
+        "mode":         "reconstruction_merge",
+        "baseline_ppl": baseline_ppl,
+        "results":      all_results,
+    }
+    path = os.path.join(output_dir, f"reconstruction_merge_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
+    import csv
+    csv_path = os.path.join(output_dir, f"reconstruction_merge_{ts}.csv")
+    csv_keys = [
+        "alpha", "method", "kind", "ridge_lambda", "clip_value",
+        "total_pruned", "pct_pruned", "baseline_ppl",
+        "perplexity", "perplexity_delta",
+        "beta_mean_abs", "beta_max_abs",
+        "train_delete_err_mean", "train_recon_err_mean", "train_improvement_pct",
+        "heldout_delete_err_mean", "heldout_recon_err_mean", "heldout_improvement_pct",
+        "overfit_gap_pct",
+        "mlp_params_red_pct", "flops_red_pct",
+        "forward_pass_ok", "notes",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_keys, extrasaction="ignore")
+        writer.writeheader()
+        for r in all_results:
+            writer.writerow(r)
+
+    logger.info("Reconstruction merge report: %s", path)
+    print(f"Report: {path}")
+    print(f"CSV:    {csv_path}\n")
+
+
+# ===========================================================================
+# Internal helper — held-out delete-only error (no B, no assignments)
+# ===========================================================================
+
+def _held_out_delete_error(
+    layers,
+    prune_indices_per_layer,
+    keep_indices_per_layer,
+    heldout_r_per_layer,
+    eps: float = EPS,
+):
+    """
+    Compute mean held-out MLP reconstruction error for pure deletion
+    (no beta, no B — just drop pruned columns entirely).
+    Returns (mean_delete_err, None).
+    """
+    errs = []
+    for layer, pi, ki, r in zip(
+        layers, prune_indices_per_layer, keep_indices_per_layer, heldout_r_per_layer
+    ):
+        if len(pi) == 0:
+            continue
+        w = get_mlp_weights(layer)
+        w_gate = w["gate"].detach().float().cpu()
+        w_up   = w["up"].detach().float().cpu()
+        w_down = w["down"].detach().float().cpu()
+        R = r.float().cpu()
+        with torch.no_grad():
+            A     = F.silu(R @ w_gate.T) * (R @ w_up.T)
+            Y     = A @ w_down.T
+            Y_del = A[:, ki] @ w_down[:, ki].T
+            Y_norm = float(Y.norm()) + eps
+            errs.append(float((Y - Y_del).norm()) / Y_norm)
+    if not errs:
+        return None, None
+    return sum(errs) / len(errs), None
+        "alpha", "method", "kind", "ridge_lambda", "clip_value",
+        "total_pruned", "pct_pruned", "baseline_ppl",
+        "perplexity", "perplexity_delta",
+        "beta_mean_abs", "beta_max_abs",
+        "train_delete_err_mean", "train_recon_err_mean", "train_improvement_pct",
+        "heldout_delete_err_mean", "heldout_recon_err_mean", "heldout_improvement_pct",
+        "overfit_gap_pct",
+        "mlp_params_red_pct", "flops_red_pct",
+        "forward_pass_ok", "notes",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_keys, extrasaction="ignore")
+        writer.writeheader()
+        for r in all_results:
+            writer.writerow(r)
+
+    logger.info("Reconstruction merge report: %s", path)
+    print(f"Report: {path}")
+    print(f"CSV:    {csv_path}\n")
+
+
+# ===========================================================================
+# Internal helper — held-out delete-only error (no B, no assignments)
+# ===========================================================================
+
+def _held_out_delete_error(
+    layers,
+    prune_indices_per_layer,
+    keep_indices_per_layer,
+    heldout_r_per_layer,
+    eps: float = EPS,
+):
+    """
+    Compute mean held-out MLP reconstruction error for pure deletion
+    (no beta, no B — just drop pruned columns entirely).
+    Returns (mean_delete_err, None).
+    """
+    errs = []
+    for layer, pi, ki, r in zip(
+        layers, prune_indices_per_layer, keep_indices_per_layer, heldout_r_per_layer
+    ):
+        if len(pi) == 0:
+            continue
+        w = get_mlp_weights(layer)
+        w_gate = w["gate"].detach().float().cpu()
+        w_up   = w["up"].detach().float().cpu()
+        w_down = w["down"].detach().float().cpu()
+        R = r.float().cpu()
+        with torch.no_grad():
+            A     = F.silu(R @ w_gate.T) * (R @ w_up.T)
+            Y     = A @ w_down.T
+            Y_del = A[:, ki] @ w_down[:, ki].T
+            Y_norm = float(Y.norm()) + eps
+            errs.append(float((Y - Y_del).norm()) / Y_norm)
+    if not errs:
+        return None, None
+    return sum(errs) / len(errs), None
