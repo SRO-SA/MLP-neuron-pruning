@@ -8,20 +8,20 @@ Usage
 Full experiment:
     python run_experiment.py --config configs/default.yaml
 
-Diagnostic mode only (no pruning):
+Debug mode (no pruning; runs all correctness + scoring checks):
+    python run_experiment.py --config configs/default.yaml --debug-pruning
+
+Diagnostic mode (no pruning; logs per-layer MLP norms):
     python run_experiment.py --config configs/default.yaml --diagnostics-only
 
-Override config values inline:
+Quick override of config values:
     python run_experiment.py --config configs/default.yaml \
-        --pruning-ratios 0.0 0.1 0.2  --methods rmsnorm_bound_angle random
-
-Results are saved to the output_dir specified in the config (default: results/).
+        --pruning-ratios 0.0 0.1 --methods rmsnorm_bound_angle random
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import json
 import logging
@@ -35,9 +35,10 @@ from typing import Any, Dict, List, Optional
 import torch
 import yaml
 
-# Make sure src/ is importable when running from the project root
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.bound_analysis import run_bound_analysis_mode
+from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
 from src.flops import estimate_mlp_flops
@@ -53,13 +54,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config / device
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path) as f:
-        cfg = yaml.safe_load(f)
-    return cfg
+        return yaml.safe_load(f)
 
 
 def resolve_device(cfg: Dict) -> str:
@@ -68,10 +68,6 @@ def resolve_device(cfg: Dict) -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
     return d
 
-
-# ---------------------------------------------------------------------------
-# Seed
-# ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -103,47 +99,41 @@ RESULT_FIELDS = [
 ]
 
 
-def save_results(results: List[Dict], output_dir: str, tag: str = "") -> None:
+def save_results(results: List[Dict], output_dir: str) -> tuple:
     os.makedirs(output_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    stem = f"results_{ts}{('_' + tag) if tag else ''}"
+    ts   = time.strftime("%Y%m%d_%H%M%S")
+    stem = f"results_{ts}"
 
     csv_path  = os.path.join(output_dir, stem + ".csv")
     json_path = os.path.join(output_dir, stem + ".json")
 
-    # CSV
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
-    # JSON (includes generation examples)
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    logger.info("Results saved to %s and %s", csv_path, json_path)
+    logger.info("Results → %s  and  %s", csv_path, json_path)
     return csv_path, json_path
 
 
 def save_generations(gen_results: Dict, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    ts   = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(output_dir, f"generations_{ts}.json")
     with open(path, "w") as f:
         json.dump(gen_results, f, indent=2)
-    logger.info("Generations saved to %s", path)
+    logger.info("Generations → %s", path)
 
-
-# ---------------------------------------------------------------------------
-# Pretty printing
-# ---------------------------------------------------------------------------
 
 def print_result_row(row: Dict) -> None:
     print(
         f"  method={row['pruning_method']:20s}  ratio={row['pruning_ratio']:.0%}"
         f"  PPL={row['perplexity']:.3f}  ΔPPL={row['perplexity_delta']:+.3f}"
-        f"  MLP params: {row['mlp_params_before']:,} → {row['mlp_params_after']:,}"
-        f"  FLOPs↓ {row['mlp_flops_reduction_pct']:.1f}%"
+        f"  MLP {row['mlp_params_before']:,} → {row['mlp_params_after']:,}"
+        f"  FLOPs↓{row['mlp_flops_reduction_pct']:.1f}%"
     )
 
 
@@ -156,9 +146,7 @@ def run_experiment(cfg: Dict, args) -> None:
     device     = resolve_device(cfg)
     output_dir = cfg.get("output_dir", "results")
 
-    # -----------------------------------------------------------------------
     # Load model
-    # -----------------------------------------------------------------------
     model, tokenizer, resolved_name = load_model_and_tokenizer(
         model_name    = cfg["model_name"],
         fallback_name = cfg.get("model_name_fallback"),
@@ -166,25 +154,28 @@ def run_experiment(cfg: Dict, args) -> None:
         dtype_str     = cfg.get("dtype", "float32"),
     )
 
-    # -----------------------------------------------------------------------
-    # Diagnostics-only mode
-    # -----------------------------------------------------------------------
+    # ── BOUND ANALYSIS MODE ────────────────────────────────────────────────────
+    if args.bound_analysis:
+        run_bound_analysis_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── DEBUG MODE ─────────────────────────────────────────────────────────────
+    if args.debug_pruning:
+        run_debug_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── DIAGNOSTICS ONLY MODE ──────────────────────────────────────────────────
     if args.diagnostics_only:
-        stats = run_diagnostics(
-            model, tokenizer,
-            max_seq_len = cfg.get("max_seq_len", 128),
-            device      = device,
-        )
+        stats = run_diagnostics(model, tokenizer,
+                                max_seq_len=cfg.get("max_seq_len", 128), device=device)
         diag_path = os.path.join(output_dir, "diagnostics.json")
         os.makedirs(output_dir, exist_ok=True)
         with open(diag_path, "w") as f:
             json.dump(stats, f, indent=2)
-        logger.info("Diagnostics saved to %s", diag_path)
+        logger.info("Diagnostics → %s", diag_path)
         return
 
-    # -----------------------------------------------------------------------
-    # Baseline: perplexity & generation on the original model
-    # -----------------------------------------------------------------------
+    # ── BASELINE ───────────────────────────────────────────────────────────────
     logger.info("Evaluating BASELINE model …")
     eval_texts = load_eval_dataset(cfg.get("max_eval_samples", 512))
 
@@ -202,34 +193,46 @@ def run_experiment(cfg: Dict, args) -> None:
     logger.info("Running baseline generation tests …")
     baseline_gens = run_generation_tests(model, tokenizer, device=device)
 
-    # Baseline FLOPs and params
     baseline_params = count_parameters(model)
     baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
 
-    # -----------------------------------------------------------------------
-    # Experiment grid
-    # -----------------------------------------------------------------------
+    # Record original param count for independence checks
+    orig_total_params = baseline_params["total"]
+
+    # ── EXPERIMENT GRID ────────────────────────────────────────────────────────
     methods = args.methods or cfg.get("pruning_methods", ["rmsnorm_bound_angle"])
     ratios  = [float(r) for r in (args.pruning_ratios or cfg.get("pruning_ratios", [0.0, 0.1, 0.2]))]
+    seed    = cfg.get("seed", 42)
 
-    all_results: List[Dict]  = []
-    all_generations: Dict    = {"baseline": baseline_gens}
-    seed = cfg.get("seed", 42)
+    all_results: List[Dict]   = []
+    all_generations: Dict     = {"baseline": baseline_gens}
 
     print(f"\n{'═'*70}")
-    print(f"Experiment grid: {len(methods)} methods × {len(ratios)} ratios "
-          f"= {len(methods)*len(ratios)} runs")
+    print(f"Grid: {len(methods)} methods × {len(ratios)} ratios = {len(methods)*len(ratios)} runs")
     print(f"{'═'*70}\n")
 
     for method in methods:
         for ratio in ratios:
-            run_tag = f"{method}_r{int(ratio*100):02d}"
+            run_tag = f"{method}_r{int(ratio*100):02d}pct"
             print(f"\n{'─'*70}")
             print(f"  Run: {run_tag}")
             print(f"{'─'*70}")
 
+            # ── Independence assertion ──────────────────────────────────────
+            current_params = count_parameters(model)["total"]
+            if current_params != orig_total_params:
+                logger.error(
+                    "INDEPENDENCE BUG: original model changed from %d to %d params "
+                    "before run (%s, %.0f%%)!",
+                    orig_total_params, current_params, method, ratio * 100,
+                )
+            else:
+                logger.debug(
+                    "Independence OK: original model has %d params before run (%s, %.0f%%)",
+                    current_params, method, ratio * 100,
+                )
+
             try:
-                # Prune a fresh clone for each (method, ratio) pair
                 pruned_model, prune_info = prune_model(
                     model      = model,
                     prune_ratio = ratio,
@@ -237,16 +240,20 @@ def run_experiment(cfg: Dict, args) -> None:
                     seed       = seed,
                 )
 
-                # Forward-pass sanity check
+                # Verify original is still intact after pruning
+                post_params = count_parameters(model)["total"]
+                if post_params != orig_total_params:
+                    logger.error(
+                        "INDEPENDENCE BUG: original model changed AFTER prune_model() "
+                        "for (%s, %.0f%%). Before=%d After=%d",
+                        method, ratio * 100, orig_total_params, post_params,
+                    )
+
                 fp_ok = verify_forward_pass(pruned_model, tokenizer, device)
 
-                # Params after pruning
                 pruned_params = count_parameters(pruned_model)
-                pruned_flops  = estimate_mlp_flops(
-                    pruned_model, seq_len=cfg.get("max_seq_len", 512)
-                )
+                pruned_flops  = estimate_mlp_flops(pruned_model, seq_len=cfg.get("max_seq_len", 512))
 
-                # Perplexity
                 ppl_info = evaluate_perplexity(
                     pruned_model, tokenizer,
                     texts       = eval_texts,
@@ -255,41 +262,35 @@ def run_experiment(cfg: Dict, args) -> None:
                     batch_size  = cfg.get("batch_size", 4),
                     device      = device,
                 )
-                ppl = ppl_info["perplexity"]
-
-                # Generation
+                ppl  = ppl_info["perplexity"]
                 gens = run_generation_tests(pruned_model, tokenizer, device=device)
                 all_generations[run_tag] = gens
 
-                # FLOP reduction
-                flop_before = baseline_flops["total_flops"]
-                flop_after  = pruned_flops["total_flops"]
-                flop_red_pct = 100.0 * (1.0 - flop_after / flop_before) if flop_before > 0 else 0.0
-
-                # Param reduction
-                mlp_before = baseline_params["mlp"]
-                mlp_after  = pruned_params["mlp"]
-                mlp_red_pct = 100.0 * (1.0 - mlp_after / mlp_before) if mlp_before > 0 else 0.0
+                flop_before   = baseline_flops["total_flops"]
+                flop_after    = pruned_flops["total_flops"]
+                flop_red_pct  = 100.0 * (1.0 - flop_after / flop_before) if flop_before > 0 else 0.0
+                mlp_before    = baseline_params["mlp"]
+                mlp_after     = pruned_params["mlp"]
+                mlp_red_pct   = 100.0 * (1.0 - mlp_after / mlp_before) if mlp_before > 0 else 0.0
 
                 row = {
-                    "model_name":             resolved_name,
-                    "pruning_method":         method,
-                    "pruning_ratio":          ratio,
-                    "total_params_before":    baseline_params["total"],
-                    "total_params_after":     pruned_params["total"],
-                    "mlp_params_before":      mlp_before,
-                    "mlp_params_after":       mlp_after,
+                    "model_name":              resolved_name,
+                    "pruning_method":          method,
+                    "pruning_ratio":           ratio,
+                    "total_params_before":     baseline_params["total"],
+                    "total_params_after":      pruned_params["total"],
+                    "mlp_params_before":       mlp_before,
+                    "mlp_params_after":        mlp_after,
                     "mlp_params_reduction_pct": mlp_red_pct,
-                    "mlp_flops_before":       flop_before,
-                    "mlp_flops_after":        flop_after,
+                    "mlp_flops_before":        flop_before,
+                    "mlp_flops_after":         flop_after,
                     "mlp_flops_reduction_pct": flop_red_pct,
-                    "perplexity":             ppl,
-                    "perplexity_delta":       ppl - baseline_ppl,
-                    "forward_pass_ok":        fp_ok,
-                    "notes":                  "",
-                    # Extended info (kept in JSON only)
-                    "per_layer_d_ff":         prune_info["per_layer"],
-                    "generation_examples":    gens,
+                    "perplexity":              ppl,
+                    "perplexity_delta":        ppl - baseline_ppl,
+                    "forward_pass_ok":         fp_ok,
+                    "notes":                   "",
+                    "per_layer_d_ff":          prune_info["per_layer"],
+                    "generation_examples":     gens,
                 }
                 all_results.append(row)
                 print_result_row(row)
@@ -305,37 +306,35 @@ def run_experiment(cfg: Dict, args) -> None:
                 })
                 all_results.append(row)
 
-            # Free memory between runs
+            del pruned_model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # -----------------------------------------------------------------------
-    # Save results
-    # -----------------------------------------------------------------------
+    # ── SAVE ───────────────────────────────────────────────────────────────────
     csv_path, json_path = save_results(all_results, output_dir)
     save_generations(all_generations, output_dir)
 
-    # -----------------------------------------------------------------------
-    # Summary table
-    # -----------------------------------------------------------------------
+    # ── SUMMARY ────────────────────────────────────────────────────────────────
     print(f"\n{'═'*70}")
     print("SUMMARY")
     print(f"{'═'*70}")
-    print(f"{'Method':<22} {'Ratio':>6}  {'PPL':>8}  {'ΔPPL':>8}  {'FLOPs↓':>8}  {'MLP↓':>8}")
+    print(f"  Baseline PPL: {baseline_ppl:.4f}")
+    print(f"{'─'*70}")
+    print(f"  {'Method':<22} {'Ratio':>6}  {'PPL':>8}  {'ΔPPL':>8}  {'FLOPs↓':>8}  {'MLP↓':>8}")
     print(f"{'─'*70}")
     for r in all_results:
         try:
             print(
-                f"{str(r['pruning_method']):<22} {float(r['pruning_ratio']):>6.0%}"
+                f"  {str(r['pruning_method']):<22} {float(r['pruning_ratio']):>6.0%}"
                 f"  {float(r['perplexity']):>8.3f}  {float(r['perplexity_delta']):>+8.3f}"
                 f"  {float(r['mlp_flops_reduction_pct']):>7.1f}%"
                 f"  {float(r['mlp_params_reduction_pct']):>7.1f}%"
             )
         except (ValueError, TypeError):
-            print(f"  {r.get('pruning_method','')} ratio={r.get('pruning_ratio','')}  ERROR: {r.get('notes','')}")
+            print(f"  {r.get('pruning_method','')} ratio={r.get('pruning_ratio','')}  "
+                  f"ERROR: {r.get('notes','')}")
     print(f"{'═'*70}")
-    print(f"\nResults → {csv_path}")
-    print(f"Details  → {json_path}\n")
+    print(f"\nResults → {csv_path}\nDetails → {json_path}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -344,22 +343,21 @@ def run_experiment(cfg: Dict, args) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen SwiGLU MLP Pruning Experiment")
+    p.add_argument("--config", default="configs/default.yaml")
     p.add_argument(
-        "--config", default="configs/default.yaml",
-        help="Path to YAML config file (default: configs/default.yaml)",
+        "--bound-analysis", action="store_true",
+        help="Compute score distributions + threshold-based pruning (no forced ratios).",
+    )
+    p.add_argument(
+        "--debug-pruning", action="store_true",
+        help="Run full debug suite: shape checks, zero-mask test, score correlations, etc.",
     )
     p.add_argument(
         "--diagnostics-only", action="store_true",
-        help="Run diagnostic mode only (no pruning); log per-layer MLP norms",
+        help="Log per-layer MLP norms (no pruning)",
     )
-    p.add_argument(
-        "--pruning-ratios", nargs="+", type=float, default=None,
-        help="Override pruning_ratios from config (e.g. --pruning-ratios 0.0 0.1 0.2)",
-    )
-    p.add_argument(
-        "--methods", nargs="+", default=None,
-        help="Override pruning_methods from config (e.g. --methods random rmsnorm_bound_angle)",
-    )
+    p.add_argument("--pruning-ratios", nargs="+", type=float, default=None)
+    p.add_argument("--methods", nargs="+", default=None)
     return p.parse_args()
 
 

@@ -3,20 +3,29 @@ evaluation.py
 =============
 Perplexity evaluation and generation quality tests.
 
-Perplexity
-----------
-We compute token-level negative log-likelihood on WikiText-2 (test split).
-If the datasets library or network is unavailable, a small built-in fallback
-corpus is used so the script can still run in offline environments.
+──────────────────────────────────────────────────────────────────────────
+BUG FIX (v2)
+──────────────────────────────────────────────────────────────────────────
+The original code passed `labels=input_ids` directly to the model.
+When the batch contains padded sequences, padding token IDs are included
+in the loss computation.  HuggingFace CausalLM shifts labels by 1 and
+computes cross-entropy with ignore_index=-100; if we do not set
+`labels[padding_positions] = -100`, padding tokens contribute to the mean
+loss, inflating PPL and making it incomparable across models with different
+effective sequence lengths.
 
-    PPL = exp( -1/N * Σ_t log p(x_t | x_<t) )
+Fix: always set `labels[attention_mask == 0] = -100` before passing to
+the model.  Also count n_tokens as the number of non-padded *shifted*
+positions, which matches HF's internal denominator exactly.
 
-where N is the total number of predicted tokens.
+──────────────────────────────────────────────────────────────────────────
+PPL formula
+──────────────────────────────────────────────────────────────────────────
+    PPL = exp( -1/N * Σ_t log p(x_t | x_{<t}) )
 
-Generation tests
-----------------
-We run a small set of fixed prompts with greedy decoding and record the
-generated text.  These serve as a qualitative sanity check.
+HF reports loss = mean NLL per token (over non-(-100) positions).
+We reconstruct total NLL by multiplying by n_tokens, then divide by the
+running total to get the corpus-level mean NLL.
 """
 
 from __future__ import annotations
@@ -37,15 +46,18 @@ logger = logging.getLogger(__name__)
 FALLBACK_TEXTS = [
     "The transformer architecture was introduced in the paper "
     "Attention Is All You Need by Vaswani et al. in 2017. "
-    "It relies entirely on attention mechanisms, dispensing with recurrence and convolutions.",
+    "It relies entirely on attention mechanisms, dispensing with recurrence and convolutions "
+    "entirely. The model achieved state-of-the-art results on machine translation tasks.",
 
     "Python is a high-level, general-purpose programming language. "
     "Its design philosophy emphasises code readability, notably using significant indentation. "
-    "Python is dynamically typed and garbage-collected.",
+    "Python is dynamically typed and garbage-collected. "
+    "It supports multiple programming paradigms including structured, object-oriented and functional.",
 
     "The human brain is the central organ of the human nervous system, "
     "and with the spinal cord makes up the central nervous system. "
-    "The brain consists of the cerebrum, the brainstem and the cerebellum.",
+    "The brain consists of the cerebrum, the brainstem and the cerebellum. "
+    "It controls most of the activities of the body.",
 
     "In physics, the speed of light in vacuum, commonly denoted c, "
     "is a universal physical constant equal to 299,792,458 metres per second. "
@@ -54,27 +66,43 @@ FALLBACK_TEXTS = [
 
     "Machine learning is a method of data analysis that automates analytical model building. "
     "It is a branch of artificial intelligence based on the idea that systems can learn from data, "
-    "identify patterns and make decisions with minimal human intervention.",
+    "identify patterns and make decisions with minimal human intervention. "
+    "Deep learning uses neural networks with many layers.",
 
     "The Great Wall of China is a series of walls and fortifications that were built "
     "across the historical northern borders of ancient Chinese states and Imperial China "
-    "as protection against various nomadic groups from the Eurasian Steppe.",
+    "as protection against various nomadic groups from the Eurasian Steppe. "
+    "Construction started as early as the 7th century BC.",
 
     "Quantum mechanics is a fundamental theory in physics that provides a description of "
     "the physical properties of nature at the scale of atoms and subatomic particles. "
-    "It is the foundation of all quantum physics.",
+    "It is the foundation of all quantum physics including quantum chemistry, "
+    "quantum field theory, quantum technology, and quantum information science.",
 
     "The Internet is a global system of interconnected computer networks that uses the "
     "Internet protocol suite to communicate between networks and devices. "
-    "It carries a vast range of information resources and services.",
+    "It carries a vast range of information resources and services, "
+    "such as the interlinked hypertext documents and applications of the World Wide Web.",
 
     "Climate change refers to long-term shifts in temperatures and weather patterns. "
     "These shifts may be natural, such as through variations in the solar cycle. "
-    "But since the 1800s, human activities have been the main driver of climate change.",
+    "But since the 1800s, human activities have been the main driver of climate change, "
+    "primarily due to the burning of fossil fuels.",
 
     "The periodic table is a tabular arrangement of the chemical elements, "
     "ordered by their atomic number, electron configuration, and recurring chemical properties. "
-    "The rows are called periods and the columns are called groups.",
+    "The rows are called periods and the columns are called groups. "
+    "Elements in the same group share similar chemical properties.",
+
+    "Neural networks are computing systems inspired by biological neural networks that "
+    "constitute animal brains. An artificial neural network consists of layers of nodes "
+    "that process information using connectionist approaches to computation. "
+    "Modern deep networks have billions of parameters.",
+
+    "The solar system consists of the Sun and the objects that orbit it. "
+    "It formed approximately 4.6 billion years ago from the gravitational collapse "
+    "of a giant molecular cloud. The vast majority of the system's mass is in the Sun, "
+    "with most of the remaining mass contained in the planet Jupiter.",
 ]
 
 
@@ -84,26 +112,29 @@ FALLBACK_TEXTS = [
 
 def load_eval_dataset(max_samples: int = 512) -> List[str]:
     """
-    Try to load WikiText-2 test split.  Fall back to FALLBACK_TEXTS if
-    datasets / network is unavailable.
+    Try to load WikiText-2 test split.
+    Falls back to FALLBACK_TEXTS if datasets / network is unavailable.
     """
     try:
         from datasets import load_dataset  # type: ignore
         logger.info("Loading WikiText-2 (test split) …")
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        texts = [row["text"] for row in ds if len(row["text"].strip()) > 50]
-        texts = texts[:max_samples]
-        logger.info("WikiText-2 loaded: %d samples", len(texts))
+        ds     = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        # Filter out very short lines (headers, empty rows)
+        texts  = [row["text"] for row in ds if len(row["text"].strip()) > 100]
+        texts  = texts[:max_samples]
+        logger.info("WikiText-2 loaded: %d samples (filtered)", len(texts))
         return texts
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Could not load WikiText-2 (%s). Using built-in fallback corpus.", exc
+            "Could not load WikiText-2 (%s). Using built-in fallback corpus "
+            "(note: PPL computed on 12 short samples — values are indicative only).",
+            exc,
         )
         return FALLBACK_TEXTS
 
 
 # ---------------------------------------------------------------------------
-# Perplexity
+# Perplexity (main)
 # ---------------------------------------------------------------------------
 
 def evaluate_perplexity(
@@ -118,6 +149,8 @@ def evaluate_perplexity(
     """
     Evaluate per-token cross-entropy perplexity.
 
+    Correctly masks padding tokens so they are excluded from the loss.
+
     Returns dict with keys: 'perplexity', 'nll_mean', 'n_tokens'.
     """
     if texts is None:
@@ -127,14 +160,13 @@ def evaluate_perplexity(
         device = str(next(model.parameters()).device)
 
     model.eval()
-    total_nll   = 0.0
+    total_nll    = 0.0
     total_tokens = 0
 
     with torch.no_grad():
         for i in tqdm(range(0, len(texts), batch_size), desc="Evaluating perplexity"):
             batch_texts = texts[i : i + batch_size]
 
-            # Tokenize with padding
             enc = tokenizer(
                 batch_texts,
                 return_tensors="pt",
@@ -145,23 +177,29 @@ def evaluate_perplexity(
             input_ids      = enc["input_ids"].to(device)       # [B, T]
             attention_mask = enc["attention_mask"].to(device)  # [B, T]
 
-            # Forward pass; labels = input_ids shifted inside the model
+            # ── KEY FIX: mask padding tokens so they don't contribute to loss ──
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100   # ignore_index for HF cross-entropy
+
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=input_ids,
+                labels=labels,
             )
-            # outputs.loss is mean NLL over non-padding tokens
-            loss = outputs.loss  # scalar
+            # outputs.loss = mean NLL over the non-(-100) shifted positions
+            loss = outputs.loss
 
-            # Count non-padding tokens (exclude the first token which has
-            # no prediction target after the left-shift)
-            n_tokens = attention_mask[:, 1:].sum().item()
+            # Count non-padding prediction targets (positions 1..T, where label != -100)
+            # HF shifts by 1 internally: labels[..., 1:] are the targets.
+            # After our masking, padding positions in labels[..., 1:] are -100.
+            n_tokens = (labels[:, 1:] != -100).sum().item()
+
+            if n_tokens == 0:
+                continue
 
             total_nll    += loss.item() * n_tokens
             total_tokens += n_tokens
 
-            # Free CUDA memory between batches
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -170,10 +208,71 @@ def evaluate_perplexity(
         return {"perplexity": float("inf"), "nll_mean": float("inf"), "n_tokens": 0}
 
     nll_mean   = total_nll / total_tokens
-    perplexity = math.exp(nll_mean)
+    perplexity = math.exp(min(nll_mean, 20.0))  # cap at exp(20) ≈ 5e8 to avoid overflow
 
-    logger.info("Perplexity: %.4f  (NLL=%.4f, tokens=%d)", perplexity, nll_mean, total_tokens)
+    logger.info(
+        "Perplexity: %.4f  (NLL=%.4f, tokens=%d)", perplexity, nll_mean, total_tokens
+    )
     return {"perplexity": perplexity, "nll_mean": nll_mean, "n_tokens": total_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Perplexity sanity check on a tiny, fixed text (no padding)
+# ---------------------------------------------------------------------------
+
+SANITY_TEXT = (
+    "The transformer architecture was introduced in the paper Attention Is All You Need "
+    "by Vaswani et al. in 2017. It relies entirely on self-attention mechanisms, dispensing "
+    "with recurrence and convolutions. The model encodes each token by attending to all "
+    "other tokens in the sequence, weighted by learned key-query dot products."
+)
+
+
+def evaluate_on_fixed_text(
+    model,
+    tokenizer,
+    device: Optional[str] = None,
+    text: str = SANITY_TEXT,
+    label: str = "model",
+) -> Dict:
+    """
+    Evaluate perplexity on a single, fixed text with NO padding.
+    This removes all ambiguity about padding handling and gives a clean PPL number.
+
+    Interpretation
+    --------------
+    - For Qwen2.5-0.5B on this text, expected PPL ≈ 10-30 (if eval is correct).
+    - If PPL > 1000, the evaluation or model is broken.
+    - If PPL for the pruned model is > 5× baseline on this same text, pruning is aggressive.
+    """
+    if device is None:
+        device = str(next(model.parameters()).device)
+
+    model.eval()
+    enc      = tokenizer(text, return_tensors="pt").to(device)
+    input_ids = enc["input_ids"]               # [1, T]  (no padding)
+    n_tokens  = input_ids.shape[1] - 1        # first token has no prediction target
+
+    with torch.no_grad():
+        out  = model(input_ids=input_ids, labels=input_ids)
+        loss = out.loss.item()                 # mean NLL, no padding, so exact
+
+    ppl = math.exp(min(loss, 20.0))
+
+    print(f"\n  PPL sanity check [{label}]:")
+    print(f"    Text (first 80 chars): '{text[:80]}…'")
+    print(f"    Tokens : {n_tokens}")
+    print(f"    Loss   : {loss:.4f}")
+    print(f"    PPL    : {ppl:.4f}")
+
+    if ppl > 500:
+        print(f"    ⚠  PPL is very high — model or evaluation may be broken!")
+    elif ppl > 50:
+        print(f"    ⚠  PPL is elevated — check model or dataset match.")
+    else:
+        print(f"    ✓  PPL looks reasonable for a language model.")
+
+    return {"label": label, "loss": loss, "n_tokens": n_tokens, "perplexity": ppl}
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +297,6 @@ def run_generation_tests(
 ) -> List[Dict[str, str]]:
     """
     Run greedy-decoding generation on a fixed set of prompts.
-
     Returns a list of dicts with keys 'prompt' and 'generated'.
     """
     if prompts is None:
@@ -215,10 +313,148 @@ def run_generation_tests(
             out = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,       # greedy
+                do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-            # Decode only the newly generated tokens
+            generated_ids = out[0][enc["input_ids"].shape[-1]:]
+            generated     = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            results.append({"prompt": prompt, "generated": generated})
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return results
+            # ── KEY FIX: mask padding tokens so they don't contribute to loss ──
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100   # ignore_index for HF cross-entropy
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            loss = outputs.loss
+
+            # Count non-padding prediction targets
+            # HF shifts labels by 1: labels[..., 1:] are the targets.
+            n_tokens = (labels[:, 1:] != -100).sum().item()
+
+            if n_tokens == 0:
+                continue
+
+            total_nll    += loss.item() * n_tokens
+            total_tokens += n_tokens
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if total_tokens == 0:
+        logger.warning("No tokens evaluated — returning PPL = inf")
+        return {"perplexity": float("inf"), "nll_mean": float("inf"), "n_tokens": 0}
+
+    nll_mean   = total_nll / total_tokens
+    perplexity = math.exp(min(nll_mean, 20.0))  # cap at exp(20) to avoid overflow
+
+    logger.info(
+        "Perplexity: %.4f  (NLL=%.4f, tokens=%d)", perplexity, nll_mean, total_tokens
+    )
+    return {"perplexity": perplexity, "nll_mean": nll_mean, "n_tokens": total_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Perplexity sanity check on a tiny, fixed text (no padding)
+# ---------------------------------------------------------------------------
+
+SANITY_TEXT = (
+    "The transformer architecture was introduced in the paper Attention Is All You Need "
+    "by Vaswani et al. in 2017. It relies entirely on self-attention mechanisms, dispensing "
+    "with recurrence and convolutions. The model encodes each token by attending to all "
+    "other tokens in the sequence, weighted by learned key-query dot products."
+)
+
+
+def evaluate_on_fixed_text(
+    model,
+    tokenizer,
+    device=None,
+    text=SANITY_TEXT,
+    label="model",
+):
+    """
+    Evaluate perplexity on a single, fixed text with NO padding.
+    Removes all ambiguity about padding handling.
+
+    Expected PPL for Qwen2.5-0.5B: ~10-30.
+    If PPL > 500, the evaluation or model is broken.
+    """
+    if device is None:
+        device = str(next(model.parameters()).device)
+
+    model.eval()
+    enc       = tokenizer(text, return_tensors="pt").to(device)
+    input_ids = enc["input_ids"]               # [1, T]  no padding
+    n_tokens  = input_ids.shape[1] - 1
+
+    with torch.no_grad():
+        out  = model(input_ids=input_ids, labels=input_ids)
+        loss = out.loss.item()
+
+    ppl = math.exp(min(loss, 20.0))
+
+    print(f"\n  PPL sanity check [{label}]:")
+    print(f"    Text : '{text[:80]}...'")
+    print(f"    Tokens : {n_tokens}")
+    print(f"    Loss   : {loss:.4f}")
+    print(f"    PPL    : {ppl:.4f}")
+
+    if ppl > 500:
+        print("    WARNING: PPL is very high — model or evaluation may be broken!")
+    elif ppl > 50:
+        print("    NOTE: PPL is elevated — check model/dataset match.")
+    else:
+        print("    OK: PPL looks reasonable.")
+
+    return {"label": label, "loss": loss, "n_tokens": n_tokens, "perplexity": ppl}
+
+
+# ---------------------------------------------------------------------------
+# Generation sanity tests
+# ---------------------------------------------------------------------------
+
+GENERATION_PROMPTS = [
+    "The capital of France is",
+    "Explain what a GPU is in simple terms.",
+    "Write a short Python function to add two numbers.",
+    "The key idea behind transformer models is",
+    "Once upon a time, in a land far away,",
+]
+
+
+def run_generation_tests(
+    model,
+    tokenizer,
+    prompts=None,
+    max_new_tokens=80,
+    device=None,
+):
+    """Run greedy-decoding generation on a fixed set of prompts."""
+    if prompts is None:
+        prompts = GENERATION_PROMPTS
+    if device is None:
+        device = str(next(model.parameters()).device)
+
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for prompt in prompts:
+            enc = tokenizer(prompt, return_tensors="pt").to(device)
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
             generated_ids = out[0][enc["input_ids"].shape[-1]:]
             generated     = tokenizer.decode(generated_ids, skip_special_tokens=True)
             results.append({"prompt": prompt, "generated": generated})

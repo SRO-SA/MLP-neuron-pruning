@@ -2,16 +2,14 @@
 # qwen_swiglu_pruning — default experiment configuration
 # ---------------------------------------------------------------
 
-# Hugging Face model identifier.
-# Falls back to the Instruct variant if the base model fails to load.
 model_name: "Qwen/Qwen2.5-0.5B"
 model_name_fallback: "Qwen/Qwen2.5-0.5B-Instruct"
 
-# Hardware
 device: "auto"      # "auto" = CUDA if available, else CPU
 dtype: "float32"    # "float32" | "float16" | "bfloat16"
 
-# Experiment grid
+# Pruning ratios for the MAIN experiment
+# Use --debug-pruning to run the tiny-ratio diagnostic separately
 pruning_ratios:
   - 0.0
   - 0.05
@@ -20,6 +18,9 @@ pruning_ratios:
   - 0.30
   - 0.40
 
+# Tiny ratios used automatically in --debug-pruning mode:
+#   0.001, 0.005, 0.01, 0.02, 0.05
+
 pruning_methods:
   - random
   - down_norm
@@ -27,12 +28,17 @@ pruning_methods:
   - rmsnorm_bound_angle
 
 # Evaluation
-max_eval_samples: 512    # number of WikiText-2 samples used for perplexity
-max_seq_len: 512         # tokens per sample (truncated/padded)
+max_eval_samples: 512
+max_seq_len: 512
 batch_size: 4
 
 # Output
 output_dir: "results"
+
+# Bound analysis mode (--bound-analysis)
+# Uses a smaller eval set so the threshold experiments finish faster.
+# Set to 0 to skip PPL evaluation and only print the distribution + count tables.
+bound_analysis_eval_samples: 64
 
 # Reproducibility
 seed: 42
