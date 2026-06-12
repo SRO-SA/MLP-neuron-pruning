@@ -40,6 +40,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.bound_analysis import run_bound_analysis_mode
 from src.scaling import run_scaling_recon_mode
 from src.target_pruning import run_target_pruning_mode
+from src.moe_pruning import run_moe_target_pruning_mode
+from src.benchmark import run_benchmark_mode
 from src.merging import (
     run_bound_merge_mode,
     run_bound_merge_stable_mode,
@@ -171,6 +173,22 @@ def run_experiment(cfg: Dict, args) -> None:
             targets_override=args.target_pruning_percents or None,
             methods_override=args.methods or None,
             n_eval_override=args.n_eval or None,
+            eval_datasets_override=args.eval_datasets or None,
+            selectors_override=args.selectors or None,
+        )
+        return
+
+    # ── MOE TARGET-PRUNING MODE ─────────────────────────────────────────────
+    if args.moe_target_pruning:
+        run_moe_target_pruning_mode(
+            cfg,
+            device=device,
+            output_dir=output_dir,
+            models_override=args.models or None,
+            targets_override=args.target_pruning_percents or None,
+            methods_override=args.methods or None,
+            n_eval_override=args.n_eval or None,
+            eval_datasets_override=args.eval_datasets or None,
         )
         return
 
@@ -181,6 +199,17 @@ def run_experiment(cfg: Dict, args) -> None:
         device        = device,
         dtype_str     = cfg.get("dtype", "float32"),
     )
+
+    # ── BENCHMARK MODE ─────────────────────────────────────────────────────────
+    if args.benchmark:
+        run_benchmark_mode(
+            cfg, device=device, output_dir=output_dir,
+            model_configs=[("baseline", model, tokenizer)],
+            prompt_lens=cfg.get("benchmark_prompt_lens", [128, 512, 1024]),
+            max_new_tokens=int(cfg.get("benchmark_max_new_tokens", 128)),
+            n_repeats=int(cfg.get("benchmark_n_repeats", 5)),
+        )
+        return
 
     # ── BOUND ANALYSIS MODE ────────────────────────────────────────────────────
     if args.bound_analysis:
@@ -562,9 +591,50 @@ def parse_args():
     p.add_argument(
         "--n-eval", type=int, default=None,
         help=(
-            "Number of WikiText-2 evaluation samples override "
+            "Number of evaluation samples per dataset "
             "(e.g. --n-eval 256). "
             "Overrides reconstruction_eval_samples in the config."
+        ),
+    )
+    p.add_argument(
+        "--eval-datasets", nargs="+", default=None,
+        dest="eval_datasets",
+        help=(
+            "Evaluation datasets for --target-pruning-scaling "
+            "(e.g. --eval-datasets wikitext2 c4 wikitext103). "
+            "Supported: wikitext2, c4, wikitext103, lambada. "
+            "Overrides eval_datasets in the config."
+        ),
+    )
+    p.add_argument(
+        "--selectors", nargs="+", default=None,
+        help=(
+            "Pruning selector(s) for --target-pruning-scaling "
+            "(e.g. --selectors rmsnorm_bound down_norm random_seed0). "
+            "Supported: rmsnorm_bound, down_norm, activation_score, "
+            "random_seed0, random_seed1, random_seed2. "
+            "Overrides selectors in the config."
+        ),
+    )
+    p.add_argument(
+        "--moe-target-pruning", action="store_true",
+        dest="moe_target_pruning",
+        help=(
+            "Expert-wise structured MLP channel pruning for MoE models "
+            "(e.g. Qwen3-30B-A3B). "
+            "Uses router-aware calibration and per-expert channel scoring. "
+            "Does NOT prune router weights or remove entire experts. "
+            "Use --models, --target-pruning-percents, --methods, --n-eval to configure."
+        ),
+    )
+    p.add_argument(
+        "--benchmark", action="store_true",
+        help=(
+            "Run inference latency / throughput / memory benchmark. "
+            "Requires --config with model_name set. "
+            "Benchmarks prompt_lens 128/512/1024 with max_new_tokens=128. "
+            "Use benchmark_prompt_lens, benchmark_max_new_tokens, "
+            "benchmark_n_repeats in config to customise."
         ),
     )
     return p

@@ -110,47 +110,125 @@ FALLBACK_TEXTS = [
 # Dataset loading
 # ---------------------------------------------------------------------------
 
+# Canonical names for supported eval datasets
+SUPPORTED_EVAL_DATASETS = ("wikitext2", "c4", "wikitext103", "lambada")
+
+
 def load_eval_dataset(
     max_samples: int = 512,
     use_fallback_corpus: bool = True,
+    dataset_name: str = "wikitext2",
 ) -> List[str]:
     """
-    Try to load WikiText-2 test split.
+    Load an evaluation text corpus.
 
     Parameters
     ----------
     max_samples : int
         Maximum number of text samples to return.
     use_fallback_corpus : bool
-        If True (default), silently fall back to the built-in FALLBACK_TEXTS
-        when WikiText-2 cannot be loaded (useful for offline / CI runs).
-        If False, raise the exception so the caller knows real data is unavailable.
+        If True, fall back to FALLBACK_TEXTS when the dataset cannot be loaded.
         Set to False in the config when you need trustworthy perplexity numbers.
+    dataset_name : str
+        One of: "wikitext2" (default), "c4", "wikitext103", "lambada".
+        Unrecognised names fall through to wikitext2 with a warning.
     """
+    ds_key = dataset_name.lower().strip()
+
+    loaders = {
+        "wikitext2":   _load_wikitext2,
+        "wikitext103": _load_wikitext103,
+        "c4":          _load_c4,
+        "lambada":     _load_lambada,
+    }
+    loader = loaders.get(ds_key)
+    if loader is None:
+        logger.warning(
+            "Unknown dataset_name '%s'; falling back to wikitext2.", dataset_name
+        )
+        loader = _load_wikitext2
+
     try:
-        from datasets import load_dataset  # type: ignore
-        logger.info("Loading WikiText-2 (test split) …")
-        ds     = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-        # Filter out very short lines (headers, empty rows)
-        texts  = [row["text"] for row in ds if len(row["text"].strip()) > 100]
-        texts  = texts[:max_samples]
-        logger.info("WikiText-2 loaded: %d samples (filtered)", len(texts))
+        texts = loader(max_samples)
+        logger.info("Dataset '%s' loaded: %d samples", ds_key, len(texts))
         return texts
     except Exception as exc:  # noqa: BLE001
         if not use_fallback_corpus:
             logger.error(
-                "Could not load WikiText-2: %s\n"
-                "  Re-run with use_fallback_corpus: true in the config if you want to\n"
-                "  proceed with the built-in fallback corpus (PPL will be unreliable).",
-                exc,
+                "Could not load '%s': %s\n"
+                "  Re-run with use_fallback_corpus: true to use the built-in "
+                "fallback corpus (PPL will be indicative only).",
+                dataset_name, exc,
             )
             raise
         logger.warning(
-            "Could not load WikiText-2 (%s). Using built-in fallback corpus "
-            "(note: PPL computed on %d short samples — values are indicative only).",
-            exc, len(FALLBACK_TEXTS),
+            "Could not load '%s' (%s). Using built-in fallback corpus "
+            "(note: PPL computed on %d short samples — indicative only).",
+            dataset_name, exc, len(FALLBACK_TEXTS),
         )
         return FALLBACK_TEXTS
+
+
+def load_all_eval_datasets(
+    dataset_names: List[str],
+    max_samples: int = 512,
+    use_fallback_corpus: bool = True,
+) -> "Dict[str, List[str]]":
+    """
+    Load multiple evaluation datasets at once.
+
+    Returns
+    -------
+    Dict mapping dataset_name → list of text samples.
+    If a dataset fails and use_fallback_corpus=True, it maps to FALLBACK_TEXTS.
+    """
+    out: Dict[str, List[str]] = {}
+    for name in dataset_names:
+        out[name] = load_eval_dataset(
+            max_samples=max_samples,
+            use_fallback_corpus=use_fallback_corpus,
+            dataset_name=name,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset loader helpers
+# ---------------------------------------------------------------------------
+
+def _load_wikitext2(max_samples: int) -> List[str]:
+    from datasets import load_dataset  # type: ignore
+    ds    = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    texts = [row["text"] for row in ds if len(row["text"].strip()) > 100]
+    return texts[:max_samples]
+
+
+def _load_wikitext103(max_samples: int) -> List[str]:
+    from datasets import load_dataset  # type: ignore
+    ds    = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
+    texts = [row["text"] for row in ds if len(row["text"].strip()) > 100]
+    return texts[:max_samples]
+
+
+def _load_c4(max_samples: int) -> List[str]:
+    from datasets import load_dataset  # type: ignore
+    # C4 validation split; streaming avoids downloading the full ~300 GB
+    ds    = load_dataset("allenai/c4", "en", split="validation", streaming=True)
+    texts = []
+    for row in ds:
+        t = row.get("text", "").strip()
+        if len(t) > 100:
+            texts.append(t)
+        if len(texts) >= max_samples:
+            break
+    return texts
+
+
+def _load_lambada(max_samples: int) -> List[str]:
+    from datasets import load_dataset  # type: ignore
+    ds    = load_dataset("EleutherAI/lambada_openai", split="test")
+    texts = [row["text"] for row in ds if len(row["text"].strip()) > 20]
+    return texts[:max_samples]
 
 
 # ---------------------------------------------------------------------------

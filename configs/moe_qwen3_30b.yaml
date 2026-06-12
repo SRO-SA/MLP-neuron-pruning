@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------
+# qwen_swiglu_pruning — MoE expert-wise channel pruning
+#
+# Run (smoke test first):
+#   python run_experiment.py \
+#       --config configs/moe_qwen3_30b.yaml \
+#       --moe-target-pruning
+#
+# Smoke test mode (first 4 MoE layers only, n_eval=64):
+#   Set moe_smoke_test: true in this file (default below)
+#
+# WARNING: Qwen3-30B-A3B requires ~30-40 GB VRAM in bfloat16.
+#   If OOM, reduce reconstruction_eval_samples and batch_size.
+#   Set scaling_dtype: "float16" if bfloat16 is not supported.
+#
+# Purpose:
+#   Expert-wise structured SwiGLU channel pruning on Qwen3-30B-A3B.
+#   - Router weights are NOT modified.
+#   - Entire experts are NOT removed.
+#   - Only MLP channels (gate/up/down rows/cols) within each expert are pruned.
+#   - Per-expert cap: max_expert_frac (default 20%) of that expert's channels.
+#   - Experts with < min_expert_tokens routed tokens are skipped.
+# ---------------------------------------------------------------
+
+device: "auto"
+scaling_dtype: "auto"   # bfloat16 if supported, else float16
+
+scaling_models:
+  - "Qwen/Qwen3-30B-A3B"
+
+# Target percentage of total expert MLP neurons to prune (globally)
+target_pruning_percents:
+  - 2.0
+
+# Methods: pure_delete first (no calibration), then residual
+scaling_methods:
+  - "pure_delete"
+  # - "residual_full"  # uncomment when pure_delete looks good
+
+# Per-expert safety cap: at most this fraction of one expert's channels
+max_expert_frac: 0.20
+
+# Skip experts with fewer than this many routed calibration tokens
+min_expert_tokens: 128
+
+# Evaluation
+reconstruction_eval_samples: 64
+max_seq_len: 512
+batch_size: 1
+
+# Datasets
+eval_datasets:
+  - "wikitext2"
+use_fallback_corpus: false
+
+# Output
+output_dir: "results"
+
+# Set true to run only first 4 MoE layers (fast correctness check)
+moe_smoke_test: true
+
+# Reproducibility
+seed: 42

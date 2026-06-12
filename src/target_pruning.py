@@ -94,9 +94,12 @@ DIAGNOSTIC_ALPHAS = [5e-4, 1e-3, 2e-3]
 # CSV schemas
 # ---------------------------------------------------------------------------
 MAIN_CSV_KEYS = [
-    "model", "target_pruning_percent",
+    "model", "target_pruning_percent", "eval_dataset", "selector",
     "actual_pruned_neurons", "total_mlp_neurons", "actual_pruning_percent",
+    "mlp_channel_pruning_percent",
     "mlp_param_reduction_percent", "mlp_flop_reduction_percent",
+    "total_model_param_reduction_percent",
+    "estimated_total_forward_flop_reduction_percent",
     "method",
     "baseline_ppl", "compressed_ppl", "delta_ppl", "relative_ppl_increase_percent",
     "pure_delete_delta_ppl", "damage_reduction_percent",
@@ -457,6 +460,58 @@ def _try_save_plots(
     logger.info("Saved: %s", p)
 
 
+
+# ---------------------------------------------------------------------------
+# Physical shape verification
+# ---------------------------------------------------------------------------
+
+def _verify_pruned_shapes(
+    layers_orig:     list,
+    layers_pruned:   list,
+    prune_per_layer: list,
+    label:           str = "",
+) -> int:
+    """
+    Confirm that gate_proj, up_proj, down_proj shapes are physically correct
+    after pruning.  Returns total neurons removed across all layers.
+
+    For each layer:
+      gate_proj.weight : [d_ff_new, d_model]  where d_ff_new = d_ff - n_pruned
+      up_proj.weight   : [d_ff_new, d_model]
+      down_proj.weight : [d_model, d_ff_new]
+
+    Logs a WARNING for any mismatch; does not raise (resilience over strictness).
+    """
+    from .model_utils import get_mlp_weights
+    total_removed = 0
+    for li, (ol, pl, pi) in enumerate(
+            zip(layers_orig, layers_pruned, prune_per_layer)):
+        try:
+            ow = get_mlp_weights(ol)
+            pw = get_mlp_weights(pl)
+            n_pruned   = int(len(pi))
+            d_ff_exp   = ow["d_ff"] - n_pruned
+            d_ff_got   = pw["d_ff"]
+            total_removed += n_pruned
+            if d_ff_exp != d_ff_got:
+                logger.warning(
+                    "[%s] Layer %d shape mismatch: "
+                    "expected d_ff=%d got d_ff=%d (pruned=%d)",
+                    label, li, d_ff_exp, d_ff_got, n_pruned,
+                )
+            else:
+                logger.debug(
+                    "[%s] Layer %d OK: gate[%d,%d] up[%d,%d] down[%d,%d]",
+                    label, li,
+                    d_ff_got, ow["d_model"],
+                    d_ff_got, ow["d_model"],
+                    ow["d_model"], d_ff_got,
+                )
+        except Exception as exc:
+            logger.warning("[%s] Layer %d shape check failed: %s", label, li, exc)
+    return total_removed
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -469,6 +524,8 @@ def run_target_pruning_mode(
     targets_override: Optional[List[float]] = None,
     methods_override: Optional[List[str]]   = None,
     n_eval_override:  Optional[int]         = None,
+    eval_datasets_override: Optional[List[str]] = None,
+    selectors_override: Optional[List[str]] = None,
 ) -> None:
     """
     Fixed-percentage MLP pruning experiment.
@@ -489,7 +546,9 @@ def run_target_pruning_mode(
         apply_residual_down_reconstruction_timed,
     )
     from .bound_analysis import compute_bound_scores_and_R, select_by_budget
-    from .evaluation import evaluate_perplexity, load_eval_dataset
+    from .selectors import gather_scores_for_selector
+    from .evaluation import (evaluate_perplexity, load_eval_dataset,
+                               load_all_eval_datasets)
     from .flops import estimate_mlp_flops
     from .model_utils import (
         count_parameters,
@@ -527,11 +586,18 @@ def run_target_pruning_mode(
     use_fb         = bool(cfg.get("use_fallback_corpus", False))
     dtype_cfg      = str(cfg.get("scaling_dtype", "auto"))
     max_layer_frac = float(cfg.get("max_layer_prune_frac", DEFAULT_MAX_LAYER_FRAC))
+    EVAL_DATASETS  = (eval_datasets_override
+                      or cfg.get("eval_datasets", ["wikitext2"]))
+    EVAL_DATASETS  = [str(d) for d in EVAL_DATASETS]
+    SELECTORS      = (selectors_override
+                      or cfg.get("selectors", ["rmsnorm_bound"]))
+    SELECTORS      = [str(s) for s in SELECTORS]
+    needs_act_sel  = any(s == "activation_score" for s in SELECTORS)
 
     n_train_prompts  = len(RECONSTRUCTION_TRAIN_PROMPTS)
     n_heldout_prompts = len(RECONSTRUCTION_HELDOUT_PROMPTS)
     n_calib_samples  = n_train_prompts + n_heldout_prompts
-    needs_calib      = any(m != "pure_delete" for m in METHODS)
+    needs_calib      = any(m != "pure_delete" for m in METHODS) or needs_act_sel
 
     # ── Header ───────────────────────────────────────────────────────────────
     print(f"\n{'=' * 90}")
@@ -539,7 +605,9 @@ def run_target_pruning_mode(
     print(f"  Models         : {model_list}")
     print(f"  Target percents: {TARGET_PCTS}%")
     print(f"  Methods        : {METHODS}")
-    print(f"  n_eval         : {n_eval} WikiText-2 samples")
+    print(f"  Selectors      : {SELECTORS}")
+    print(f"  n_eval         : {n_eval} samples per dataset")
+    print(f"  Eval datasets  : {EVAL_DATASETS}")
     print(f"  Max layer frac : {max_layer_frac:.0%}")
     print(f"  lambda / tau   : {BEST_RESIDUAL_LAM} / {BEST_RESIDUAL_TAU}")
     print(f"{'=' * 90}")
@@ -552,14 +620,19 @@ def run_target_pruning_mode(
     print("                      evaluation data is WikiText-2. No shared tokens.")
     print()
 
-    # Load eval texts ONCE — identical corpus ensures cross-model comparability
-    print("Loading WikiText-2 evaluation texts ...")
-    eval_texts    = load_eval_dataset(n_eval, use_fallback_corpus=use_fb)
+    # Load all eval corpora ONCE — same corpora for every model ensures comparability
+    print(f"Loading evaluation datasets: {EVAL_DATASETS} ...")
+    all_eval_corpora: Dict[str, list] = load_all_eval_datasets(
+        EVAL_DATASETS, max_samples=n_eval, use_fallback_corpus=use_fb,
+    )
+    for _dn, _txts in all_eval_corpora.items():
+        print(f"  {_dn}: {len(_txts)} samples "
+              f"(approx {len(_txts) * max_seq:,} tokens)")
+    print()
+    # Backward-compat references (used for diag prints; per-dataset values used in rows)
+    eval_texts    = all_eval_corpora[EVAL_DATASETS[0]]
     n_eval_actual = len(eval_texts)
-    # Approximate upper bound on eval tokens (some sequences may be shorter)
     n_eval_tokens_approx = n_eval_actual * max_seq
-    print(f"  Loaded {n_eval_actual} samples "
-          f"(approx {n_eval_tokens_approx:,} tokens at max_seq={max_seq}).\n")
 
     all_results:       List[Dict] = []
     all_layer_results: List[Dict] = []
@@ -596,25 +669,28 @@ def run_target_pruning_mode(
             print(f"  Hidden size  : {hidden_size}")
             print(f"  Intermediate : {inter_size}")
 
-            # Baseline
-            print("\n  Computing baseline PPL ...")
+            # Per-dataset baseline PPLs (computed once per model)
+            print("\n  Computing per-dataset baseline PPLs ...")
             layers = get_transformer_layers(model)
-            bp = evaluate_perplexity(
-                model, tokenizer, texts=eval_texts,
-                max_seq_len=max_seq, batch_size=batch_sz, device=device,
-            )
-            baseline_ppl    = bp["perplexity"]
+            baseline_ppl_per_ds: Dict[str, float] = {}
+            for _ds in EVAL_DATASETS:
+                _bp = evaluate_perplexity(
+                    model, tokenizer, texts=all_eval_corpora[_ds],
+                    max_seq_len=max_seq, batch_size=batch_sz, device=device,
+                )
+                baseline_ppl_per_ds[_ds] = _bp["perplexity"]
+                print(f"    {_ds}: PPL = {_bp['perplexity']:.4f}")
+            baseline_ppl    = baseline_ppl_per_ds[EVAL_DATASETS[0]]
             baseline_params = count_parameters(model)
             baseline_flops  = estimate_mlp_flops(model, seq_len=max_seq)
-            print(f"  Baseline PPL = {baseline_ppl:.4f}")
 
-            # Static scores (no forward pass)
-            print("\n  Computing RMSNorm-bound-angle scores ...")
+            # Static scores for rmsnorm_bound (used for diagnostics + total_mlp count)
+            print("\n  Computing RMSNorm-bound-angle scores (for diagnostics) ...")
             all_scores    = _gather_all_scores(layers, compute_bound_scores_and_R)
             total_mlp     = sum(int(s.numel()) for s in all_scores)
             print(f"  Total MLP neurons : {total_mlp:,}")
 
-            # Score diagnostics (once per model)
+            # Score diagnostics (once per model, always with rmsnorm_bound)
             print("  Computing score diagnostics ...")
             diag = _score_diagnostics(
                 all_scores, model_name, total_mlp, select_by_budget
@@ -654,58 +730,80 @@ def run_target_pruning_mode(
                 print(f"  Disjointness confirmed: calibration = hardcoded prompts; "
                       f"evaluation = WikiText-2 test split")
 
+            # ── Per-layer calibration activations for activation_score ───────
+            calib_per_layer: List[Optional[torch.Tensor]] = [None] * len(layers)
+            if needs_act_sel and train_r is not None:
+                print("  Caching per-layer MLP inputs for activation_score ...")
+                for _li, _r in enumerate(train_r):
+                    if _r is not None:
+                        calib_per_layer[_li] = _r.detach().float().cpu()
+
             # ── Per-target loop ──────────────────────────────────────────────
             for target_pct in TARGET_PCTS:
                 print(f"\n  {'=' * 70}")
                 print(f"  Target: {target_pct:.1f}%  of  {total_mlp:,}  MLP neurons")
 
-                target_n = round(target_pct / 100.0 * total_mlp)
-                prune_per_layer, keep_per_layer, sel_info = _select_global_target(
-                    all_scores, target_n, max_layer_frac=max_layer_frac
-                )
+                for selector_name in SELECTORS:
+                    print(f"\n    [selector={selector_name}]")
 
-                actual_pruned = sel_info["actual_pruned"]
-                actual_pct    = 100.0 * actual_pruned / total_mlp if total_mlp else 0.0
-                cap_hits      = sel_info["cap_hit_layers"]
-
-                print(f"    Requested: {target_n:,}  "
-                      f"Actual: {actual_pruned:,} ({actual_pct:.3f}%)")
-                if cap_hits:
-                    print(f"    Per-layer cap hit in {len(cap_hits)} "
-                          f"layer(s): {cap_hits}")
-                if not sel_info["target_reached"]:
-                    logger.warning(
-                        "Target %.1f%% NOT REACHED for %s: "
-                        "actual %.3f%% (cap hit in %d layers)",
-                        target_pct, model_name, actual_pct, len(cap_hits),
+                    # Gather scores for this selector
+                    sel_scores = gather_scores_for_selector(
+                        selector_name, layers,
+                        calib_inputs_per_layer=calib_per_layer,
+                        device=device,
                     )
-                    print(f"    WARNING: target not reached due to per-layer cap")
 
-                # Per-layer CSV
-                layer_rows = _make_per_layer_rows(
-                    all_scores, prune_per_layer, model_name, target_pct
-                )
-                all_layer_results.extend(layer_rows)
-                _flush_csv(layer_csv_path, layer_rows, PER_LAYER_CSV_KEYS)
+                    target_n = round(target_pct / 100.0 * total_mlp)
+                    prune_per_layer, keep_per_layer, sel_info = _select_global_target(
+                        sel_scores, target_n, max_layer_frac=max_layer_frac
+                    )
 
-                target_rows: List[Dict]    = []
-                dppl_delete: Optional[float] = None
+                    actual_pruned = sel_info["actual_pruned"]
+                    actual_pct    = 100.0 * actual_pruned / total_mlp if total_mlp else 0.0
+                    cap_hits      = sel_info["cap_hit_layers"]
 
-                # -- Row factories (closures over per-target constants) --------
-                def _base_row(method: str, **extra) -> Dict:
+                    print(f"      Requested: {target_n:,}  "
+                          f"Actual: {actual_pruned:,} ({actual_pct:.3f}%)")
+                    if cap_hits:
+                        print(f"      Per-layer cap hit in {len(cap_hits)} layer(s)")
+                    if not sel_info["target_reached"]:
+                        logger.warning(
+                            "Target %.1f%% NOT REACHED for %s selector=%s: "
+                            "actual %.3f%% (cap hit in %d layers)",
+                            target_pct, model_name, selector_name,
+                            actual_pct, len(cap_hits),
+                        )
+                        print(f"      WARNING: target not reached due to per-layer cap")
+
+                    # Per-layer CSV (one entry per selector per target%)
+                    layer_rows = _make_per_layer_rows(
+                        sel_scores, prune_per_layer, model_name, target_pct
+                    )
+                    all_layer_results.extend(layer_rows)
+                    _flush_csv(layer_csv_path, layer_rows, PER_LAYER_CSV_KEYS)
+
+                # ─────────────────────────────────────────────────────────────
+                # Row factories and PPL helper
+                # ─────────────────────────────────────────────────────────────
+                def _base_row(method_: str, ds_name_: str, **extra) -> Dict:
+                    """Build a base result row for (method, dataset)."""
                     r: Dict = {
                         "model":                    model_name,
                         "target_pruning_percent":   target_pct,
+                        "eval_dataset":             ds_name_,
+                        "selector":                 selector_name,
                         "actual_pruned_neurons":    actual_pruned,
                         "total_mlp_neurons":        total_mlp,
                         "actual_pruning_percent":   round(actual_pct, 4),
-                        "method":                   method,
-                        "baseline_ppl":             round(baseline_ppl, 4),
+                        "method":                   method_,
+                        "baseline_ppl":             round(
+                            baseline_ppl_per_ds.get(ds_name_, baseline_ppl), 4),
                         "dtype":                    dtype_str,
                         "calibration_num_samples":  n_calib_samples,
-                        "eval_num_samples":         n_eval_actual,
+                        "eval_num_samples":         len(all_eval_corpora[ds_name_]),
                         "calibration_num_tokens":   n_calib_tokens,
-                        "eval_num_tokens":          n_eval_tokens_approx,
+                        "eval_num_tokens":          (
+                            len(all_eval_corpora[ds_name_]) * max_seq),
                         "cap_hit_layers_count":     len(cap_hits),
                         "target_reached":           sel_info["target_reached"],
                         "notes":                    "",
@@ -713,64 +811,105 @@ def run_target_pruning_mode(
                     r.update(extra)
                     return r
 
-                def _fill_ppl(row: Dict, m) -> Tuple[float, float]:
-                    """Evaluate m; populate PPL + compression columns."""
+                def _fill_ppl(row: Dict, m, ds_name_: str) -> Tuple[float, float]:
+                    """Evaluate m on dataset ds_name_; populate compression cols."""
+                    cur_texts_   = all_eval_corpora[ds_name_]
+                    cur_bppl_    = baseline_ppl_per_ds.get(ds_name_, baseline_ppl)
                     fp_ok    = verify_forward_pass(m, tokenizer, device)
                     ppl_info = evaluate_perplexity(
-                        m, tokenizer, texts=eval_texts,
+                        m, tokenizer, texts=cur_texts_,
                         max_seq_len=max_seq, batch_size=batch_sz, device=device,
                     )
                     ppl   = ppl_info["perplexity"]
-                    delta = ppl - baseline_ppl
+                    delta = ppl - cur_bppl_
                     pp    = count_parameters(m)
                     pf    = estimate_mlp_flops(m, seq_len=max_seq)
+
+                    mlp_par_red = round(
+                        100 * (1 - pp["mlp"] / baseline_params["mlp"]), 4)
+                    mlp_flp_red = round(
+                        100 * (1 - pf["total_flops"]
+                               / baseline_flops["total_flops"]), 4)
+                    total_par_red = round(
+                        100 * (1 - pp["total"] / baseline_params["total"]), 4)
+
+                    # Attention FLOPs ≈ 8 * seq * d_model^2 * n_layers (approx)
+                    _n_ly  = getattr(cfg_m, "num_hidden_layers", 1)
+                    _d_m   = getattr(cfg_m, "hidden_size", 1)
+                    _attn  = 8 * max_seq * (_d_m ** 2) * _n_ly
+                    _tb    = baseline_flops["total_flops"] + _attn
+                    _mlp_s = baseline_flops["total_flops"] - pf["total_flops"]
+                    est_tot_flp_red = round(
+                        100 * _mlp_s / _tb if _tb > 0 else 0.0, 4)
+
                     row.update({
                         "compressed_ppl":                round(ppl,   4),
                         "delta_ppl":                     round(delta, 4),
                         "relative_ppl_increase_percent": round(
-                            100.0 * delta / baseline_ppl, 4),
-                        "mlp_param_reduction_percent":   round(
-                            100 * (1 - pp["mlp"] / baseline_params["mlp"]), 4),
-                        "mlp_flop_reduction_percent":    round(
-                            100 * (1 - pf["total_flops"]
-                                   / baseline_flops["total_flops"]), 4),
+                            100.0 * delta / cur_bppl_, 4),
+                        "mlp_channel_pruning_percent":   round(actual_pct, 4),
+                        "mlp_param_reduction_percent":   mlp_par_red,
+                        "mlp_flop_reduction_percent":    mlp_flp_red,
+                        "total_model_param_reduction_percent":       total_par_red,
+                        "estimated_total_forward_flop_reduction_percent":
+                                                         est_tot_flp_red,
                         "notes": row.get("notes", "") or ("" if fp_ok
                                                           else "forward_pass_failed"),
                     })
                     return round(ppl, 4), round(delta, 4)
 
-                # ── Method loop ──────────────────────────────────────────────
+                # ── Method loop (prune/reconstruct once; eval on all datasets) ──
+                all_target_rows: List[Dict] = []
+                # dppl_delete per dataset (needed for damage_reduction of resid methods)
+                dppl_delete_per_ds: Dict[str, Optional[float]] = {
+                    ds: None for ds in EVAL_DATASETS
+                }
+
                 for method in METHODS:
 
                     # ── pure_delete ──────────────────────────────────────────
                     if method == "pure_delete":
-                        print(f"    [pure_delete]  ", end="", flush=True)
-                        row_del      = _base_row("pure_delete")
+                        print(f"    [pure_delete] pruning ... ", end="", flush=True)
                         pruned_model = None
                         try:
                             pruned_model, _ = prune_model_by_layer_indices(
                                 model, prune_per_layer,
                                 label=f"tp_del_{target_pct}",
                             )
-                            _, dppl_delete = _fill_ppl(row_del, pruned_model)
-                            row_del["pure_delete_delta_ppl"]      = dppl_delete
-                            row_del["damage_reduction_percent"]   = float("nan")
-                            print(
-                                f"PPL={row_del['compressed_ppl']:.4f}  "
-                                f"dPPL={dppl_delete:+.4f}  "
-                                f"rel={row_del['relative_ppl_increase_percent']:+.2f}%"
+                            # Physical shape verification (once per pruning)
+                            _n_rm = _verify_pruned_shapes(
+                                layers,
+                                get_transformer_layers(pruned_model),
+                                prune_per_layer,
+                                label=f"pure_delete/{model_name}/{target_pct}%",
                             )
+                            print(f"shape OK ({_n_rm:,} removed)")
+                            # Evaluate on each dataset
+                            for _ds in EVAL_DATASETS:
+                                row_del = _base_row("pure_delete", _ds)
+                                _, _dppl = _fill_ppl(row_del, pruned_model, _ds)
+                                row_del["pure_delete_delta_ppl"]    = _dppl
+                                row_del["damage_reduction_percent"] = float("nan")
+                                dppl_delete_per_ds[_ds] = _dppl
+                                print(
+                                    f"      [{_ds}] PPL={row_del['compressed_ppl']:.4f}"
+                                    f"  dPPL={_dppl:+.4f}"
+                                    f"  rel={row_del['relative_ppl_increase_percent']:+.2f}%"
+                                )
+                                all_target_rows.append(row_del)
                         except Exception as exc:
                             logger.error("pure_delete %s t=%.1f%%: %s",
                                          model_name, target_pct, exc, exc_info=True)
-                            row_del["notes"] = f"ERROR: {exc}"
+                            for _ds in EVAL_DATASETS:
+                                r = _base_row("pure_delete", _ds)
+                                r["notes"] = f"ERROR: {exc}"
+                                all_target_rows.append(r)
                             print(f"FAILED: {exc}")
                         finally:
                             if pruned_model is not None:
                                 del pruned_model
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                        target_rows.append(row_del)
                         continue
 
                     # ── residual methods ─────────────────────────────────────
@@ -784,10 +923,7 @@ def run_target_pruning_mode(
                         )
                         continue
 
-                    print(f"    [{method}]  ", end="", flush=True)
-                    row_res      = _base_row(method,
-                                             ridge_lambda=BEST_RESIDUAL_LAM,
-                                             tau=BEST_RESIDUAL_TAU)
+                    print(f"    [{method}] reconstructing ... ", end="", flush=True)
                     pruned_model = None
                     try:
                         pruned_model, build_info = apply_residual_down_reconstruction_timed(
@@ -799,60 +935,73 @@ def run_target_pruning_mode(
                         )
                         n_s = build_info["n_stable_layers"]
                         n_u = build_info["n_unstable_layers"]
-                        row_res["n_stable_layers"]              = n_s
-                        row_res["n_unstable_layers"]            = n_u
-                        row_res["reconstruction_time_seconds"]  = build_info.get(
-                            "total_recon_time_s")
-                        row_res["peak_gpu_memory_MB"]           = build_info.get(
-                            "peak_gpu_mb")
+                        t_s   = build_info.get("total_recon_time_s", float("nan"))
+                        gb_mb = build_info.get("peak_gpu_mb", float("nan"))
+                        print(f"done  t={t_s:.1f}s  stable={n_s}/{n_s+n_u}")
 
                         if build_info.get("all_unstable", False):
-                            row_res["notes"] = "SKIPPED_PPL:all_layers_unstable"
-                            print(f"all layers unstable "
-                                  f"(stable={n_s} unstable={n_u})")
-                            target_rows.append(row_res)
+                            for _ds in EVAL_DATASETS:
+                                r = _base_row(method, _ds,
+                                              ridge_lambda=BEST_RESIDUAL_LAM,
+                                              tau=BEST_RESIDUAL_TAU)
+                                r["n_stable_layers"]             = n_s
+                                r["n_unstable_layers"]           = n_u
+                                r["reconstruction_time_seconds"] = t_s
+                                r["peak_gpu_memory_MB"]          = gb_mb
+                                r["notes"] = "SKIPPED_PPL:all_layers_unstable"
+                                all_target_rows.append(r)
                             continue
 
-                        _, dppl_res = _fill_ppl(row_res, pruned_model)
+                        # Evaluate on each dataset
+                        for _ds in EVAL_DATASETS:
+                            row_res = _base_row(method, _ds,
+                                                ridge_lambda=BEST_RESIDUAL_LAM,
+                                                tau=BEST_RESIDUAL_TAU)
+                            row_res["n_stable_layers"]             = n_s
+                            row_res["n_unstable_layers"]           = n_u
+                            row_res["reconstruction_time_seconds"] = t_s
+                            row_res["peak_gpu_memory_MB"]          = gb_mb
+                            _, dppl_res = _fill_ppl(row_res, pruned_model, _ds)
 
-                        # Damage reduction vs pure_delete
-                        if dppl_delete is not None and abs(dppl_delete) > 1e-6:
-                            dmg = round(
-                                100.0 * (dppl_delete - dppl_res) / dppl_delete, 2
+                            # Damage reduction (per-dataset baseline)
+                            dppl_del = dppl_delete_per_ds.get(_ds)
+                            if dppl_del is not None and abs(dppl_del) >= 0.05:
+                                dmg = round(
+                                    100.0 * (dppl_del - dppl_res) / dppl_del, 2)
+                                row_res["damage_reduction_percent"] = dmg
+                                row_res["pure_delete_delta_ppl"]    = round(dppl_del, 4)
+                            else:
+                                row_res["damage_reduction_percent"] = float("nan")
+
+                            dm   = row_res.get("damage_reduction_percent", float("nan"))
+                            dm_s = f"  dmg_red={dm:+.1f}%" if dm == dm else ""
+                            print(
+                                f"      [{_ds}] PPL={row_res['compressed_ppl']:.4f}"
+                                f"  dPPL={dppl_res:+.4f}"
+                                f"  rel={row_res['relative_ppl_increase_percent']:+.2f}%"
+                                + dm_s
                             )
-                            row_res["damage_reduction_percent"] = dmg
-                            row_res["pure_delete_delta_ppl"]    = round(dppl_delete, 4)
-                        else:
-                            row_res["damage_reduction_percent"] = float("nan")
-
-                        t_s   = row_res.get("reconstruction_time_seconds", float("nan"))
-                        gb_mb = row_res.get("peak_gpu_memory_MB",          float("nan"))
-                        dm    = row_res.get("damage_reduction_percent",    float("nan"))
-                        dm_s  = (f"  dmg_red={dm:+.1f}%"
-                                 if dm == dm else "")
-                        print(
-                            f"PPL={row_res['compressed_ppl']:.4f}  "
-                            f"dPPL={dppl_res:+.4f}  "
-                            f"rel={row_res['relative_ppl_increase_percent']:+.2f}%"
-                            + dm_s
-                            + f"  t={t_s:.1f}s  gpu={gb_mb:.0f}MB"
-                        )
+                            all_target_rows.append(row_res)
 
                     except Exception as exc:
                         logger.error("[%s] %s t=%.1f%%: %s",
                                      method, model_name, target_pct, exc, exc_info=True)
-                        row_res["notes"] = f"ERROR: {exc}"
+                        for _ds in EVAL_DATASETS:
+                            r = _base_row(method, _ds)
+                            r["notes"] = f"ERROR: {exc}"
+                            all_target_rows.append(r)
                         print(f"FAILED: {exc}")
                     finally:
                         if pruned_model is not None:
                             del pruned_model
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                    target_rows.append(row_res)
 
-                # Flush after every (model, target_pct) pair
-                _flush_csv(main_csv_path, target_rows, MAIN_CSV_KEYS)
-                all_results.extend(target_rows)
+                    # Flush after every (model, target_pct, selector)
+                    _flush_csv(main_csv_path, all_target_rows, MAIN_CSV_KEYS)
+                    all_results.extend(all_target_rows)
+                    all_target_rows = []  # reset for next selector
+                # end selector loop
 
         except torch.cuda.OutOfMemoryError as oom:
             logger.error("OOM for %s: %s", model_name, oom)
@@ -885,7 +1034,7 @@ def run_target_pruning_mode(
     print(f"{'─' * W}")
     hdr = (
         f"  {'model':>22}  {'tgt%':>5}  {'act%':>6}  {'pruned':>8}  "
-        f"{'par%':>7}  {'flop%':>7}  "
+        f"{'mlp_par%':>8}  {'tot_par%':>8}  {'mlp_flp%':>8}  {'est_flp%':>8}  "
         f"{'method':>30}  "
         f"{'bPPL':>8}  {'PPL':>9}  {'dPPL':>9}  {'rel%':>7}  {'dmg_red':>9}  "
         f"{'t_s':>6}  {'gpu_MB':>7}"
@@ -893,27 +1042,32 @@ def run_target_pruning_mode(
     print(hdr)
     print(f"{'─' * W}")
     for r in ppl_rows:
-        act_pct = r.get("actual_pruning_percent",        float("nan"))
-        n_prn   = r.get("actual_pruned_neurons",         "?")
-        par_red = r.get("mlp_param_reduction_percent",   float("nan"))
-        flp_red = r.get("mlp_flop_reduction_percent",    float("nan"))
-        dm      = r.get("damage_reduction_percent",      float("nan"))
-        rel     = r.get("relative_ppl_increase_percent", float("nan"))
-        t_s     = r.get("reconstruction_time_seconds",   float("nan"))
-        gpu_mb  = r.get("peak_gpu_memory_MB",            float("nan"))
+        act_pct  = r.get("actual_pruning_percent",        float("nan"))
+        n_prn    = r.get("actual_pruned_neurons",         "?")
+        par_red  = r.get("mlp_param_reduction_percent",   float("nan"))
+        tpar_red = r.get("total_model_param_reduction_percent", float("nan"))
+        flp_red  = r.get("mlp_flop_reduction_percent",    float("nan"))
+        eflp_red = r.get("estimated_total_forward_flop_reduction_percent",
+                         float("nan"))
+        dm       = r.get("damage_reduction_percent",      float("nan"))
+        rel      = r.get("relative_ppl_increase_percent", float("nan"))
+        t_s      = r.get("reconstruction_time_seconds",   float("nan"))
+        gpu_mb   = r.get("peak_gpu_memory_MB",            float("nan"))
 
-        act_s  = f"{act_pct:5.2f}%"  if act_pct == act_pct  else "  nan%"
-        par_s  = f"{par_red:+6.2f}%" if par_red == par_red  else "    nan%"
-        flp_s  = f"{flp_red:+6.2f}%" if flp_red == flp_red  else "    nan%"
-        dm_s   = f"{dm:+8.1f}%"      if dm == dm             else "      nan%"
-        rel_s  = f"{rel:+7.2f}%"     if rel == rel           else "    nan%"
-        t_s_s  = f"{t_s:6.1f}"       if t_s == t_s           else "   nan"
-        gpu_s  = f"{gpu_mb:7.0f}"    if gpu_mb == gpu_mb     else "    nan"
+        act_s   = f"{act_pct:5.2f}%"   if act_pct  == act_pct   else "  nan%"
+        par_s   = f"{par_red:+7.2f}%"  if par_red  == par_red   else "     nan%"
+        tpar_s  = f"{tpar_red:+7.2f}%" if tpar_red == tpar_red  else "     nan%"
+        flp_s   = f"{flp_red:+7.2f}%"  if flp_red  == flp_red   else "     nan%"
+        eflp_s  = f"{eflp_red:+7.2f}%" if eflp_red == eflp_red  else "     nan%"
+        dm_s    = f"{dm:+8.1f}%"       if dm == dm               else "      nan%"
+        rel_s   = f"{rel:+7.2f}%"      if rel == rel             else "    nan%"
+        t_s_s   = f"{t_s:6.1f}"        if t_s == t_s             else "   nan"
+        gpu_s   = f"{gpu_mb:7.0f}"     if gpu_mb == gpu_mb       else "    nan"
 
         print(
             f"  {str(r.get('model',''))[-22:]:>22}  "
             f"{float(r.get('target_pruning_percent', 0)):>5.1f}  {act_s}  "
-            f"{str(n_prn):>8}  {par_s}  {flp_s}  "
+            f"{str(n_prn):>8}  {par_s}  {tpar_s}  {flp_s}  {eflp_s}  "
             f"{str(r.get('method',''))[:30]:>30}  "
             f"{float(r.get('baseline_ppl', 0)):>8.4f}  "
             f"{float(r.get('compressed_ppl', 0)):>9.4f}  "
