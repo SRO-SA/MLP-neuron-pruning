@@ -2164,60 +2164,640 @@ def _held_out_delete_error(
     if not errs:
         return None, None
     return sum(errs) / len(errs), None
-        "alpha", "method", "kind", "ridge_lambda", "clip_value",
+
+
+# ===========================================================================
+# Residual correction: per-layer helper
+# ===========================================================================
+
+def _compute_residual_correction_for_layer(
+    layer,
+    train_r:       torch.Tensor,   # [N_train, d_model]  calibration MLP inputs
+    keep_indices:  torch.Tensor,   # [k]
+    prune_indices: torch.Tensor,   # [p]
+    ridge_lambda:  float,          # unscaled — multiplied by mean(diag(system_matrix))
+    tau:           float = 1.0,    # damping: W_new = W_K + tau * delta_B.T
+    eps:           float = EPS,
+) -> Tuple[Optional[torch.Tensor], dict]:
+    """
+    Solve for a residual *correction* delta_B that recovers the signal lost
+    by removing pruned neurons, rather than relearning W_down from scratch.
+
+    Decomposition
+    -------------
+    Y_full   = A_K @ W_K.T + A_P @ W_P.T
+    Y_delete = A_K @ W_K.T
+    E        = Y_full - Y_delete  =  A_P @ W_P.T   [N, d_model]  "lost signal"
+
+    Solve (ridge):
+        delta_B  =  argmin  ||A_K @ delta_B - E||^2  +  lambda_scaled * ||delta_B||^2
+
+    New weights:
+        W_new  =  W_K  +  tau * delta_B.T            [d_model, k]
+
+    Numerical choices
+    -----------------
+    * float64 throughout the solve
+    * Scaled lambda: lambda_val * mean(diag(A_K @ A_K.T))  (scale-invariant)
+    * Dual form A_K @ A_K.T  [N, N]  whenever N <= k  (always true for Qwen2.5)
+    * Jitter fallback:  0 -> 1e-6*scale -> 1e-5*scale -> 1e-4*scale
+    * solver fallback:  linalg.solve -> linalg.lstsq -> linalg.pinv
+
+    Returns (W_new [d_model, k] float32,  diagnostics dict)
+            or (None, diagnostics)  if NaN/Inf or all solvers fail.
+    """
+    d = {}
+    w = get_mlp_weights(layer)
+    w_gate = w["gate"].detach().float().cpu()
+    w_up   = w["up"].detach().float().cpu()
+    w_down = w["down"].detach().float().cpu()  # [d_model, d_ff]
+
+    R = train_r.float().cpu()
+    N = R.shape[0]
+    k = keep_indices.shape[0]
+    p = prune_indices.shape[0]
+
+    with torch.no_grad():
+        A   = F.silu(R @ w_gate.T) * (R @ w_up.T)   # [N, d_ff]
+        A_K = A[:, keep_indices]    # [N, k]
+        A_P = A[:, prune_indices]   # [N, p]
+        W_K = w_down[:, keep_indices]   # [d_model, k]  original kept weights
+        W_P = w_down[:, prune_indices]  # [d_model, p]
+
+        # Lost signal — what pure deletion removes
+        E = A_P @ W_P.T             # [N, d_model]
+
+        # Full original output (reference)
+        Y_full = A_K @ W_K.T + E   # [N, d_model]
+        Y_norm = float(Y_full.norm()) + eps
+        del_err = float(E.norm()) / Y_norm   # = ||Y_full - Y_del|| / ||Y_full||
+
+        d.update({"N_tokens": N, "k_kept": k, "p_pruned": p,
+                  "E_norm": round(float(E.norm()), 6),
+                  "train_delete_err": round(del_err, 6)})
+
+        # ----- float64 for stability -----
+        A_K64 = A_K.double()
+        E64   = E.double()
+        W_K64 = W_K.double()
+
+        # Choose primal vs dual
+        if N <= k:
+            # Dual: N×N  (always true for Qwen2.5 with 12 train prompts)
+            AAt   = A_K64 @ A_K64.T                         # [N, N]
+            scale = float(AAt.diagonal().mean().clamp(min=1e-10))
+            reg   = (ridge_lambda * scale) * torch.eye(N, dtype=torch.float64)
+            d.update({"system_form": "dual", "system_size": N})
+        else:
+            # Primal: k×k
+            AtA   = A_K64.T @ A_K64                         # [k, k]
+            AtE   = A_K64.T @ E64
+            scale = float(AtA.diagonal().mean().clamp(min=1e-10))
+            reg   = (ridge_lambda * scale) * torch.eye(k, dtype=torch.float64)
+            d.update({"system_form": "primal", "system_size": k})
+
+        d["scale"]        = round(scale, 6)
+        d["lambda_scaled"] = round(ridge_lambda * scale, 6)
+
+        # Condition number on regularized system
+        try:
+            if N <= k:
+                M_diag = AAt + reg
+            else:
+                M_diag = AtA + reg
+            d["cond_number"] = round(float(torch.linalg.cond(M_diag).item()), 2)
+        except Exception:
+            d["cond_number"] = None
+
+        # Solve with jitter fallback
+        delta_B64   = None
+        solve_label = "failed"
+        for jm in [0.0, 1e-6, 1e-5, 1e-4]:
+            jitter = jm * scale
+            try:
+                if N <= k:
+                    M = AAt + reg + jitter * torch.eye(N, dtype=torch.float64)
+                    delta_B64 = A_K64.T @ torch.linalg.solve(M, E64)   # [k, d_model]
+                else:
+                    M = AtA + reg + jitter * torch.eye(k, dtype=torch.float64)
+                    delta_B64 = torch.linalg.solve(M, AtE)              # [k, d_model]
+                solve_label = f"solve+jitter{jm}"
+                break
+            except RuntimeError:
+                continue
+
+        if delta_B64 is None:
+            try:
+                delta_B64   = torch.linalg.lstsq(A_K64, E64, rcond=None).solution
+                solve_label = "lstsq_fallback"
+            except Exception:
+                pass
+
+        if delta_B64 is None:
+            try:
+                delta_B64   = torch.linalg.pinv(A_K64) @ E64
+                solve_label = "pinv_fallback"
+            except Exception:
+                pass
+
+        d["solve_method"] = solve_label
+
+        if delta_B64 is None:
+            d["error"] = "all_solvers_failed"
+            return None, d
+
+        # Apply damping, back to float32
+        dB_f32 = (tau * delta_B64).float()   # [k, d_model]
+        W_new  = W_K + dB_f32.T             # [d_model, k]
+
+        # --- Diagnostics ---
+        delta_norm  = float(dB_f32.norm())
+        w_k_norm    = float(W_K.norm())
+        delta_rel   = delta_norm / (w_k_norm + eps)
+        max_abs_new = float(W_new.abs().max())
+        max_abs_old = float(W_K.abs().max())
+        has_nan     = bool(W_new.isnan().any() or W_new.isinf().any())
+
+        # Train reconstruction error
+        Y_new      = A_K @ W_new.T                     # [N, d_model]
+        recon_train = float((Y_full - Y_new).norm()) / Y_norm
+
+        d.update({
+            "tau":                   tau,
+            "ridge_lambda":          ridge_lambda,
+            "delta_norm":            round(delta_norm, 6),
+            "w_k_norm":              round(w_k_norm, 6),
+            "delta_rel_norm":        round(delta_rel, 6),
+            "max_abs_new":           round(max_abs_new, 6),
+            "max_abs_old":           round(max_abs_old, 6),
+            "max_abs_ratio":         round(max_abs_new / (max_abs_old + eps), 4),
+            "has_nan_inf":           has_nan,
+            "train_recon_err":       round(recon_train, 6),
+            "train_improvement_pct": round(100.0 * (del_err - recon_train) / (del_err + eps), 2),
+        })
+
+        if has_nan:
+            d["error"] = "NaN/Inf_in_W_new"
+            return None, d
+
+    return W_new, d
+
+
+# ===========================================================================
+# Residual correction: apply to full model
+# ===========================================================================
+
+def apply_residual_down_reconstruction(
+    model,
+    prune_indices_per_layer: List[torch.Tensor],
+    keep_indices_per_layer:  List[torch.Tensor],
+    train_r_per_layer:       List[torch.Tensor],
+    heldout_r_per_layer:     List[torch.Tensor],
+    ridge_lambda:            float,
+    tau:                     float = 1.0,
+    eps:                     float = EPS,
+    max_delta_rel:           float = 2.0,   # reject layer if ||tau*dB||/||W_K|| > this
+    max_abs_ratio:           float = 10.0,  # reject layer if max_abs_new/old > this
+) -> Tuple[Optional[object], dict]:
+    """
+    For each layer: compute residual correction delta_B, run stability checks,
+    apply to clone if stable.  Unstable layers fall back to pure-delete weights.
+
+    Returns (pruned_model, info)  or  (None, info) if every layer is unstable.
+    info["n_stable_layers"] / ["n_unstable_layers"] summarize stability.
+    """
+    from .pruning import prune_model_by_layer_indices
+
+    orig_layers  = get_transformer_layers(model)
+    recon_clone  = clone_model(model)
+    clone_layers = get_transformer_layers(recon_clone)
+
+    sanity   = []
+    n_stable = 0
+    n_bad    = 0
+
+    with torch.no_grad():
+        for idx, (orig_l, clone_l, pi, ki, r_tr, r_ho) in enumerate(zip(
+            orig_layers, clone_layers,
+            prune_indices_per_layer, keep_indices_per_layer,
+            train_r_per_layer, heldout_r_per_layer,
+        )):
+            if len(pi) == 0:
+                sanity.append({"layer_idx": idx, "n_pruned": 0, "stable": True})
+                n_stable += 1
+                continue
+
+            W_new, d = _compute_residual_correction_for_layer(
+                orig_l, r_tr, ki, pi,
+                ridge_lambda=ridge_lambda, tau=tau, eps=eps,
+            )
+            d["layer_idx"] = idx
+
+            if W_new is None:
+                d["stable"] = False
+                d["reject_reason"] = d.get("error", "solver_failed")
+                n_bad += 1
+                sanity.append(d)
+                continue
+
+            # Held-out evaluation using _eval_recon_heldout
+            # pass W_new.T as B  [k, d_model]
+            ho = _eval_recon_heldout(orig_l, r_ho, ki, W_new.T, eps=eps)
+            d.update(ho)
+            d["overfit_gap_pct"] = round(
+                d["train_improvement_pct"] - ho["heldout_improvement_pct"], 2
+            )
+
+            # Stability checks
+            reject_reason = None
+            if ho["heldout_recon_err"] > ho["heldout_delete_err"]:
+                reject_reason = (
+                    f"heldout_recon({ho['heldout_recon_err']:.4f})"
+                    f" > del({ho['heldout_delete_err']:.4f})"
+                )
+            elif d["delta_rel_norm"] > max_delta_rel:
+                reject_reason = f"delta_rel_norm={d['delta_rel_norm']:.4f} > {max_delta_rel}"
+            elif d["max_abs_ratio"] > max_abs_ratio:
+                reject_reason = f"max_abs_ratio={d['max_abs_ratio']:.2f} > {max_abs_ratio}"
+
+            if reject_reason:
+                d["stable"] = False
+                d["reject_reason"] = reject_reason
+                n_bad += 1
+                sanity.append(d)
+                continue
+
+            # Apply W_new to clone's down_proj
+            w_clone = get_mlp_weights(clone_l)
+            down    = w_clone["down"]   # [d_model, d_ff]
+            down.data[:, ki] = W_new.to(dtype=down.dtype, device=down.device)
+
+            d["stable"] = True
+            n_stable += 1
+            sanity.append(d)
+
+    info = {
+        "n_stable_layers":   n_stable,
+        "n_unstable_layers": n_bad,
+        "all_unstable":      (n_bad > 0 and n_stable == sum(
+                                1 for s in sanity if s.get("n_pruned", 1) == 0
+                             )),
+        "sanity_per_layer":  sanity,
+    }
+    # "all_unstable" = every pruned layer was rejected
+    n_pruned_layers = sum(1 for s in sanity if s.get("n_pruned", 0) > 0)
+    info["all_unstable"] = (n_bad == n_pruned_layers) and n_pruned_layers > 0
+
+    pruned_model, prune_info = prune_model_by_layer_indices(
+        recon_clone, prune_indices_per_layer, label="residual_recon"
+    )
+    info.update({k: v for k, v in prune_info.items() if k != "sanity_per_layer"})
+
+    del recon_clone
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return pruned_model, info
+
+
+# ===========================================================================
+# --reconstruction-merge (revised):  residual correction experiment
+# ===========================================================================
+
+def run_residual_reconstruction_mode(model, tokenizer, cfg, device, output_dir="results"):
+    """
+    Compare residual down-projection correction against activation-merge baselines.
+
+    Key insight vs prior attempt
+    ----------------------------
+    Instead of learning a completely new W_down (which massively overfits the tiny
+    calibration set), we solve only for a *correction*:
+        delta_B  s.t.  A_K @ delta_B ≈ E  (lost signal from pruned neurons)
+        W_down_new = W_down_K + tau * delta_B.T
+
+    Strong scaled-ridge regularization + damping tau prevent overfitting.
+
+    Methods per alpha
+    -----------------
+      pure_delete
+      merge_activation_ridge_1e-2        (best at alpha=1e-3, prior expts)
+      merge_activation_clip_0.5          (best at alpha=1e-2, prior expts)
+      residual_recon_lam{l}_tau{t}       for l in {1e-2, 0.1, 1.0, 10.0, 100.0}
+                                              t in {0.05, 0.1, 0.25, 0.5, 1.0}
+
+    Stability checks (skip PPL if any fail)
+    ----------------------------------------
+      - No NaN/Inf in corrected weights
+      - Heldout reconstruction error < heldout deletion error
+      - ||tau * delta_B||_F / ||W_K||_F  <= max_delta_rel  (default 2.0)
+      - max|W_new| / max|W_K|             <= max_abs_ratio  (default 10.0)
+
+    Per-row output
+    ---------------
+      PPL, dPPL
+      train_delete_err,  train_recon_err,  train_improvement_pct
+      heldout_delete_err, heldout_recon_err, heldout_improvement_pct
+      overfit_gap_pct   (positive = overfitting train)
+      delta_rel_norm    (||tau*dB|| / ||W_K||)
+      n_stable_layers, n_unstable_layers
+      mlp_params_red_pct, flops_red_pct
+    """
+    import json, os, time
+    import torch
+
+    from .bound_analysis import _k, compute_bound_scores_and_R, select_by_budget
+    from .evaluation import evaluate_perplexity, load_eval_dataset
+    from .flops import estimate_mlp_flops
+    from .model_utils import count_parameters
+    from .pruning import prune_model_by_layer_indices, verify_forward_pass
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts     = time.strftime("%Y%m%d_%H%M%S")
+    layers = get_transformer_layers(model)
+    ALPHAS = [1e-4, 1e-3, 1e-2]
+
+    LAMBDAS = [1e-2, 0.1, 1.0, 10.0, 100.0]
+    TAUS    = [0.05, 0.1, 0.25, 0.5, 1.0]
+
+    # ------------------------------------------------------------------
+    # Data collection
+    # ------------------------------------------------------------------
+    print("\nComputing bound scores ...")
+    all_scores = [compute_bound_scores_and_R(l)[0] for l in layers]
+
+    print("Collecting TRAIN calibration inputs ...")
+    train_r = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_TRAIN_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+    print("Collecting HELD-OUT calibration inputs ...")
+    heldout_r = collect_mlp_inputs(
+        model, tokenizer, RECONSTRUCTION_HELDOUT_PROMPTS, device,
+        max_seq_len=cfg.get("max_seq_len", 128),
+    )
+
+    use_fallback = cfg.get("use_fallback_corpus", True)
+    n_eval       = cfg.get("bound_analysis_eval_samples", 64)
+    eval_texts   = load_eval_dataset(n_eval, use_fallback_corpus=use_fallback)
+
+    baseline_params = count_parameters(model)
+    baseline_flops  = estimate_mlp_flops(model, seq_len=cfg.get("max_seq_len", 512))
+
+    print("Computing baseline PPL ...")
+    bp           = evaluate_perplexity(
+        model, tokenizer, texts=eval_texts,
+        max_seq_len=cfg.get("max_seq_len", 512),
+        batch_size=cfg.get("batch_size", 4),
+        device=device,
+    )
+    baseline_ppl = bp["perplexity"]
+    print(f"Baseline PPL: {baseline_ppl:.4f}\n")
+
+    all_results = []
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    for alpha in ALPHAS:
+        prune_per_layer = []
+        for scores in all_scores:
+            pi, _ = select_by_budget(scores, alpha, float(scores.sum()))
+            prune_per_layer.append(pi)
+
+        total_pruned = sum(len(pi) for pi in prune_per_layer)
+        total_n      = sum(s.numel() for s in all_scores)
+        pct          = 100.0 * total_pruned / total_n if total_n else 0.0
+
+        if total_pruned == 0:
+            print(f"alpha={_k(alpha)}: 0 neurons selected — skipping\n")
+            continue
+
+        keep_per_layer = []
+        for scores, pi in zip(all_scores, prune_per_layer):
+            p_set = set(pi.tolist())
+            keep_per_layer.append(
+                torch.tensor([j for j in range(scores.numel()) if j not in p_set],
+                             dtype=torch.long)
+            )
+
+        print(f"\n{'=' * 78}")
+        print(f"alpha={_k(alpha)}  pruned={total_pruned} ({pct:.3f}%)")
+        print(f"{'=' * 78}")
+
+        def _base_row():
+            return {
+                "alpha": alpha, "total_pruned": total_pruned,
+                "pct_pruned": round(pct, 4), "baseline_ppl": round(baseline_ppl, 4),
+            }
+
+        def _fill_ppl(row, m):
+            fp_ok    = verify_forward_pass(m, tokenizer, device)
+            ppl_info = evaluate_perplexity(
+                m, tokenizer, texts=eval_texts,
+                max_seq_len=cfg.get("max_seq_len", 512),
+                batch_size=cfg.get("batch_size", 4), device=device,
+            )
+            ppl = ppl_info["perplexity"]
+            pp  = count_parameters(m)
+            pf  = estimate_mlp_flops(m, seq_len=cfg.get("max_seq_len", 512))
+            row.update({
+                "perplexity":         round(ppl, 4),
+                "perplexity_delta":   round(ppl - baseline_ppl, 4),
+                "forward_pass_ok":    fp_ok,
+                "mlp_params_red_pct": round(100*(1 - pp["mlp"]/baseline_params["mlp"]), 4),
+                "flops_red_pct":      round(100*(1 - pf["total_flops"]/baseline_flops["total_flops"]), 4),
+            })
+            return round(ppl, 4)
+
+        # ---- Baseline: pure_delete ----------------------------------------
+        print(f"\n  [pure_delete]")
+        row = _base_row(); row["method"] = "pure_delete"
+        pruned_model = None
+        try:
+            pruned_model, _ = prune_model_by_layer_indices(
+                model, prune_per_layer, label=f"rdel_a{_k(alpha)}"
+            )
+            # Held-out deletion error
+            ho_del, _ = _held_out_delete_error(
+                layers, prune_per_layer, keep_per_layer, heldout_r
+            )
+            if ho_del is not None:
+                row["heldout_delete_err"] = round(ho_del, 6)
+            ppl = _fill_ppl(row, pruned_model)
+            print(f"    PPL={ppl:.4f}  dPPL={row['perplexity_delta']:+.4f}")
+        except Exception as exc:
+            logger.error("pure_delete alpha=%s: %s", _k(alpha), exc, exc_info=True)
+            row["notes"] = f"ERROR: {exc}"
+        finally:
+            if pruned_model is not None: del pruned_model
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        all_results.append(row)
+
+        # ---- Activation merge baselines -----------------------------------
+        for aname, alambda, aclip in [
+            ("merge_act_ridge_1e-2", 1e-2, None),
+            ("merge_act_clip_0.5",   0.0,  0.5),
+        ]:
+            print(f"\n  [{aname}]")
+            row = _base_row(); row.update({"method": aname, "ridge_lambda": alambda, "clip_value": aclip})
+            pruned_model = None
+            try:
+                asns = [
+                    compute_merge_assignments_activation(
+                        l, pi, ki, r, ridge_lambda=alambda, clip_value=aclip
+                    ) if len(pi) > 0 else []
+                    for l, pi, ki, r in zip(layers, prune_per_layer, keep_per_layer, train_r)
+                ]
+                pruned_model, _ = apply_merge_and_prune(
+                    model, prune_per_layer, asns, label=f"r{aname[:12]}_a{_k(alpha)}"
+                )
+                ho_res = _compute_held_out_reconstruction(
+                    layers, prune_per_layer, keep_per_layer, asns, train_r, heldout_r
+                )
+                active = [r for r in ho_res if r.get("n_pruned", 0) > 0]
+                if active:
+                    row["train_delete_err_mean"]    = round(sum(r["train_delete_err"]  for r in active)/len(active), 6)
+                    row["train_recon_err_mean"]     = round(sum(r["train_merge_err"]   for r in active)/len(active), 6)
+                    row["train_improvement_pct"]    = round(sum(r["train_improvement_pct"] for r in active)/len(active), 2)
+                    row["heldout_delete_err_mean"]  = round(sum(r["heldout_delete_err"] for r in active)/len(active), 6)
+                    row["heldout_recon_err_mean"]   = round(sum(r["heldout_merge_err"]  for r in active)/len(active), 6)
+                    row["heldout_improvement_pct"]  = round(sum(r["heldout_improvement_pct"] for r in active)/len(active), 2)
+                    row["overfit_gap_pct"]          = round(sum(r["overfit_gap_pct"] for r in active)/len(active), 2)
+                    print(
+                        f"    train  del={row['train_delete_err_mean']:.4f}  "
+                        f"recon={row['train_recon_err_mean']:.4f}  imp={row['train_improvement_pct']:+.1f}%"
+                    )
+                    print(
+                        f"    heldout del={row['heldout_delete_err_mean']:.4f}  "
+                        f"recon={row['heldout_recon_err_mean']:.4f}  imp={row['heldout_improvement_pct']:+.1f}%"
+                        f"  overfit={row['overfit_gap_pct']:+.1f}%"
+                    )
+                ppl = _fill_ppl(row, pruned_model)
+                print(f"    PPL={ppl:.4f}  dPPL={row['perplexity_delta']:+.4f}")
+            except Exception as exc:
+                logger.error("[%s] alpha=%s: %s", aname, _k(alpha), exc, exc_info=True)
+                row["notes"] = f"ERROR: {exc}"
+            finally:
+                if pruned_model is not None: del pruned_model
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
+            all_results.append(row)
+
+        # ---- Residual reconstruction grid ---------------------------------
+        for lam in LAMBDAS:
+            for tau in TAUS:
+                vname = f"resid_lam{_k(lam)}_tau{tau}"
+                print(f"\n  [{vname}]")
+                row = _base_row()
+                row.update({"method": vname, "ridge_lambda": lam, "tau": tau})
+                pruned_model = None
+                try:
+                    pruned_model, build_info = apply_residual_down_reconstruction(
+                        model, prune_per_layer, keep_per_layer,
+                        train_r, heldout_r,
+                        ridge_lambda=lam, tau=tau,
+                    )
+
+                    n_s = build_info["n_stable_layers"]
+                    n_u = build_info["n_unstable_layers"]
+                    row["n_stable_layers"]   = n_s
+                    row["n_unstable_layers"] = n_u
+
+                    # Aggregate per-layer sanity
+                    active_s = [
+                        s for s in build_info["sanity_per_layer"]
+                        if s.get("n_pruned", 0) > 0 and s.get("stable", False)
+                    ]
+                    if active_s:
+                        row["train_delete_err_mean"]   = round(sum(s["train_delete_err"]       for s in active_s)/len(active_s), 6)
+                        row["train_recon_err_mean"]    = round(sum(s["train_recon_err"]         for s in active_s)/len(active_s), 6)
+                        row["train_improvement_pct"]   = round(sum(s["train_improvement_pct"]   for s in active_s)/len(active_s), 2)
+                        row["heldout_delete_err_mean"] = round(sum(s["heldout_delete_err"]      for s in active_s)/len(active_s), 6)
+                        row["heldout_recon_err_mean"]  = round(sum(s["heldout_recon_err"]       for s in active_s)/len(active_s), 6)
+                        row["heldout_improvement_pct"] = round(sum(s["heldout_improvement_pct"] for s in active_s)/len(active_s), 2)
+                        row["overfit_gap_pct"]         = round(sum(s["overfit_gap_pct"]         for s in active_s)/len(active_s), 2)
+                        row["delta_rel_norm_mean"]     = round(sum(s.get("delta_rel_norm", 0)   for s in active_s)/len(active_s), 4)
+                        print(
+                            f"    stable={n_s}  unstable={n_u}  "
+                            f"delta_rel={row['delta_rel_norm_mean']:.4f}"
+                        )
+                        print(
+                            f"    train  del={row['train_delete_err_mean']:.4f}  "
+                            f"recon={row['train_recon_err_mean']:.4f}  imp={row['train_improvement_pct']:+.1f}%"
+                        )
+                        print(
+                            f"    heldout del={row['heldout_delete_err_mean']:.4f}  "
+                            f"recon={row['heldout_recon_err_mean']:.4f}  imp={row['heldout_improvement_pct']:+.1f}%"
+                            f"  overfit={row['overfit_gap_pct']:+.1f}%"
+                        )
+
+                    if build_info.get("all_unstable", False):
+                        row["notes"] = "SKIPPED_PPL:all_layers_unstable"
+                        print("    => all layers unstable, skipping PPL")
+                        all_results.append(row)
+                        continue
+
+                    ppl = _fill_ppl(row, pruned_model)
+                    print(f"    PPL={ppl:.4f}  dPPL={row['perplexity_delta']:+.4f}")
+
+                except Exception as exc:
+                    logger.error("[%s] alpha=%s: %s", vname, _k(alpha), exc, exc_info=True)
+                    row["notes"] = f"ERROR: {exc}"
+                finally:
+                    if pruned_model is not None: del pruned_model
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                all_results.append(row)
+
+    # ------------------------------------------------------------------
+    # Summary table
+    # ------------------------------------------------------------------
+    print(f"\n{'=' * 100}")
+    print("RESIDUAL RECONSTRUCTION SUMMARY")
+    print(f"  Baseline PPL: {baseline_ppl:.4f}")
+    print(f"{'─' * 100}")
+    print(f"  {'alpha':>9}  {'method':<42}  {'PPL':>9}  {'dPPL':>9}  {'HO-imp':>7}  {'overfit':>7}")
+    print(f"{'─' * 100}")
+    for r in all_results:
+        if "perplexity" in r:
+            ho_imp  = r.get("heldout_improvement_pct", float("nan"))
+            overfit = r.get("overfit_gap_pct",         float("nan"))
+            print(
+                f"  {_k(r['alpha']):>9}  {r['method']:<42}"
+                f"  {r['perplexity']:>9.4f}  {r['perplexity_delta']:>+9.4f}"
+                f"  {ho_imp:>+7.2f}%  {overfit:>+7.2f}%"
+            )
+        else:
+            print(f"  {_k(r['alpha']):>9}  {r['method']:<42}  {r.get('notes', 'ERROR')}")
+    print(f"{'=' * 100}\n")
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    report = {
+        "timestamp": ts, "mode": "residual_reconstruction",
+        "baseline_ppl": baseline_ppl, "results": all_results,
+    }
+    jpath = os.path.join(output_dir, f"residual_recon_{ts}.json")
+    with open(jpath, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
+    import csv
+    cpath = os.path.join(output_dir, f"residual_recon_{ts}.csv")
+    keys  = [
+        "alpha", "method", "ridge_lambda", "tau",
         "total_pruned", "pct_pruned", "baseline_ppl",
         "perplexity", "perplexity_delta",
-        "beta_mean_abs", "beta_max_abs",
         "train_delete_err_mean", "train_recon_err_mean", "train_improvement_pct",
         "heldout_delete_err_mean", "heldout_recon_err_mean", "heldout_improvement_pct",
-        "overfit_gap_pct",
-        "mlp_params_red_pct", "flops_red_pct",
-        "forward_pass_ok", "notes",
+        "overfit_gap_pct", "delta_rel_norm_mean",
+        "n_stable_layers", "n_unstable_layers",
+        "mlp_params_red_pct", "flops_red_pct", "forward_pass_ok", "notes",
     ]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_keys, extrasaction="ignore")
-        writer.writeheader()
+    with open(cpath, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
         for r in all_results:
-            writer.writerow(r)
+            w.writerow(r)
 
-    logger.info("Reconstruction merge report: %s", path)
-    print(f"Report: {path}")
-    print(f"CSV:    {csv_path}\n")
-
-
-# ===========================================================================
-# Internal helper — held-out delete-only error (no B, no assignments)
-# ===========================================================================
-
-def _held_out_delete_error(
-    layers,
-    prune_indices_per_layer,
-    keep_indices_per_layer,
-    heldout_r_per_layer,
-    eps: float = EPS,
-):
-    """
-    Compute mean held-out MLP reconstruction error for pure deletion
-    (no beta, no B — just drop pruned columns entirely).
-    Returns (mean_delete_err, None).
-    """
-    errs = []
-    for layer, pi, ki, r in zip(
-        layers, prune_indices_per_layer, keep_indices_per_layer, heldout_r_per_layer
-    ):
-        if len(pi) == 0:
-            continue
-        w = get_mlp_weights(layer)
-        w_gate = w["gate"].detach().float().cpu()
-        w_up   = w["up"].detach().float().cpu()
-        w_down = w["down"].detach().float().cpu()
-        R = r.float().cpu()
-        with torch.no_grad():
-            A     = F.silu(R @ w_gate.T) * (R @ w_up.T)
-            Y     = A @ w_down.T
-            Y_del = A[:, ki] @ w_down[:, ki].T
-            Y_norm = float(Y.norm()) + eps
-            errs.append(float((Y - Y_del).norm()) / Y_norm)
-    if not errs:
-        return None, None
-    return sum(errs) / len(errs), None
+    logger.info("Residual reconstruction report: %s", jpath)
+    print(f"Report: {jpath}")
+    print(f"CSV:    {cpath}\n")

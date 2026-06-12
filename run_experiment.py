@@ -47,6 +47,7 @@ from src.merging import (
     run_bound_merge_stable_mode,
     run_debug_merge_mode,
     run_reconstruction_merge_mode,
+    run_residual_reconstruction_mode,
 )
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
@@ -194,7 +195,7 @@ def run_experiment(cfg: Dict, args) -> None:
 
     # ── RECONSTRUCTION MERGE MODE ─────────────────────────────────────────────
     if args.reconstruction_merge:
-        run_reconstruction_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        run_residual_reconstruction_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── STABLE MERGE MODE ─────────────────────────────────────────────────────
@@ -487,4 +488,4 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     cfg  = load_config(args.config)
-    main(args, cfg)
+    run_experiment(cfg, args)
