@@ -44,6 +44,25 @@ bound_analysis_eval_samples: 64
 # 256 is a reasonable trade-off; raise to 512 for final results.
 reconstruction_eval_samples: 256
 
+# Scaling experiment (--scaling-recon)
+# Models loaded one at a time; each deleted before the next.
+# Add "Qwen/Qwen2.5-3B" or "Qwen/Qwen2.5-7B" once 0.5B and 1.5B are verified.
+scaling_models:
+  - "Qwen/Qwen2.5-0.5B"
+  - "Qwen/Qwen2.5-1.5B"
+
+scaling_alphas:
+  - 0.0001   # 1e-4
+  - 0.001    # 1e-3
+  - 0.002    # 2e-3
+  - 0.003    # 3e-3
+  - 0.005    # 5e-3
+  - 0.01     # 1e-2
+
+# scaling_dtype: "auto"  (= bfloat16 if CUDA supports it, else float32)
+# Override with "float32" or "float16" if needed.
+scaling_dtype: "auto"
+
 # Evaluation dataset
 # eval_dataset: which dataset to use for perplexity evaluation.
 #   Currently only "wikitext" (WikiText-2-raw-v1 test split) is supported.

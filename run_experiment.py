@@ -38,6 +38,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.bound_analysis import run_bound_analysis_mode
+from src.scaling import run_scaling_recon_mode
 from src.merging import (
     run_bound_merge_mode,
     run_bound_merge_stable_mode,
@@ -153,6 +154,11 @@ def run_experiment(cfg: Dict, args) -> None:
     set_seed(cfg.get("seed", 42))
     device     = resolve_device(cfg)
     output_dir = cfg.get("output_dir", "results")
+
+    # ── SCALING RECON MODE  (loads its own models — skip global model load) ───
+    if args.scaling_recon:
+        run_scaling_recon_mode(cfg, device=device, output_dir=output_dir)
+        return
 
     # Load model
     model, tokenizer, resolved_name = load_model_and_tokenizer(
@@ -457,6 +463,17 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--scaling-recon", action="store_true",
+        help=(
+            "Multi-model scaling experiment: pure_delete + resid_lam1e-2_tau1.0\n"
+            "across all models in scaling_models (default: 0.5B and 1.5B).\n"
+            "Alphas: scaling_alphas (default: 1e-4,1e-3,2e-3,3e-3,5e-3,1e-2).\n"
+            "Models loaded one at a time; partial CSV flushed after each (model, alpha).\n"
+            "Uses bfloat16 automatically if CUDA supports it.\n"
+            "Skips models gracefully on OOM."
+        ),
+    )
+    p.add_argument(
         "--bound-merge-stable", action="store_true",
         help=(
             "Test stabilized activation-merge variants at alpha=1e-4/1e-3/1e-2.\n"
@@ -476,31 +493,33 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--debug-pruning", action="store_true",
-        help="Full debug suite: shape checks, zero-mask test, score correlations, etc.",
-    )
-    p.add_argument(
         "--diagnostics-only", action="store_true",
-        help="Log per-layer MLP norms (no pruning).",
-    )
-
-    # -- Modifiers for --bound-analysis --------------------------------------
-    p.add_argument(
-        "--no-ppl", action="store_true",
-        help="(--bound-analysis only) Skip PPL; show distributions and count tables only.",
+        help="Run diagnostic mode only (no pruning, no PPL).",
     )
     p.add_argument(
-        "--no-activation-verification", action="store_true",
-        help="(--bound-analysis only) Run PPL but skip activation verification.",
+        "--debug-pruning", action="store_true",
+        help=(
+            "Run a tiny-ratio pruning diagnostic.\n"
+            "Sweeps very small prune fractions to find where PPL first degrades."
+        ),
     )
+    p.add_argument("--no-ppl",                        action="store_true")
+    p.add_argument("--no-activation-verification",    action="store_true")
+    p.add_argument("--bound-ppl-only",                action="store_true")
+    p.add_argument("--activation-verification-only",  action="store_true")
+    return p
 
-    # -- Main experiment overrides -------------------------------------------
-    p.add_argument("--pruning-ratios", nargs="+", type=float, default=None)
-    p.add_argument("--methods", nargs="+", default=None)
-    return p.parse_args()
+
+def main():
+    p    = build_arg_parser()
+    args = p.parse_args()
+
+    with open(args.config) as fh:
+        import yaml
+        cfg = yaml.safe_load(fh)
+
+    run_experiment(cfg, args)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    cfg  = load_config(args.config)
-    run_experiment(cfg, args)
+    main()
