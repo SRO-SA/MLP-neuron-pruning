@@ -503,10 +503,22 @@ def parse_args():
             "Sweeps very small prune fractions to find where PPL first degrades."
         ),
     )
-    p.add_argument("--no-ppl",                        action="store_true")
-    p.add_argument("--no-activation-verification",    action="store_true")
-    p.add_argument("--bound-ppl-only",                action="store_true")
-    p.add_argument("--activation-verification-only",  action="store_true")
+    p.add_argument(
+        "--no-ppl", action="store_true",
+        help="Skip PPL evaluation in --bound-analysis mode.",
+    )
+    p.add_argument(
+        "--no-activation-verification", action="store_true",
+        help="Skip activation verification in --bound-analysis mode.",
+    )
+    p.add_argument(
+        "--methods", nargs="+", default=None,
+        help="Override pruning methods from config (e.g. --methods random down_norm).",
+    )
+    p.add_argument(
+        "--pruning-ratios", nargs="+", type=float, default=None,
+        help="Override pruning ratios from config (e.g. --pruning-ratios 0.1 0.2).",
+    )
     return p
 
 
