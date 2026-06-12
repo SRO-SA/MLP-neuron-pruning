@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.bound_analysis import run_bound_analysis_mode
 from src.scaling import run_scaling_recon_mode
+from src.target_pruning import run_target_pruning_mode
 from src.merging import (
     run_bound_merge_mode,
     run_bound_merge_stable_mode,
@@ -158,6 +159,19 @@ def run_experiment(cfg: Dict, args) -> None:
     # ── SCALING RECON MODE  (loads its own models — skip global model load) ───
     if args.scaling_recon:
         run_scaling_recon_mode(cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── TARGET-PRUNING SCALING MODE  (loads its own models) ─────────────────
+    if args.target_pruning_scaling:
+        run_target_pruning_mode(
+            cfg,
+            device=device,
+            output_dir=output_dir,
+            models_override=args.models or None,
+            targets_override=args.target_pruning_percents or None,
+            methods_override=args.methods or None,
+            n_eval_override=args.n_eval or None,
+        )
         return
 
     # Load model
@@ -518,6 +532,40 @@ def parse_args():
     p.add_argument(
         "--pruning-ratios", nargs="+", type=float, default=None,
         help="Override pruning ratios from config (e.g. --pruning-ratios 0.1 0.2).",
+    )
+    p.add_argument(
+        "--target-pruning-scaling", action="store_true",
+        help=(
+            "Fixed-percentage MLP pruning experiment.\n"
+            "Selects neurons by global score rank to reach exact target percentages,\n"
+            "instead of using alpha (score-mass budget). Enables fair cross-model\n"
+            "comparison at identical compression levels.\n"
+            "Use --models, --target-pruning-percents, --methods, --n-eval to configure."
+        ),
+    )
+    p.add_argument(
+        "--models", nargs="+", default=None,
+        help=(
+            "Model names for --target-pruning-scaling "
+            "(e.g. --models Qwen/Qwen2.5-3B Qwen/Qwen2.5-7B). "
+            "Overrides scaling_models in the config."
+        ),
+    )
+    p.add_argument(
+        "--target-pruning-percents", nargs="+", type=float, default=None,
+        help=(
+            "Target pruning percentages for --target-pruning-scaling "
+            "(e.g. --target-pruning-percents 2 4 6 8). "
+            "Overrides target_pruning_percents in the config."
+        ),
+    )
+    p.add_argument(
+        "--n-eval", type=int, default=None,
+        help=(
+            "Number of WikiText-2 evaluation samples override "
+            "(e.g. --n-eval 256). "
+            "Overrides reconstruction_eval_samples in the config."
+        ),
     )
     return p
 

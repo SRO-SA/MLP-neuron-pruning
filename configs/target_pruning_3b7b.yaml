@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------
+# qwen_swiglu_pruning — target-percentage pruning: 3B vs 7B
+#
+# Run:
+#   python run_experiment.py \
+#       --config configs/target_pruning_3b7b.yaml \
+#       --target-pruning-scaling
+#
+# Or override from CLI:
+#   python run_experiment.py \
+#       --config configs/target_pruning_3b7b.yaml \
+#       --target-pruning-scaling \
+#       --models Qwen/Qwen2.5-3B Qwen/Qwen2.5-7B \
+#       --target-pruning-percents 2 4 6 8 \
+#       --methods pure_delete residual_full residual_local_top1024 residual_local_top2048 \
+#       --n-eval 256
+#
+# Purpose: Compare 3B and 7B at the SAME actual pruning percentage.
+# Alpha-based scaling produced different actual pruning% across model sizes:
+#   Qwen2.5-3B at alpha=1e-3 -> 6.63%  (26268 / 396288 neurons)
+#   Qwen2.5-7B at alpha=1e-3 -> 2.40%  (12752 / 530432 neurons)
+# This experiment fixes the pruning% and asks: which model tolerates it better?
+#
+# Main scientific question:
+#   At the same actual MLP pruning percentage, does Qwen2.5-7B tolerate
+#   structured pruning better than Qwen2.5-3B?
+#
+# Secondary question:
+#   Can residual_local_top1024/top2048 match residual_full quality
+#   while reducing reconstruction cost at 7B scale?
+#
+# WARNING: Qwen2.5-7B requires ~15-20 GB VRAM in bfloat16.
+#   If OOM on residual_full, remove it from scaling_methods and
+#   use residual_local_top1024 as the primary reconstruction method.
+# ---------------------------------------------------------------
+
+device: "auto"
+dtype: "float32"
+
+# Models: loaded one at a time, released before next
+scaling_models:
+  - "Qwen/Qwen2.5-3B"
+  - "Qwen/Qwen2.5-7B"
+
+# Target pruning percentages (global, across all MLP neurons)
+target_pruning_percents:
+  - 2.0
+  - 4.0
+  - 6.0
+  - 8.0
+
+# Methods to run for each (model, target_pct)
+# pure_delete must come first — damage_reduction is computed relative to it
+scaling_methods:
+  - "pure_delete"
+  - "residual_full"
+  - "residual_local_top1024"
+  - "residual_local_top2048"
+
+# Per-layer safety cap: at most this fraction of a layer's neurons may be pruned
+max_layer_prune_frac: 0.30
+
+# Reconstruction regularization (fixed — matches best results from prior runs)
+# lambda = 1e-2, tau = 1.0  (hardcoded in target_pruning.py)
+
+# dtype for model loading (auto = bfloat16 if CUDA supports, else float32)
+scaling_dtype: "auto"
+
+# Evaluation
+reconstruction_eval_samples: 256
+max_seq_len: 512
+batch_size: 4
+
+# Output
+output_dir: "results"
+
+# Dataset
+eval_dataset: "wikitext"
+use_fallback_corpus: false
+
+# Reproducibility
+seed: 42
