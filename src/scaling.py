@@ -460,26 +460,40 @@ def run_scaling_recon_mode(cfg: dict, device: str, output_dir: str = "results") 
 
     # ── Final summary table ──────────────────────────────────────────────────
     ppl_rows = [r for r in all_results if "perplexity" in r]
-    print(f"\n{'=' * 110}")
-    print(f"SCALING SUMMARY  (n_eval={n_eval},  baseline per model shown in first pure_delete row)")
-    print(f"{'─' * 110}")
+    W = 148
+    print(f"\n{'=' * W}")
+    print(f"SCALING SUMMARY  (n_eval={n_eval})")
+    print(f"{'─' * W}")
     print(
-        f"  {'model':>22}  {'alpha':>7}  {'method':>32}  "
-        f"{'bPPL':>8}  {'PPL':>9}  {'dPPL':>9}  {'rel%':>7}  {'dmg_red':>8}"
+        f"  {'model':>22}  {'alpha':>7}  "
+        f"{'pruned':>8}  {'tot_mlp':>8}  {'prn%':>6}  {'par%':>7}  {'flop%':>7}  "
+        f"{'method':>30}  "
+        f"{'bPPL':>8}  {'PPL':>9}  {'dPPL':>9}  {'rel%':>7}  {'dmg_red':>9}"
     )
-    print(f"{'─' * 110}")
+    print(f"{'─' * W}")
     for r in ppl_rows:
-        dm  = r.get("damage_reduction_pct", float("nan"))
-        rel = r.get("relative_ppl_increase_pct", float("nan"))
-        dm_s  = f"{dm:+8.1f}%" if (dm == dm) else "     nan%"
-        rel_s = f"{rel:+7.2f}%" if (rel == rel) else "    nan%"
+        n_prn   = r.get("n_pruned",              "?")
+        tot_mlp = r.get("total_mlp_neurons",     "?")
+        pct_prn = r.get("pct_pruned",            float("nan"))
+        par_red = r.get("mlp_params_red_pct",    float("nan"))
+        flp_red = r.get("flops_red_pct",         float("nan"))
+        dm      = r.get("damage_reduction_pct",  float("nan"))
+        rel     = r.get("relative_ppl_increase_pct", float("nan"))
+
+        par_s = f"{par_red:+6.2f}%" if par_red == par_red else "    nan%"
+        flp_s = f"{flp_red:+6.2f}%" if flp_red == flp_red else "    nan%"
+        dm_s  = f"{dm:+8.1f}%"      if dm  == dm           else "      nan%"
+        rel_s = f"{rel:+7.2f}%"     if rel == rel           else "    nan%"
+        pct_s = f"{pct_prn:5.2f}%" if pct_prn == pct_prn   else "  nan%"
+
         print(
             f"  {r['model_name'][-22:]:>22}  {_k(r['alpha']):>7}  "
-            f"{r['method']:>32}  "
+            f"{n_prn:>8}  {tot_mlp:>8}  {pct_s}  {par_s}  {flp_s}  "
+            f"{r['method']:>30}  "
             f"{r['baseline_ppl']:>8.4f}  {r['perplexity']:>9.4f}  "
             f"{r['perplexity_delta']:>+9.4f}  {rel_s}  {dm_s}"
         )
-    print(f"{'=' * 110}\n")
+    print(f"{'=' * W}\n")
 
     # ── JSON report ──────────────────────────────────────────────────────────
     report = {
