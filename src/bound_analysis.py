@@ -132,7 +132,7 @@ def compute_bound_scores_and_R(layer) -> Tuple[torch.Tensor, float]:
     )
 
     rmsnorm   = get_rmsnorm_before_mlp(layer)
-    gamma     = rmsnorm.weight.float().cpu()  # [d_model]
+    gamma     = rmsnorm.weight.detach().float().cpu()  # [d_model]
     gamma_inf = float(gamma.abs().max())
     R         = math.sqrt(d_model) * gamma_inf
     R_sq      = float(d_model) * gamma_inf ** 2

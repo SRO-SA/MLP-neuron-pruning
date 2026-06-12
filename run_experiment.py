@@ -42,6 +42,7 @@ from src.bound_analysis import (
     run_bound_ppl_mode,
     run_activation_verification_mode,
 )
+from src.merging import run_bound_merge_mode
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
 from src.evaluation import evaluate_perplexity, load_eval_dataset, run_generation_tests
@@ -179,6 +180,11 @@ def run_experiment(cfg: Dict, args) -> None:
         run_activation_verification_mode(
             model, tokenizer, cfg, device=device, output_dir=output_dir
         )
+        return
+
+    # ── BOUND MERGE MODE ───────────────────────────────────────────────────────
+    if args.bound_merge:
+        run_bound_merge_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── DEBUG MODE ─────────────────────────────────────────────────────────────
@@ -355,6 +361,7 @@ def run_experiment(cfg: Dict, args) -> None:
                 f"  {float(r['mlp_flops_reduction_pct']):>7.1f}%"
                 f"  {float(r['mlp_params_reduction_pct']):>7.1f}%"
             )
+
         except (ValueError, TypeError):
             print(f"  {r.get('pruning_method','')} ratio={r.get('pruning_ratio','')}  "
                   f"ERROR: {r.get('notes','')}")
@@ -393,6 +400,14 @@ def parse_args():
         help=(
             "Compute hook-based activation scores and correlations with bound scores.\n"
             "No pruning performed."
+        ),
+    )
+    p.add_argument(
+        "--bound-merge", action="store_true",
+        help=(
+            "Compare pure_delete vs merge_weight_similarity vs merge_activation_similarity\n"
+            "for cumulative-budget candidates at alpha=1e-4/1e-3/1e-2.\n"
+            "Saves PPL comparison table and per-neuron diagnostics."
         ),
     )
     p.add_argument(

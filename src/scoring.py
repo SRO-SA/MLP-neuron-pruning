@@ -120,7 +120,7 @@ def compute_scores(
     # the score and making them preferentially pruned.
     if method == "rmsnorm_bound_angle":
         rmsnorm  = get_rmsnorm_before_mlp(layer)
-        gamma    = rmsnorm.weight.float().cpu()   # [d_model]
+        gamma    = rmsnorm.weight.detach().float().cpu()   # [d_model]
 
         # R² = d_model * ||γ||_∞²
         # (R is a constant across all neurons in this layer; does not affect ranking)
