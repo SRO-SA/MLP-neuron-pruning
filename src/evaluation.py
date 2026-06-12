@@ -130,7 +130,7 @@ def load_eval_dataset(
     try:
         from datasets import load_dataset  # type: ignore
         logger.info("Loading WikiText-2 (test split) …")
-        ds     = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        ds     = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
         # Filter out very short lines (headers, empty rows)
         texts  = [row["text"] for row in ds if len(row["text"].strip()) > 100]
         texts  = texts[:max_samples]
