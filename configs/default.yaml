@@ -39,6 +39,11 @@ output_dir: "results"
 # Uses a smaller eval set so the threshold experiments finish faster.
 bound_analysis_eval_samples: 64
 
+# Reconstruction modes (--reconstruction-merge / --reconstruction-best)
+# Larger eval set for more reliable PPL estimates.
+# 256 is a reasonable trade-off; raise to 512 for final results.
+reconstruction_eval_samples: 256
+
 # Evaluation dataset
 # eval_dataset: which dataset to use for perplexity evaluation.
 #   Currently only "wikitext" (WikiText-2-raw-v1 test split) is supported.

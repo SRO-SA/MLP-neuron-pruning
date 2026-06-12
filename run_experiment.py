@@ -44,6 +44,7 @@ from src.merging import (
     run_debug_merge_mode,
     run_reconstruction_merge_mode,
     run_residual_reconstruction_mode,
+    run_reconstruction_best_mode,
 )
 from src.debug import run_debug_mode
 from src.diagnostics import run_diagnostics
@@ -198,6 +199,11 @@ def run_experiment(cfg: Dict, args) -> None:
     # ── RECONSTRUCTION MERGE MODE ─────────────────────────────────────────────
     if args.reconstruction_merge:
         run_residual_reconstruction_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
+        return
+
+    # ── RECONSTRUCTION BEST MODE ──────────────────────────────────────────────
+    if args.reconstruction_best:
+        run_reconstruction_best_mode(model, tokenizer, cfg, device=device, output_dir=output_dir)
         return
 
     # ── STABLE MERGE MODE ─────────────────────────────────────────────────────
@@ -436,11 +442,18 @@ def parse_args():
     p.add_argument(
         "--reconstruction-merge", action="store_true",
         help=(
-            "Compare pairwise activation merge vs down-proj ridge reconstruction.\n"
-            "Methods: pure_delete, merge_activation (ridge_1e-2/ridge_1.0/clip_0.5),\n"
-            "         down_recon_ridge at lam in {1e-6,1e-5,1e-4,1e-3,1e-2,0.1,1.0}.\n"
-            "Uses train/held-out calibration split for overfitting detection.\n"
-            "Reports: PPL, dPPL, reconstruction error, overfit gap."
+            "Full residual reconstruction grid: pure_delete + activation merge baselines\n"
+            "+ residual_lam×tau grid (5×5=25 configs) for alpha in {1e-4,1e-3,1e-2}.\n"
+            "Uses train/held-out calibration split. Reports all reconstruction metrics."
+        ),
+    )
+    p.add_argument(
+        "--reconstruction-best", action="store_true",
+        help=(
+            "Fast best-config evaluation: pure_delete + merge_act_ridge_1e-2 + \n"
+            "resid_lam1e-2_tau1.0 for alpha in {1e-4,1e-3,1e-2}.\n"
+            "Uses reconstruction_eval_samples (default 256) from WikiText-2.\n"
+            "Reports full held-out reconstruction metrics and overfit diagnostics."
         ),
     )
     p.add_argument(
