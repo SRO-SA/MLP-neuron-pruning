@@ -448,6 +448,10 @@ def collect_expert_activations(
     """
     expert_inputs: Dict[Tuple[int, int], List[torch.Tensor]] = {}
     hooks = []
+    # Local caches for packed-expert calibration (keyed by layer_idx)
+    # These stay local — never attached to MoELayerInfo slots.
+    hidden_cache:  Dict[int, List[torch.Tensor]] = {}
+    routing_cache: Dict[int, List[torch.Tensor]] = {}
 
     for info in layer_infos:
         if not info.is_moe:
@@ -473,61 +477,53 @@ def collect_expert_activations(
 
         else:
             # ── Layout B: hook MoE block input + router output ───────────────
+            # Use local dicts (keyed by layer_idx) instead of attaching to
+            # MoELayerInfo — which has __slots__ and rejects dynamic attributes.
             n_exp = info.num_experts
             top_k = info.top_k
+            li    = info.layer_idx
             for ei in range(n_exp):
-                key = (info.layer_idx, ei)
-                expert_inputs[key] = []
+                expert_inputs[(li, ei)] = []
 
-            # Storage for this layer's per-prompt data
-            layer_hidden: List[torch.Tensor] = []     # [n_tok, d_model] per prompt
-            layer_routing: List[torch.Tensor] = []    # [n_tok, top_k] per prompt
+            hidden_cache[li]  = []   # List of [n_tok, d_model] CPU tensors
+            routing_cache[li] = []   # List of [n_tok, top_k]   CPU int tensors
 
             mlp_module    = info.layer_module.mlp
             router_module = info.router_module
 
-            def _make_pre_hook(lh):
+            def _make_pre_hook(layer_idx):
                 def pre_hook(module, args):
-                    # args[0]: [batch, seq, d_model] or [n_tok, d_model]
                     h = args[0].detach().float().cpu()
                     if h.dim() == 3:
                         h = h.reshape(-1, h.shape[-1])
-                    lh.append(h)
+                    hidden_cache[layer_idx].append(h)
                 return pre_hook
 
-            def _make_router_hook(lr):
+            def _make_router_hook(layer_idx, top_k_):
                 def router_hook(module, inp, out):
-                    # out may be (routing_weights, selected_experts) or just logits
                     if isinstance(out, (tuple, list)):
-                        # Typically (routing_weights, selected_experts)
-                        # selected_experts: [n_tok, top_k] int64
                         if len(out) >= 2:
                             sel = out[1]
                             if isinstance(sel, torch.Tensor) and sel.dtype in (
                                     torch.int32, torch.int64, torch.long):
-                                lr.append(sel.detach().cpu())
+                                routing_cache[layer_idx].append(sel.detach().cpu())
                                 return
-                        # Fallback: logits → top_k
                         logits = out[0] if isinstance(out[0], torch.Tensor) else out
-                        topk = torch.topk(logits.float(), k=min(top_k, logits.shape[-1]),
-                                          dim=-1)
-                        lr.append(topk.indices.detach().cpu())
+                        topk = torch.topk(logits.float(),
+                                          k=min(top_k_, logits.shape[-1]), dim=-1)
+                        routing_cache[layer_idx].append(topk.indices.detach().cpu())
                     elif isinstance(out, torch.Tensor):
                         if out.dtype in (torch.int32, torch.int64, torch.long):
-                            lr.append(out.detach().cpu())
+                            routing_cache[layer_idx].append(out.detach().cpu())
                         else:
                             topk = torch.topk(out.float(),
-                                              k=min(top_k, out.shape[-1]), dim=-1)
-                            lr.append(topk.indices.detach().cpu())
+                                              k=min(top_k_, out.shape[-1]), dim=-1)
+                            routing_cache[layer_idx].append(topk.indices.detach().cpu())
                 return router_hook
 
-            h1 = mlp_module.register_forward_pre_hook(_make_pre_hook(layer_hidden))
-            h2 = router_module.register_forward_hook(_make_router_hook(layer_routing))
+            h1 = mlp_module.register_forward_pre_hook(_make_pre_hook(li))
+            h2 = router_module.register_forward_hook(_make_router_hook(li, top_k))
             hooks.extend([h1, h2])
-
-            # Store references so we can reconstruct after calibration
-            info._calib_hidden  = layer_hidden
-            info._calib_routing = layer_routing
 
     model.eval()
     with torch.no_grad():
@@ -549,47 +545,80 @@ def collect_expert_activations(
     for info in layer_infos:
         if not info.is_moe or not info.experts_packed:
             continue
-        hidden_list  = getattr(info, "_calib_hidden",  [])
-        routing_list = getattr(info, "_calib_routing", [])
+        li            = info.layer_idx
+        hidden_list   = hidden_cache.get(li, [])
+        routing_list  = routing_cache.get(li, [])
+
         if not hidden_list or not routing_list:
-            logger.warning("Layer %d: no calibration data captured", info.layer_idx)
+            logger.warning("Layer %d: no calibration data captured", li)
             continue
 
-        # Align lengths (router may fire multiple times per prompt due to block structure)
-        # Concatenate all and match by token count
-        all_hidden = torch.cat(hidden_list, dim=0)   # [total_tokens, d_model]
+        all_hidden = torch.cat(hidden_list, dim=0).cpu()    # [total_tokens, d_model]
+        del hidden_list                                      # free CPU memory
 
-        # routing tensors may be [n_tok, top_k] or [n_tok]
         try:
-            all_routing = torch.cat(routing_list, dim=0)  # [total_tokens, top_k] or similar
+            all_routing = torch.cat(routing_list, dim=0).cpu()
         except RuntimeError:
-            # Shape mismatch — skip
-            logger.warning("Layer %d: routing tensor shapes mismatch, skipping", info.layer_idx)
+            logger.warning("Layer %d: routing tensor shape mismatch, skipping", li)
+            del routing_cache[li]
             continue
+        del routing_list
 
         if all_routing.dim() == 1:
-            all_routing = all_routing.unsqueeze(-1)  # [n_tok, 1]
+            all_routing = all_routing.unsqueeze(-1)          # [n_tok, 1]
 
-        n_tok = min(all_hidden.shape[0], all_routing.shape[0])
-        all_hidden   = all_hidden[:n_tok]
-        all_routing  = all_routing[:n_tok]
+        n_tok       = min(all_hidden.shape[0], all_routing.shape[0])
+        all_hidden  = all_hidden[:n_tok]
+        all_routing = all_routing[:n_tok]
 
         for ei in range(info.num_experts):
-            # mask: token is routed to expert ei if any column of routing == ei
-            mask = (all_routing == ei).any(dim=-1)  # [n_tok] bool
+            mask = (all_routing == ei).any(dim=-1)           # [n_tok] bool
             if mask.any():
-                key = (info.layer_idx, ei)
-                expert_inputs[key].append(all_hidden[mask])
+                expert_inputs[(li, ei)].append(all_hidden[mask].clone())
 
-        # Clean up temporary storage
-        info._calib_hidden  = []
-        info._calib_routing = []
+        # Free layer-level caches
+        del hidden_cache[li], routing_cache[li]
+        del all_hidden, all_routing
 
-    # Concatenate results
+    # ── Concatenate per-expert lists into tensors ─────────────────────────────
     result: Dict[Tuple[int, int], torch.Tensor] = {}
     for key, tensors in expert_inputs.items():
         if tensors:
-            result[key] = torch.cat(tensors, dim=0)
+            result[key] = torch.cat(tensors, dim=0)          # [n_routed, d_model]
+
+    # ── Routing statistics log ────────────────────────────────────────────────
+    import statistics as _stat
+    # ── Per-layer routing stats ───────────────────────────────────────────────
+    layer_idx_to_info = {i.layer_idx: i for i in layer_infos}
+    packed_layers = [i for i in layer_infos if i.is_moe and i.experts_packed]
+    n_skipped_total = 0
+    for info in packed_layers:
+        li = info.layer_idx
+        counts = [
+            result.get((li, ei), torch.empty(0)).shape[0]
+            for ei in range(info.num_experts)
+        ]
+        total_tok = sum(counts)
+        n_zero    = sum(1 for c in counts if c == 0)
+        if counts:
+            mn  = min(counts)
+            med = int(_stat.median(counts))
+            mx  = max(counts)
+            print(
+                f"    Layer {li:3d}: total_tokens={total_tok:6d}  "
+                f"per_expert min={mn:4d} med={med:5d} max={mx:5d}  "
+                f"zero_routed={n_zero}"
+            )
+        n_skipped_total += n_zero
+    if packed_layers:
+        print(f"    Total experts with zero routed tokens: {n_skipped_total}")
+        first_li   = packed_layers[0].layer_idx
+        first_info = packed_layers[0]
+        counts_0   = [
+            result.get((first_li, ei), torch.empty(0)).shape[0]
+            for ei in range(first_info.num_experts)
+        ]
+        print(f"    Layer {first_li} first 8 expert counts: {counts_0[:8]}")
 
     return result
 
