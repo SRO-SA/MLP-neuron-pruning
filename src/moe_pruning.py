@@ -574,7 +574,49 @@ def run_moe_target_pruning_mode(
 
             # Discover architecture
             layer_infos, arch_info = discover_moe_architecture(model)
-            print(f"  Architecture: {arch_info}")
+
+            # ── Architecture sanity log ──────────────────────────────────────
+            first_moe = next((i for i in layer_infos if i.is_moe), None)
+            print(f"\n  {'─' * 60}")
+            print(f"  ARCHITECTURE DISCOVERY")
+            print(f"  {'─' * 60}")
+            print(f"  Model class         : {arch_info['model_class']}")
+            print(f"  Total layers        : {arch_info['total_layers']}")
+            print(f"  MoE layers          : {arch_info['n_moe_layers']}")
+            print(f"  Dense layers        : {arch_info['n_dense_layers']}")
+            print(f"  Total experts       : {arch_info['total_experts']}")
+            if first_moe is not None:
+                print(f"  First MoE layer idx : {first_moe.layer_idx}")
+                # Router info
+                rtr = first_moe.router_module
+                if rtr is not None:
+                    r_shape = (list(rtr.weight.shape)
+                               if hasattr(rtr, "weight") else "no .weight")
+                    print(f"  Router type         : {type(rtr).__name__}  shape={r_shape}")
+                else:
+                    print(f"  Router              : not detected")
+                # First expert shapes
+                if first_moe.expert_modules:
+                    e0 = first_moe.expert_modules[0]
+                    for pname in ("gate_proj", "up_proj", "down_proj"):
+                        pm = getattr(e0, pname, None)
+                        if pm is not None and hasattr(pm, "weight"):
+                            print(f"  expert[0].{pname:9s} : {list(pm.weight.shape)}")
+                # num_experts_per_tok / top_k
+                cfg_m = getattr(model, "config", None)
+                epk = getattr(cfg_m, "num_experts_per_tok",
+                              getattr(cfg_m, "top_k", "?"))
+                print(f"  num_experts_per_tok : {epk}")
+                # Shared expert
+                if first_moe.shared_expert_module is not None:
+                    se = first_moe.shared_expert_module
+                    for pname in ("gate_proj", "up_proj", "down_proj"):
+                        pm = getattr(se, pname, None)
+                        if pm is not None and hasattr(pm, "weight"):
+                            print(f"  shared.{pname:9s}    : {list(pm.weight.shape)}")
+            else:
+                print(f"  WARNING: no MoE layers found — cannot proceed")
+            print(f"  {'─' * 60}\n")
 
             if smoke_test:
                 # Only keep first 4 MoE layers for smoke test
@@ -710,14 +752,14 @@ def run_moe_target_pruning_mode(
                         keep_idx = keep_mask.nonzero(as_tuple=True)[0]
 
                         n_routed  = routed_counts.get((li, ei), 0)
-                        skipped   = n_routed < min_expert_tokens
+                        skipped   = n_routed < min_exp_tokens
                         calib_inp = expert_activations.get((li, ei), None)
 
                         if skipped:
                             experts_skipped += 1
                             logger.info(
                                 "Layer %d Expert %d: skipped (only %d routed tokens < %d)",
-                                li, ei, n_routed, min_expert_tokens,
+                                li, ei, n_routed, min_exp_tokens,
                             )
                             row_exp = {
                                 "model": model_name, "target_pruning_percent": target_pct,
@@ -848,7 +890,7 @@ def run_moe_target_pruning_mode(
         "target_percents": TARGET_PCTS,
         "methods": METHODS,
         "max_expert_frac": max_exp_frac,
-        "min_expert_tokens": min_expert_tokens,
+        "min_expert_tokens": min_exp_tokens,
         "note": "Router weights and expert routing are NOT modified. "
                 "Only MLP channels within each expert are pruned.",
         "results": all_results,

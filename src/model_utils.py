@@ -100,7 +100,12 @@ def load_model_and_tokenizer(
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
             logger.info("Model loaded successfully: %s", name)
-            print_model_info(model)
+            try:
+                print_model_info(model)
+            except Exception as pmi_exc:
+                logger.warning(
+                    "print_model_info failed (non-fatal): %s", pmi_exc
+                )
             return model, tokenizer, name
 
         except Exception as exc:  # noqa: BLE001
@@ -194,7 +199,11 @@ def get_mlp_weights(layer) -> Dict[str, torch.Tensor]:
 
 
 def print_model_info(model: AutoModelForCausalLM) -> None:
-    """Print a summary of model architecture and MLP shapes per layer."""
+    """Print a summary of model architecture and MLP shapes per layer.
+
+    Handles both dense (Qwen2.5-style) and MoE (Qwen3MoE-style) first layers
+    without raising an AssertionError when gate_proj is absent.
+    """
     print("\n" + "=" * 60)
     print("MODEL ARCHITECTURE SUMMARY")
     print("=" * 60)
@@ -203,21 +212,68 @@ def print_model_info(model: AutoModelForCausalLM) -> None:
     cfg = model.config
     print(f"  Hidden size   : {getattr(cfg, 'hidden_size', '?')}")
     print(f"  Intermediate  : {getattr(cfg, 'intermediate_size', '?')}")
+    print(f"  MoE inter.    : {getattr(cfg, 'moe_intermediate_size', '?')}")
     print(f"  Num layers    : {getattr(cfg, 'num_hidden_layers', '?')}")
     print(f"  Num heads     : {getattr(cfg, 'num_attention_heads', '?')}")
+    print(f"  Num experts   : {getattr(cfg, 'num_experts', '?')}")
+    print(f"  Experts/tok   : {getattr(cfg, 'num_experts_per_tok', getattr(cfg, 'top_k', '?'))}")
     print(f"  Vocab size    : {getattr(cfg, 'vocab_size', '?')}")
 
-    layers = get_transformer_layers(model)
-    print(f"\n  Inspecting first layer MLP shapes:")
-    w = get_mlp_weights(layers[0])
-    rmsnorm = get_rmsnorm_before_mlp(layers[0])
-    print(f"    gate_proj.weight : {list(w['gate'].shape)}")
-    print(f"    up_proj.weight   : {list(w['up'].shape)}")
-    print(f"    down_proj.weight : {list(w['down'].shape)}")
-    print(f"    d_model          : {w['d_model']}")
-    print(f"    d_ff             : {w['d_ff']}")
-    print(f"    RMSNorm before MLP: {type(rmsnorm).__name__} "
-          f"(gamma shape {list(rmsnorm.weight.shape)})")
+    try:
+        layers  = get_transformer_layers(model)
+        first   = layers[0]
+        mlp     = getattr(first, "mlp", None)
+
+        print(f"\n  First-layer MLP ({type(mlp).__name__ if mlp else 'None'}):")
+
+        if mlp is not None and hasattr(mlp, "gate_proj"):
+            # ── Dense MLP (Qwen2.5 / LLaMA style) ──────────────────────────
+            w = get_mlp_weights(first)
+            print(f"    gate_proj.weight : {list(w['gate'].shape)}")
+            print(f"    up_proj.weight   : {list(w['up'].shape)}")
+            print(f"    down_proj.weight : {list(w['down'].shape)}")
+            print(f"    d_model          : {w['d_model']}")
+            print(f"    d_ff             : {w['d_ff']}")
+            try:
+                rmsnorm = get_rmsnorm_before_mlp(first)
+                print(f"    RMSNorm before MLP : {type(rmsnorm).__name__} "
+                      f"(gamma shape {list(rmsnorm.weight.shape)})")
+            except Exception as rms_exc:
+                print(f"    RMSNorm before MLP : could not inspect ({rms_exc})")
+
+        elif mlp is not None and hasattr(mlp, "experts"):
+            # ── MoE MLP (Qwen3MoE style) ────────────────────────────────────
+            experts = list(mlp.experts)
+            router  = (getattr(mlp, "gate",          None) or
+                       getattr(mlp, "router",         None) or
+                       getattr(mlp, "expert_router",  None))
+            shared  = getattr(mlp, "shared_expert", None)
+
+            print(f"    MLP type       : {type(mlp).__name__} (MoE)")
+            if router is not None:
+                r_shape = (list(router.weight.shape)
+                           if hasattr(router, "weight") else "no .weight")
+                print(f"    Router         : {type(router).__name__}  shape={r_shape}")
+            print(f"    Num experts    : {len(experts)}")
+            if experts:
+                e0 = experts[0]
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    m = getattr(e0, proj, None)
+                    if m is not None and hasattr(m, "weight"):
+                        print(f"    expert[0].{proj}.weight : {list(m.weight.shape)}")
+            if shared is not None:
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    m = getattr(shared, proj, None)
+                    if m is not None and hasattr(m, "weight"):
+                        print(f"    shared.{proj}.weight    : {list(m.weight.shape)}")
+
+        else:
+            print(f"    Unknown MLP type — shape inspection skipped")
+
+    except Exception as exc:
+        logger.warning("print_model_info: inspection failed: %s", exc)
+        print(f"  (shape inspection skipped: {exc})")
+
     print("=" * 60 + "\n")
 
 

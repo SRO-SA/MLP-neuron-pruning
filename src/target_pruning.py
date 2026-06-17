@@ -1028,14 +1028,14 @@ def run_target_pruning_mode(
 
     # ── Final summary table ───────────────────────────────────────────────────
     ppl_rows = [r for r in all_results if "compressed_ppl" in r]
-    W = 192
+    W = 204
     print(f"\n{'=' * W}")
     print(f"TARGET-PRUNING SUMMARY  (n_eval={n_eval_actual})")
     print(f"{'─' * W}")
     hdr = (
         f"  {'model':>22}  {'tgt%':>5}  {'act%':>6}  {'pruned':>8}  "
         f"{'mlp_par%':>8}  {'tot_par%':>8}  {'mlp_flp%':>8}  {'est_flp%':>8}  "
-        f"{'selector':>18}  {'method':>30}  "
+        f"{'dataset':>12}  {'selector':>18}  {'method':>30}  "
         f"{'bPPL':>8}  {'PPL':>9}  {'dPPL':>9}  {'rel%':>7}  {'dmg_red':>9}  "
         f"{'t_s':>6}  {'gpu_MB':>7}"
     )
@@ -1068,6 +1068,7 @@ def run_target_pruning_mode(
             f"  {str(r.get('model',''))[-22:]:>22}  "
             f"{float(r.get('target_pruning_percent', 0)):>5.1f}  {act_s}  "
             f"{str(n_prn):>8}  {par_s}  {tpar_s}  {flp_s}  {eflp_s}  "
+            f"{str(r.get('eval_dataset',''))[:12]:>12}  "
             f"{str(r.get('selector',''))[:18]:>18}  "
             f"{str(r.get('method',''))[:30]:>30}  "
             f"{float(r.get('baseline_ppl', 0)):>8.4f}  "
