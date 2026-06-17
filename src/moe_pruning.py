@@ -103,22 +103,129 @@ class MoELayerInfo:
         "layer_idx", "layer_module",
         "is_moe", "is_dense",
         "router_module",
-        "expert_modules",
+        "expert_modules",       # List[expert_module | PackedExpertView]
         "shared_expert_module",
         "num_experts",
         "top_k",
+        "experts_packed",       # True when mlp.experts is a packed Qwen3MoeExperts tensor
+        "experts_container",    # the Qwen3MoeExperts object when packed; else None
     ]
 
     def __init__(self, layer_idx: int, layer_module):
-        self.layer_idx          = layer_idx
-        self.layer_module       = layer_module
-        self.is_moe             = False
-        self.is_dense           = False
-        self.router_module      = None
-        self.expert_modules     = []
+        self.layer_idx            = layer_idx
+        self.layer_module         = layer_module
+        self.is_moe               = False
+        self.is_dense             = False
+        self.router_module        = None
+        self.expert_modules       = []
         self.shared_expert_module = None
-        self.num_experts        = 0
-        self.top_k              = 2  # default
+        self.num_experts          = 0
+        self.top_k                = 2  # default
+        self.experts_packed       = False
+        self.experts_container    = None
+
+
+# ---------------------------------------------------------------------------
+# Packed-expert support (Qwen3MoeExperts layout)
+# ---------------------------------------------------------------------------
+
+class PackedExpertView:
+    """
+    Virtual per-expert view into a packed Qwen3MoeExperts tensor block.
+
+    Qwen3MoeExperts stores all experts in two fused parameters:
+        gate_up_proj : [num_experts, 2 * moe_intermediate, hidden_dim]
+                       (gate projection comes first, then up projection)
+        down_proj    : [num_experts, hidden_dim, moe_intermediate]
+
+    This class slices those tensors for a single expert so that
+    get_expert_weights / get_expert_scores work identically to the
+    unpacked (ModuleList) case.
+
+    For expert i:
+        gate slice: gate_up_proj[i, :moe_inter, :]   shape [moe_inter, hidden]
+        up   slice: gate_up_proj[i, moe_inter:, :]   shape [moe_inter, hidden]
+        down slice: down_proj[i]                      shape [hidden, moe_inter]
+
+    These are views (not copies) — they share memory with the container.
+    """
+
+    def __init__(self, container, expert_idx: int, moe_intermediate: int):
+        self.container        = container
+        self.idx              = expert_idx
+        self.moe_intermediate = moe_intermediate
+        self.hidden_dim       = container.gate_up_proj.shape[2]
+
+    # ── virtual weight properties ─────────────────────────────────────────
+    @property
+    def gate_weight(self) -> torch.Tensor:
+        """[moe_intermediate, hidden_dim] view of gate projection."""
+        return self.container.gate_up_proj[self.idx, :self.moe_intermediate, :]
+
+    @property
+    def up_weight(self) -> torch.Tensor:
+        """[moe_intermediate, hidden_dim] view of up projection."""
+        return self.container.gate_up_proj[self.idx, self.moe_intermediate:, :]
+
+    @property
+    def down_weight(self) -> torch.Tensor:
+        """[hidden_dim, moe_intermediate] view of down projection."""
+        return self.container.down_proj[self.idx]
+
+    def __repr__(self):
+        return (f"PackedExpertView(idx={self.idx}, "
+                f"d_ff={self.moe_intermediate}, d_model={self.hidden_dim})")
+
+
+def inspect_experts_container(experts) -> None:
+    """
+    Diagnostic helper: print type, parameters, buffers, and child modules
+    of an experts container.  Call this when expert layout is unknown.
+    """
+    print(f"\n  Experts type   : {type(experts).__name__}")
+    print(f"  Experts params :")
+    for name, param in experts.named_parameters(recurse=False):
+        print(f"    {name:30s}  shape={list(param.shape)}  dtype={param.dtype}")
+    for name, buf in experts.named_buffers(recurse=False):
+        print(f"    [buf] {name:26s}  shape={list(buf.shape)}")
+    print(f"  Experts children:")
+    for cname, cmod in experts.named_children():
+        print(f"    {cname:30s}  {type(cmod).__name__}")
+    for attr in ("num_experts", "intermediate_dim", "hidden_dim",
+                 "is_concatenated", "has_gate"):
+        if hasattr(experts, attr):
+            print(f"  .{attr:28s} = {getattr(experts, attr)}")
+    print()
+
+
+def _detect_experts_layout(experts) -> str:
+    """
+    Detect whether experts is Layout A (iterable ModuleList) or
+    Layout B (packed Qwen3MoeExperts with gate_up_proj + down_proj).
+
+    Returns
+    -------
+    "unpacked"          — Layout A: experts is iterable, each item has gate_proj / up_proj / down_proj
+    "packed_gate_up"    — Layout B: experts has .gate_up_proj [n,2i,h] + .down_proj [n,h,i]
+    "unknown"           — neither layout recognised
+    """
+    # Layout B check first (more specific)
+    if (hasattr(experts, "gate_up_proj") and
+            hasattr(experts, "down_proj") and
+            isinstance(getattr(experts, "gate_up_proj", None), torch.Tensor)):
+        gu = experts.gate_up_proj
+        if gu.ndim == 3:
+            return "packed_gate_up"
+
+    # Layout A: try iterating
+    try:
+        items = list(experts)
+        if items and hasattr(items[0], "gate_proj"):
+            return "unpacked"
+    except (TypeError, RuntimeError):
+        pass
+
+    return "unknown"
 
 
 def discover_moe_architecture(model) -> Tuple[List[MoELayerInfo], dict]:
@@ -161,14 +268,51 @@ def discover_moe_architecture(model) -> Tuple[List[MoELayerInfo], dict]:
         if experts is not None and router is not None:
             info.is_moe            = True
             info.router_module     = router
-            info.expert_modules    = list(experts)
-            info.num_experts       = len(info.expert_modules)
             info.shared_expert_module = getattr(mlp, "shared_expert", None)
-            # Try to get top_k from config
+            info.experts_container = experts
+
+            layout = _detect_experts_layout(experts)
+
+            if layout == "unpacked":
+                # Layout A: ModuleList of independent expert modules
+                info.experts_packed  = False
+                info.expert_modules  = list(experts)
+                info.num_experts     = len(info.expert_modules)
+
+            elif layout == "packed_gate_up":
+                # Layout B: Qwen3MoeExperts — packed [n_exp, 2*inter, hidden] tensors
+                gu = experts.gate_up_proj          # [n_exp, 2*inter, hidden]
+                n_exp   = gu.shape[0]
+                inter   = gu.shape[1] // 2        # moe_intermediate
+                info.experts_packed = True
+                info.num_experts    = n_exp
+                # Build virtual per-expert views
+                info.expert_modules = [
+                    PackedExpertView(experts, ei, inter)
+                    for ei in range(n_exp)
+                ]
+                logger.info(
+                    "Layer %d: packed Qwen3MoeExperts detected — "
+                    "n_exp=%d, moe_inter=%d, hidden=%d",
+                    li, n_exp, inter, gu.shape[2],
+                )
+
+            else:
+                logger.warning(
+                    "Layer %d: unknown experts layout %s — printing diagnostics",
+                    li, type(experts).__name__,
+                )
+                inspect_experts_container(experts)
+                raise RuntimeError(
+                    f"Unsupported experts layout in layer {li}: "
+                    f"{type(experts).__name__}. "
+                    "See diagnostic output above for parameter names/shapes."
+                )
+
             cfg = getattr(model, "config", None)
             info.top_k = getattr(cfg, "num_experts_per_tok",
                          getattr(cfg, "top_k", 2))
-            n_moe     += 1
+            n_moe         += 1
             total_experts += info.num_experts
         else:
             info.is_dense = True
@@ -197,9 +341,32 @@ def discover_moe_architecture(model) -> Tuple[List[MoELayerInfo], dict]:
 def get_expert_weights(expert_module) -> dict:
     """
     Extract gate_proj, up_proj, down_proj from an expert module.
+
+    Handles both:
+    - Layout A (unpacked): expert_module.gate_proj / up_proj / down_proj are nn.Linear
+    - Layout B (packed): expert_module is a PackedExpertView with tensor properties
+
     Returns dict with 'd_model', 'd_ff', 'gate_proj', 'up_proj', 'down_proj'.
-    Raises AttributeError if the expected attributes are missing.
+    Shapes follow the dense-MLP convention:
+        gate_proj : [d_ff, d_model]
+        up_proj   : [d_ff, d_model]
+        down_proj : [d_model, d_ff]
     """
+    if isinstance(expert_module, PackedExpertView):
+        pv = expert_module
+        gate = pv.gate_weight   # [moe_inter, hidden] = [d_ff, d_model]
+        up   = pv.up_weight     # [moe_inter, hidden] = [d_ff, d_model]
+        down = pv.down_weight   # [hidden, moe_inter] = [d_model, d_ff]
+        d_ff, d_model = gate.shape
+        return {
+            "d_model":   d_model,
+            "d_ff":      d_ff,
+            "gate_proj": gate,
+            "up_proj":   up,
+            "down_proj": down,
+        }
+
+    # Layout A: independent nn.Linear expert modules
     gate = getattr(expert_module, "gate_proj", None)
     up   = getattr(expert_module, "up_proj",   None)
     down = getattr(expert_module, "down_proj", None)
@@ -261,36 +428,106 @@ def collect_expert_activations(
     Route calibration tokens through the model and collect MLP input activations
     per expert.
 
+    Handles two expert layouts:
+
+    Layout A (unpacked ModuleList):
+        Registers a forward hook on each expert's gate_proj module.
+        The hook fires only for tokens routed to that expert — exactly the
+        activations needed for per-expert residual reconstruction.
+
+    Layout B (packed Qwen3MoeExperts):
+        Registers a pre-hook on the MoE block to capture hidden_states, and a
+        forward hook on the router (gate) to capture top-k routing decisions.
+        After the forward pass, reconstructs per-expert slices:
+            expert_inputs[layer_idx, expert_idx] = hidden_states[routed_mask]
+
     Returns
     -------
     Dict mapping (layer_idx, expert_idx) → Tensor of shape [n_routed, d_model]
     Only MoE layers are populated; dense layers are skipped.
     """
-    # We use forward hooks to capture inputs to each expert's gate_proj
-    from .model_utils import get_transformer_layers
-
     expert_inputs: Dict[Tuple[int, int], List[torch.Tensor]] = {}
     hooks = []
 
-    # Register hooks for every expert in every MoE layer
     for info in layer_infos:
         if not info.is_moe:
             continue
-        for ei, expert in enumerate(info.expert_modules):
-            gate_proj = getattr(expert, "gate_proj", None)
-            if gate_proj is None:
-                continue
-            key = (info.layer_idx, ei)
-            expert_inputs[key] = []
 
-            def _make_hook(k):
-                def hook_fn(module, inp, out):
-                    # inp[0]: [n_tokens, d_model]  (all tokens routed to this expert)
-                    expert_inputs[k].append(inp[0].detach().float().cpu())
-                return hook_fn
+        if not info.experts_packed:
+            # ── Layout A: hook each expert's gate_proj ───────────────────────
+            for ei, expert in enumerate(info.expert_modules):
+                gate_proj = getattr(expert, "gate_proj", None)
+                if gate_proj is None:
+                    continue
+                key = (info.layer_idx, ei)
+                expert_inputs[key] = []
 
-            h = gate_proj.register_forward_hook(_make_hook(key))
-            hooks.append(h)
+                def _make_hook(k):
+                    def hook_fn(module, inp, out):
+                        # inp[0]: [n_tokens, d_model] (already routed)
+                        expert_inputs[k].append(inp[0].detach().float().cpu())
+                    return hook_fn
+
+                h = gate_proj.register_forward_hook(_make_hook(key))
+                hooks.append(h)
+
+        else:
+            # ── Layout B: hook MoE block input + router output ───────────────
+            n_exp = info.num_experts
+            top_k = info.top_k
+            for ei in range(n_exp):
+                key = (info.layer_idx, ei)
+                expert_inputs[key] = []
+
+            # Storage for this layer's per-prompt data
+            layer_hidden: List[torch.Tensor] = []     # [n_tok, d_model] per prompt
+            layer_routing: List[torch.Tensor] = []    # [n_tok, top_k] per prompt
+
+            mlp_module    = info.layer_module.mlp
+            router_module = info.router_module
+
+            def _make_pre_hook(lh):
+                def pre_hook(module, args):
+                    # args[0]: [batch, seq, d_model] or [n_tok, d_model]
+                    h = args[0].detach().float().cpu()
+                    if h.dim() == 3:
+                        h = h.reshape(-1, h.shape[-1])
+                    lh.append(h)
+                return pre_hook
+
+            def _make_router_hook(lr):
+                def router_hook(module, inp, out):
+                    # out may be (routing_weights, selected_experts) or just logits
+                    if isinstance(out, (tuple, list)):
+                        # Typically (routing_weights, selected_experts)
+                        # selected_experts: [n_tok, top_k] int64
+                        if len(out) >= 2:
+                            sel = out[1]
+                            if isinstance(sel, torch.Tensor) and sel.dtype in (
+                                    torch.int32, torch.int64, torch.long):
+                                lr.append(sel.detach().cpu())
+                                return
+                        # Fallback: logits → top_k
+                        logits = out[0] if isinstance(out[0], torch.Tensor) else out
+                        topk = torch.topk(logits.float(), k=min(top_k, logits.shape[-1]),
+                                          dim=-1)
+                        lr.append(topk.indices.detach().cpu())
+                    elif isinstance(out, torch.Tensor):
+                        if out.dtype in (torch.int32, torch.int64, torch.long):
+                            lr.append(out.detach().cpu())
+                        else:
+                            topk = torch.topk(out.float(),
+                                              k=min(top_k, out.shape[-1]), dim=-1)
+                            lr.append(topk.indices.detach().cpu())
+                return router_hook
+
+            h1 = mlp_module.register_forward_pre_hook(_make_pre_hook(layer_hidden))
+            h2 = router_module.register_forward_hook(_make_router_hook(layer_routing))
+            hooks.extend([h1, h2])
+
+            # Store references so we can reconstruct after calibration
+            info._calib_hidden  = layer_hidden
+            info._calib_routing = layer_routing
 
     model.eval()
     with torch.no_grad():
@@ -305,16 +542,54 @@ def collect_expert_activations(
             except Exception as exc:
                 logger.warning("calibration forward pass failed: %s", exc)
 
-    # Remove hooks
     for h in hooks:
         h.remove()
 
-    # Concatenate collected tensors
+    # ── Reconstruct per-expert activations for packed layers ─────────────────
+    for info in layer_infos:
+        if not info.is_moe or not info.experts_packed:
+            continue
+        hidden_list  = getattr(info, "_calib_hidden",  [])
+        routing_list = getattr(info, "_calib_routing", [])
+        if not hidden_list or not routing_list:
+            logger.warning("Layer %d: no calibration data captured", info.layer_idx)
+            continue
+
+        # Align lengths (router may fire multiple times per prompt due to block structure)
+        # Concatenate all and match by token count
+        all_hidden = torch.cat(hidden_list, dim=0)   # [total_tokens, d_model]
+
+        # routing tensors may be [n_tok, top_k] or [n_tok]
+        try:
+            all_routing = torch.cat(routing_list, dim=0)  # [total_tokens, top_k] or similar
+        except RuntimeError:
+            # Shape mismatch — skip
+            logger.warning("Layer %d: routing tensor shapes mismatch, skipping", info.layer_idx)
+            continue
+
+        if all_routing.dim() == 1:
+            all_routing = all_routing.unsqueeze(-1)  # [n_tok, 1]
+
+        n_tok = min(all_hidden.shape[0], all_routing.shape[0])
+        all_hidden   = all_hidden[:n_tok]
+        all_routing  = all_routing[:n_tok]
+
+        for ei in range(info.num_experts):
+            # mask: token is routed to expert ei if any column of routing == ei
+            mask = (all_routing == ei).any(dim=-1)  # [n_tok] bool
+            if mask.any():
+                key = (info.layer_idx, ei)
+                expert_inputs[key].append(all_hidden[mask])
+
+        # Clean up temporary storage
+        info._calib_hidden  = []
+        info._calib_routing = []
+
+    # Concatenate results
     result: Dict[Tuple[int, int], torch.Tensor] = {}
     for key, tensors in expert_inputs.items():
         if tensors:
-            result[key] = torch.cat(tensors, dim=0)  # [n_routed, d_model]
-        # else: no tokens routed to this expert — not added to result
+            result[key] = torch.cat(tensors, dim=0)
 
     return result
 
@@ -363,6 +638,70 @@ def prune_expert_channels(
     expert_module.down_proj.weight = torch.nn.Parameter(old_d[:, keep_indices])
     if expert_module.down_proj.bias is not None:
         pass  # down_proj bias is [d_model], independent of d_ff — no change
+
+
+
+def prune_packed_experts_global(
+    experts_container,
+    prune_indices: torch.Tensor,
+) -> int:
+    """
+    Globally prune the SAME channels from ALL experts in a packed tensor block.
+
+    Because gate_up_proj and down_proj are fused across experts, per-expert
+    variable-width pruning is not possible without unpacking.  This function
+    instead removes a shared set of channel indices from every expert.
+
+    Parameters
+    ----------
+    experts_container : Qwen3MoeExperts (has .gate_up_proj and .down_proj params)
+    prune_indices     : 1-D int64 tensor of channel indices to prune,
+                        in [0, moe_intermediate)
+
+    Modifies
+    --------
+    experts_container.gate_up_proj : [n_exp, 2*moe_inter, hidden]
+                                   → [n_exp, 2*new_inter, hidden]
+    experts_container.down_proj    : [n_exp, hidden, moe_inter]
+                                   → [n_exp, hidden, new_inter]
+    experts_container.intermediate_dim (if present) updated to new_inter.
+
+    Returns
+    -------
+    new_intermediate : int  (number of channels remaining)
+    """
+    gu = experts_container.gate_up_proj.data   # [n_exp, 2*moe_inter, hidden]
+    dp = experts_container.down_proj.data       # [n_exp, hidden, moe_inter]
+
+    moe_inter = gu.shape[1] // 2
+    n_exp     = gu.shape[0]
+
+    keep_mask = torch.ones(moe_inter, dtype=torch.bool)
+    keep_mask[prune_indices] = False
+    keep_idx = keep_mask.nonzero(as_tuple=True)[0]  # [new_inter]
+    new_inter = len(keep_idx)
+
+    # gate_up rows: gate occupies [:moe_inter], up occupies [moe_inter:]
+    gate_keep    = keep_idx                     # rows to keep in gate portion
+    up_keep      = keep_idx + moe_inter         # rows to keep in up portion
+    gate_up_keep = torch.cat([gate_keep, up_keep])  # [2*new_inter]
+
+    new_gu = gu[:, gate_up_keep, :]   # [n_exp, 2*new_inter, hidden]
+    new_dp = dp[:, :, keep_idx]       # [n_exp, hidden, new_inter]
+
+    experts_container.gate_up_proj = torch.nn.Parameter(new_gu)
+    experts_container.down_proj    = torch.nn.Parameter(new_dp)
+
+    # Update metadata attribute if it exists
+    if hasattr(experts_container, "intermediate_dim"):
+        experts_container.intermediate_dim = new_inter
+
+    logger.info(
+        "prune_packed_experts_global: %d experts, moe_inter %d → %d "
+        "(pruned %d channels)",
+        n_exp, moe_inter, new_inter, moe_inter - new_inter,
+    )
+    return new_inter
 
 
 # ---------------------------------------------------------------------------
@@ -596,12 +935,29 @@ def run_moe_target_pruning_mode(
                 else:
                     print(f"  Router              : not detected")
                 # First expert shapes
-                if first_moe.expert_modules:
+                if first_moe.experts_packed and first_moe.experts_container is not None:
+                    ec = first_moe.experts_container
+                    print(f"  Expert layout       : PACKED (Qwen3MoeExperts)")
+                    for pname in ("gate_up_proj", "down_proj"):
+                        p = getattr(ec, pname, None)
+                        if isinstance(p, torch.Tensor):
+                            print(f"  experts.{pname:18s}: {list(p.shape)}")
+                    inter = first_moe.expert_modules[0].moe_intermediate if first_moe.expert_modules else "?"
+                    print(f"  moe_intermediate    : {inter}")
+                    print(f"  NOTE: physical pruning will use global same-channel mode")
+                elif first_moe.expert_modules:
                     e0 = first_moe.expert_modules[0]
-                    for pname in ("gate_proj", "up_proj", "down_proj"):
-                        pm = getattr(e0, pname, None)
-                        if pm is not None and hasattr(pm, "weight"):
-                            print(f"  expert[0].{pname:9s} : {list(pm.weight.shape)}")
+                    if isinstance(e0, PackedExpertView):
+                        print(f"  Expert layout       : PACKED (virtual views)")
+                        print(f"  expert[0].gate      : {list(e0.gate_weight.shape)}")
+                        print(f"  expert[0].up        : {list(e0.up_weight.shape)}")
+                        print(f"  expert[0].down      : {list(e0.down_weight.shape)}")
+                    else:
+                        print(f"  Expert layout       : UNPACKED (ModuleList)")
+                        for pname in ("gate_proj", "up_proj", "down_proj"):
+                            pm = getattr(e0, pname, None)
+                            if pm is not None and hasattr(pm, "weight"):
+                                print(f"  expert[0].{pname:9s} : {list(pm.weight.shape)}")
                 # num_experts_per_tok / top_k
                 cfg_m = getattr(model, "config", None)
                 epk = getattr(cfg_m, "num_experts_per_tok",
@@ -629,9 +985,14 @@ def run_moe_target_pruning_mode(
                 print("  No MoE layers found — aborting")
                 continue
 
+            def _expert_d_ff(exp) -> int:
+                if isinstance(exp, PackedExpertView):
+                    return exp.moe_intermediate
+                w = get_expert_weights(exp)
+                return w["d_ff"]
+
             total_expert_neurons = sum(
-                sum(get_expert_weights(exp)["d_ff"]
-                    for exp in info.expert_modules)
+                sum(_expert_d_ff(exp) for exp in info.expert_modules)
                 for info in moe_layers
             )
             print(f"  Total expert MLP neurons (prunable): {total_expert_neurons:,}")
