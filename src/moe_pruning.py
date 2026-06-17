@@ -941,11 +941,15 @@ def run_moe_target_pruning_mode(
     if inplace_prune:
         print("  INPLACE PRUNING: model pruned in-place (no deepcopy)")
         if len(TARGET_PCTS) > 1:
-            print(f"  WARNING: moe_inplace_pruning=True but {len(TARGET_PCTS)} "
-                  "target_percents specified — only first will be valid")
+            raise RuntimeError(
+                f"moe_inplace_pruning=True supports only ONE target percent per "
+                f"process, but {len(TARGET_PCTS)} were specified: {TARGET_PCTS}.\n"
+                f"Run separate processes (one per target), or set\n"
+                f"  moe_inplace_pruning: false\nto use deepcopy mode."
+            )
         if len(METHODS) > 1:
             print(f"  WARNING: moe_inplace_pruning=True but {len(METHODS)} "
-                  "methods specified — only first method runs per process")
+                  "methods — only the first method will run per process")
     print(f"{'=' * 90}\n")
 
     # Load eval datasets once
@@ -1241,8 +1245,15 @@ def run_moe_target_pruning_mode(
                       f"(requested {target_pct:.1f}%)")
 
                 # ── Release calibration caches before pruning ─────────────────
-                _calib_ref = expert_activations   # keep local ref for recon
-                del expert_activations
+                # pure_delete needs no per-expert activations during pruning;
+                # reconstruction methods do.  Only hold a reference if needed.
+                _first_method = METHODS[0] if METHODS else "pure_delete"
+                _needs_calib  = (_first_method != "pure_delete")
+                if _needs_calib:
+                    _calib_ref = expert_activations   # keep alive for recon
+                else:
+                    _calib_ref = None
+                del expert_activations   # release GPU/CPU memory regardless
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1483,6 +1494,14 @@ def run_moe_target_pruning_mode(
                     _log_gpu_memory("after eval")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+
+                if inplace_prune:
+                    print(
+                        "\n  NOTE: model has been modified in-place. "
+                        "No additional target percentages will run from this "
+                        "model state. Use separate processes for each target."
+                    )
+                    break  # exit per-target loop — model is consumed
 
         except Exception as exc:
             logger.error("Failed %s: %s", model_name, exc, exc_info=True)

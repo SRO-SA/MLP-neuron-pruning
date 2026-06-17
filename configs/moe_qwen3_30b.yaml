@@ -30,7 +30,6 @@ scaling_models:
 
 # Target percentage of total expert MLP neurons to prune (globally)
 target_pruning_percents:
-  - 1.0
   - 2.0
 
 # Methods: pure_delete first (no calibration), then residual
