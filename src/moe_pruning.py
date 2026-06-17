@@ -74,7 +74,7 @@ MOE_MAIN_CSV_KEYS = [
     "n_routed_tokens",
     "skipped",
     "baseline_ppl", "compressed_ppl", "delta_ppl",
-    "relative_ppl_increase_percent",
+    "relative_delta_pct",
     "reconstruction_time_seconds", "peak_gpu_memory_MB",
     "dtype", "notes",
 ]
@@ -94,7 +94,7 @@ MOE_SUMMARY_CSV_KEYS = [
     "old_intermediate", "new_intermediate", "moe_channel_alignment",
     # PPL
     "baseline_ppl", "compressed_ppl", "delta_ppl",
-    "relative_ppl_increase_percent", "damage_reduction_percent",
+    "relative_delta_pct", "damage_reduction_percent",
     # Diagnostics
     "forward_check", "reconstruction_time_seconds",
     "peak_gpu_memory_MB", "gpu0_peak_mb", "gpu1_peak_mb",
@@ -1088,8 +1088,15 @@ def _print_per_layer_distribution(
     routed_counts: Dict,
     total_expert_neurons: int,
     chan_align: int,
+    pruning_mode: str = "packed_same_channel",
 ) -> None:
-    """Print a per-layer summary of channel pruning decisions."""
+    """Print a per-layer summary of channel pruning decisions.
+
+    Three cases:
+      packed_same_channel : (li, -1) key — physical reshape, old_i→new_i
+      per_expert_mask     : (li, ei) keys on packed layer — mask-only, old_i=new_i
+      unpacked per-expert : (li, ei) keys on individual modules — physical per-expert
+    """
     li_to_info = {i.layer_idx: i for i in moe_layers}
     pruned_layers = sorted(
         set(_li for (_li, _ei), plist in per_expert_pruned.items() if plist),
@@ -1098,23 +1105,59 @@ def _print_per_layer_distribution(
     if not pruned_layers:
         return
 
+    is_mask_only = (pruning_mode == "per_expert_mask")
+
     print("\n  Per-layer pruning distribution:")
-    hdr = (
-        f"    {'layer':>6}  {'n_exp':>6}  {'old_i':>6}  "
-        f"{'pruned':>7}  {'new_i':>6}  "
-        f"{'rem_en':>9}  {'lyr%':>6}  "
-        f"{'0rt':>4}  {'min_rt':>6}  {'med_rt':>6}  {'max_rt':>6}"
-    )
+    if is_mask_only:
+        hdr = (
+            f"    {'layer':>6}  {'n_exp':>6}  {'old_i':>6}  "
+            f"{'masked':>7}  {'new_i':>6}  {'shp':>5}  "
+            f"{'rem_en':>9}  {'lyr%':>6}  "
+            f"{'0rt':>4}  {'min_rt':>6}  {'med_rt':>6}  {'max_rt':>6}"
+        )
+    else:
+        hdr = (
+            f"    {'layer':>6}  {'n_exp':>6}  {'old_i':>6}  "
+            f"{'pruned':>7}  {'new_i':>6}  "
+            f"{'rem_en':>9}  {'lyr%':>6}  "
+            f"{'0rt':>4}  {'min_rt':>6}  {'med_rt':>6}  {'max_rt':>6}"
+        )
     print(hdr)
     print("    " + "─" * (len(hdr) - 4))
 
     for _li in pruned_layers:
         info  = li_to_info[_li]
         n_exp = info.num_experts
-        # packed → single (li, -1) key; unpacked → per-expert (li, ei) keys
         packed = info.experts_packed
 
-        if packed:
+        if is_mask_only and packed:
+            # per_expert_mask on packed layer: (li, ei) keys, no shape change.
+            # Aggregate across all experts in this layer.
+            total_masked = sum(
+                len(per_expert_pruned.get((_li, _ei), []))
+                for _ei in range(n_exp)
+            )
+            n_exp_masked = sum(
+                1 for _ei in range(n_exp)
+                if per_expert_pruned.get((_li, _ei), [])
+            )
+            old_i = expert_sizes.get((_li, 0), 0)
+            new_i = old_i   # mask-only: shape unchanged
+            rem   = total_masked   # each (ei, ch) pair = 1 expert-neuron
+            pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
+            cnts  = [routed_counts.get((_li, ej), 0) for ej in range(n_exp)]
+            z     = sum(1 for c in cnts if c == 0)
+            nz    = sorted(c for c in cnts if c > 0) or [0]
+            mn, mx, med = nz[0], nz[-1], nz[len(nz)//2]
+            print(
+                f"    {_li:>6}  {n_exp_masked:>6}  {old_i:>6}  "
+                f"{total_masked:>7}  {new_i:>6}  {'N':>5}  "
+                f"{rem:>9,}  {pct:>5.2f}%  "
+                f"{z:>4}  {mn:>6}  {med:>6}  {mx:>6}"
+            )
+
+        elif packed:
+            # packed_same_channel: (li, -1) key, physical shape change.
             key   = (_li, -1)
             plist = per_expert_pruned.get(key, [])
             old_i = expert_sizes.get(key, 0)
@@ -1122,7 +1165,6 @@ def _print_per_layer_distribution(
             new_i = old_i - n_pr
             rem   = n_pr * n_exp
             pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
-            # Routing stats
             cnts  = [routed_counts.get((_li, ej), 0) for ej in range(n_exp)]
             z     = sum(1 for c in cnts if c == 0)
             nz    = sorted(c for c in cnts if c > 0) or [0]
@@ -1133,8 +1175,9 @@ def _print_per_layer_distribution(
                 f"{rem:>9,}  {pct:>5.2f}%  "
                 f"{z:>4}  {mn:>6}  {med:>6}  {mx:>6}"
             )
+
         else:
-            # Print one line per pruned expert
+            # Unpacked: one line per pruned expert.
             for ei in range(n_exp):
                 key   = (_li, ei)
                 plist = per_expert_pruned.get(key, [])
@@ -1142,7 +1185,7 @@ def _print_per_layer_distribution(
                     continue
                 old_i = expert_sizes.get(key, 0)
                 n_pr  = len(plist)
-                new_i = old_i - n_pr
+                new_i = old_i - n_pr if not is_mask_only else old_i
                 rem   = n_pr
                 pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
                 n_rt  = routed_counts.get((_li, ei), 0)
@@ -1205,7 +1248,7 @@ def _print_moe_summary_table(
         bppl   = r.get("baseline_ppl", float("nan"))
         cppl   = r.get("compressed_ppl", float("nan"))
         dppl   = r.get("delta_ppl", float("nan"))
-        rel    = r.get("relative_ppl_increase_percent", float("nan"))
+        rel    = r.get("relative_delta_pct", float("nan"))
         fwd    = "OK" if r.get("forward_check", True) else "FAIL"
         st_s   = str(r.get("notes","") or "ok")[:16]
         try:
@@ -1665,6 +1708,7 @@ def run_moe_target_pruning_mode(
                 _print_per_layer_distribution(
                     per_expert_pruned, expert_sizes, moe_layers,
                     routed_counts, total_expert_neurons, chan_align,
+                    pruning_mode=pruning_mode,
                 )
 
                 # ── Release calibration caches before pruning ─────────────────
@@ -2063,7 +2107,7 @@ def run_moe_target_pruning_mode(
                                 "baseline_ppl":    round(baseline_ppl_per_ds[_ds], 4),
                                 "compressed_ppl":  float("nan"),
                                 "delta_ppl":       float("nan"),
-                                "relative_ppl_increase_percent": float("nan"),
+                                "relative_delta_pct": float("nan"),
                                 "damage_reduction_percent":       float("nan"),
                                 "forward_check":   False,
                                 "reconstruction_time_seconds": round(t_recon_total, 2),
@@ -2138,7 +2182,7 @@ def run_moe_target_pruning_mode(
                             "baseline_ppl":             round(cur_bppl, 4),
                             "compressed_ppl":           round(ppl, 4),
                             "delta_ppl":                round(delta, 4),
-                            "relative_ppl_increase_percent": round(rel, 4),
+                            "relative_delta_pct": round(rel, 4),
                             "damage_reduction_percent": float("nan"),
                             "forward_check":            True,
                             "reconstruction_time_seconds": round(t_recon_total, 2),

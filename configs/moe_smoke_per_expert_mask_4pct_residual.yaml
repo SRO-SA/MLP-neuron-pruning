@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------
+# Smoke: per_expert_mask + p95 + 4% + residual_mask_moe
+# n_eval: 64
+#
+#   python run_experiment.py \
+#       --config configs/moe_smoke_per_expert_mask_4pct_residual.yaml \
+#       --moe-target-pruning
+# ---------------------------------------------------------------
+
+device: "auto"
+scaling_dtype: "auto"
+
+scaling_models:
+  - "Qwen/Qwen3-30B-A3B"
+
+target_pruning_percents:
+  - 4
+
+scaling_methods:
+  - "residual_mask_moe"
+
+max_expert_frac: 0.20
+min_expert_tokens: 32
+reconstruction_eval_samples: 64
+max_seq_len: 512
+batch_size: 1
+
+eval_datasets:
+  - "wikitext2"
+use_fallback_corpus: false
+
+output_dir: "results"
+moe_smoke_test: true
+moe_inplace_pruning: true
+device_map: "auto"
+moe_channel_alignment: 16
+moe_same_channel_aggregation: "p95"
+moe_pruning_mode: "per_expert_mask"
+moe_selector: "rmsnorm_bound"
+
+residual_lambda: 1.0e-2
+residual_tau: 1.0
+min_residual_tokens_per_expert: 16
+solve_residual_on_cpu: true
+
+seed: 42
