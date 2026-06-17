@@ -30,6 +30,7 @@ scaling_models:
 
 # Target percentage of total expert MLP neurons to prune (globally)
 target_pruning_percents:
+  - 1.0
   - 2.0
 
 # Methods: pure_delete first (no calibration), then residual
@@ -64,6 +65,10 @@ moe_inplace_pruning: true
 
 # "auto" distributes across available GPUs; set "none" to disable
 device_map: "auto"
+
+# Packed MoE intermediate size must be divisible by this for grouped_mm
+# 64 = tensor-core friendly; 16 = minimum BF16 alignment
+moe_channel_alignment: 16
 
 # Reproducibility
 seed: 42
