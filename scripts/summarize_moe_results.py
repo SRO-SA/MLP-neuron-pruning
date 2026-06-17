@@ -3,16 +3,16 @@
 summarize_moe_results.py -- compact comparison table for MoE pruning CSVs.
 
 Usage:
-    python scripts/summarize_moe_results.py --glob "results/moe_target_pruning_*.csv"
+    python scripts/summarize_moe_results.py --glob "results/moe_*.csv"
     python scripts/summarize_moe_results.py --glob "results/moe_*.csv" --sort delta_ppl
-    python scripts/summarize_moe_results.py --glob "results/*.csv" --wide --no-residual
+    python scripts/summarize_moe_results.py --glob "results/moe_*.csv" --dataset wikitext2
+    python scripts/summarize_moe_results.py --glob "results/moe_*.csv" --method pure_delete --target 4 --n-eval 512
 
-Columns printed (one row per summary entry):
-    file  model  smoke_layers  total_moe_layers  target_pct  actual_pct
-    selector  aggregation_mode  pruning_mode  method  physical_pruning
-    shape_changed  baseline_ppl  compressed_ppl  delta_ppl  relative_delta_pct
-    forward_check  status
-    residual_stable_experts  residual_skipped_experts  residual_failed_experts
+Columns printed:
+    file  model  layers  target_pct  actual_pct  method  dataset  n_eval
+    baseline_ppl  compressed_ppl  delta_ppl  relative_delta_pct
+    expert_param_reduction_pct  total_model_param_reduction_pct
+    estimated_active_expert_flop_reduction_pct  forward_check  status
 
 If a CSV uses old column names they are transparently aliased.
 """
@@ -30,65 +30,60 @@ except ImportError:
 # -- Column aliases (old name -> canonical name) ------------------------------
 ALIASES = {
     "relative_ppl_increase_percent": "relative_delta_pct",
-    "smoke_layers_used":              "smoke_layers",
+    "smoke_layers_used":              "processed_moe_layers",
     "requested_target_pct":           "target_pct",
     "actual_pruning_percent":         "actual_pct",
     "notes":                          "status",
     "csv_file":                       "file",
+    "reconstruction_eval_samples":    "n_eval",
 }
 
-# Columns in exact display order (file always first)
+# Columns in exact display order
 DISPLAY_COLS = [
     "file",
     "model",
-    "smoke_layers",
-    "total_moe_layers",
+    "layers",               # processed_moe_layers / total_moe_layers
     "target_pct",
     "actual_pct",
-    "selector",
-    "aggregation_mode",
-    "pruning_mode",
     "method",
-    "physical_pruning",
-    "shape_changed",
+    "dataset",              # eval_dataset
+    "n_eval",
     "baseline_ppl",
     "compressed_ppl",
     "delta_ppl",
     "relative_delta_pct",
+    "expert_param_reduction_pct",
+    "total_model_param_reduction_pct",
+    "estimated_active_expert_flop_reduction_pct",
     "forward_check",
     "status",
-    "residual_stable_experts",
-    "residual_skipped_experts",
-    "residual_failed_experts",
 ]
 
 COL_WIDTHS = {
-    "file":                      36,
-    "model":                     26,
-    "smoke_layers":               8,
-    "total_moe_layers":           8,
-    "target_pct":                 7,
-    "actual_pct":                 8,
-    "selector":                  22,
-    "aggregation_mode":          10,
-    "pruning_mode":              22,
-    "method":                    18,
-    "physical_pruning":           8,
-    "shape_changed":              6,
-    "baseline_ppl":              10,
-    "compressed_ppl":            12,
-    "delta_ppl":                  9,
-    "relative_delta_pct":         9,
-    "forward_check":              5,
-    "status":                    18,
-    "residual_stable_experts":    7,
-    "residual_skipped_experts":   7,
-    "residual_failed_experts":    7,
+    "file":                                         36,
+    "model":                                        26,
+    "layers":                                        7,
+    "target_pct":                                    7,
+    "actual_pct":                                    8,
+    "method":                                       18,
+    "dataset":                                      10,
+    "n_eval":                                        6,
+    "baseline_ppl":                                 10,
+    "compressed_ppl":                               12,
+    "delta_ppl":                                     9,
+    "relative_delta_pct":                            9,
+    "expert_param_reduction_pct":                    9,
+    "total_model_param_reduction_pct":               9,
+    "estimated_active_expert_flop_reduction_pct":    9,
+    "forward_check":                                 5,
+    "status":                                       18,
 }
 
 FLOAT_COLS = {
     "baseline_ppl", "compressed_ppl", "delta_ppl", "relative_delta_pct",
     "target_pct", "actual_pct",
+    "expert_param_reduction_pct", "total_model_param_reduction_pct",
+    "estimated_active_expert_flop_reduction_pct",
 }
 
 
@@ -111,20 +106,48 @@ def load_csvs(pattern):
 
 
 def normalize_columns(df):
+    # Rename old -> canonical (skip if target already present)
     rename_map = {old: new for old, new in ALIASES.items()
                   if old in df.columns and new not in df.columns}
     df = df.rename(columns=rename_map)
+
+    # Unify eval_dataset -> dataset
+    if "eval_dataset" in df.columns and "dataset" not in df.columns:
+        df = df.rename(columns={"eval_dataset": "dataset"})
+
+    # Build layers display: "processed / total" or just total
+    if "processed_moe_layers" in df.columns and "total_moe_layers" in df.columns:
+        df["layers"] = (
+            df["processed_moe_layers"].fillna("?").astype(str)
+            + "/"
+            + df["total_moe_layers"].fillna("?").astype(str)
+        )
+    elif "total_moe_layers" in df.columns:
+        df["layers"] = df["total_moe_layers"].fillna("?").astype(str)
+    # else: "layers" will be filled with "-" by print_table
 
     # Keep only summary rows (those with baseline_ppl)
     if "baseline_ppl" in df.columns:
         df = df[df["baseline_ppl"].notna()].copy()
 
-    # Derive physical_pruning from pruning_mode if not present
-    if "physical_pruning" not in df.columns and "pruning_mode" in df.columns:
-        df["physical_pruning"] = df["pruning_mode"].apply(
-            lambda m: "yes" if str(m) == "packed_same_channel" else "no"
-        )
+    return df
 
+
+def apply_filters(df, args):
+    if args.dataset and "dataset" in df.columns:
+        df = df[df["dataset"].astype(str).str.lower() == args.dataset.lower()]
+    if args.method and "method" in df.columns:
+        df = df[df["method"].astype(str).str.lower() == args.method.lower()]
+    if args.target is not None and "target_pct" in df.columns:
+        df = df[df["target_pct"].apply(
+            lambda v: abs(float(v) - args.target) < 0.01
+            if pd.notna(v) else False
+        )]
+    if args.n_eval is not None and "n_eval" in df.columns:
+        df = df[df["n_eval"].apply(
+            lambda v: int(float(v)) == args.n_eval
+            if pd.notna(v) else False
+        )]
     return df
 
 
@@ -140,6 +163,12 @@ def format_val(col, val):
             return "{}{:.4f}".format(sign, v)
         except (ValueError, TypeError):
             return str(val)
+    if col in ("expert_param_reduction_pct", "total_model_param_reduction_pct",
+               "estimated_active_expert_flop_reduction_pct"):
+        try:
+            return "{:.3f}%".format(float(val))
+        except (ValueError, TypeError):
+            pass
     if col in FLOAT_COLS:
         try:
             return "{:.4f}".format(float(val))
@@ -192,15 +221,24 @@ def main():
                     help="Column to sort by (default: delta_ppl)")
     ap.add_argument("--wide", action="store_true",
                     help="Print full file paths instead of truncating")
-    ap.add_argument("--no-residual", action="store_true",
-                    help="Omit residual_* columns for narrower output")
+    # Filters
+    ap.add_argument("--dataset",
+                    help="Filter by dataset name (e.g. wikitext2 or c4)")
+    ap.add_argument("--method",
+                    help="Filter by method (e.g. pure_delete or residual_full_moe)")
+    ap.add_argument("--target", type=float, default=None,
+                    help="Filter by target pruning pct (e.g. 4.0)")
+    ap.add_argument("--n-eval", dest="n_eval", type=int, default=None,
+                    help="Filter by n_eval size (e.g. 512)")
     args = ap.parse_args()
 
     df = load_csvs(args.glob)
     df = normalize_columns(df)
+    df = apply_filters(df, args)
 
-    cols = [c for c in DISPLAY_COLS
-            if not (args.no_residual and c.startswith("residual_"))]
+    if df.empty:
+        print("No rows match the given filters.")
+        return
 
     if args.sort in df.columns:
         df = df.sort_values(args.sort, na_position="last")
@@ -208,7 +246,7 @@ def main():
         print("  [WARN] Sort column '{}' not found; using default order.".format(args.sort),
               file=sys.stderr)
 
-    print_table(df, cols, wide=args.wide)
+    print_table(df, DISPLAY_COLS, wide=args.wide)
 
 
 if __name__ == "__main__":
