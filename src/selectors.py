@@ -43,9 +43,9 @@ def _get_mlp_weights(layer):
     """Return (gate_w, up_w, down_w) as float32 CPU tensors."""
     from .model_utils import get_mlp_weights
     w = get_mlp_weights(layer)
-    gate = w["gate_proj"].detach().float().cpu()  # [d_ff, d_model]
-    up   = w["up_proj"].detach().float().cpu()    # [d_ff, d_model]
-    down = w["down_proj"].detach().float().cpu()  # [d_model, d_ff]
+    gate = w["gate"].detach().float().cpu()   # [d_ff, d_model]
+    up   = w["up"].detach().float().cpu()     # [d_ff, d_model]
+    down = w["down"].detach().float().cpu()   # [d_model, d_ff]
     return gate, up, down
 
 
@@ -98,9 +98,9 @@ def compute_activation_scores(
 
     from .model_utils import get_mlp_weights
     w    = get_mlp_weights(layer)
-    gate = w["gate_proj"]   # [d_ff, d_model]
-    up   = w["up_proj"]     # [d_ff, d_model]
-    down = w["down_proj"]   # [d_model, d_ff]
+    gate = w["gate"]   # [d_ff, d_model]
+    up   = w["up"]     # [d_ff, d_model]
+    down = w["down"]   # [d_model, d_ff]
 
     # Move weights and inputs to device for speed
     gate = gate.to(device=device, dtype=torch.float32)
@@ -260,8 +260,7 @@ def gather_scores_for_selector(
                     "gather_scores_for_selector: layer %d selector '%s' failed: %s",
                     li, selector_name, exc,
                 )
-                # Fall back to zeros (layer will be skipped by cap logic)
-                from .model_utils import get_mlp_weights
-                d_ff = get_mlp_weights(lyr)["d_ff"]
-                scores.append(torch.zeros(d_ff))
+                raise RuntimeError(
+                    f"Selector '{selector_name}' failed on layer {li}: {exc}"
+                ) from exc
     return scores

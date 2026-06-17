@@ -782,126 +782,212 @@ def run_target_pruning_mode(
                     all_layer_results.extend(layer_rows)
                     _flush_csv(layer_csv_path, layer_rows, PER_LAYER_CSV_KEYS)
 
-                # ─────────────────────────────────────────────────────────────
-                # Row factories and PPL helper
-                # ─────────────────────────────────────────────────────────────
-                def _base_row(method_: str, ds_name_: str, **extra) -> Dict:
-                    """Build a base result row for (method, dataset)."""
-                    r: Dict = {
-                        "model":                    model_name,
-                        "target_pruning_percent":   target_pct,
-                        "eval_dataset":             ds_name_,
-                        "selector":                 selector_name,
-                        "actual_pruned_neurons":    actual_pruned,
-                        "total_mlp_neurons":        total_mlp,
-                        "actual_pruning_percent":   round(actual_pct, 4),
-                        "method":                   method_,
-                        "baseline_ppl":             round(
-                            baseline_ppl_per_ds.get(ds_name_, baseline_ppl), 4),
-                        "dtype":                    dtype_str,
-                        "calibration_num_samples":  n_calib_samples,
-                        "eval_num_samples":         len(all_eval_corpora[ds_name_]),
-                        "calibration_num_tokens":   n_calib_tokens,
-                        "eval_num_tokens":          (
-                            len(all_eval_corpora[ds_name_]) * max_seq),
-                        "cap_hit_layers_count":     len(cap_hits),
-                        "target_reached":           sel_info["target_reached"],
-                        "notes":                    "",
+                    # ─────────────────────────────────────────────────────────────
+                    # Row factories and PPL helper
+                    # ─────────────────────────────────────────────────────────────
+                    def _base_row(method_: str, ds_name_: str, **extra) -> Dict:
+                        """Build a base result row for (method, dataset)."""
+                        r: Dict = {
+                            "model":                    model_name,
+                            "target_pruning_percent":   target_pct,
+                            "eval_dataset":             ds_name_,
+                            "selector":                 selector_name,
+                            "actual_pruned_neurons":    actual_pruned,
+                            "total_mlp_neurons":        total_mlp,
+                            "actual_pruning_percent":   round(actual_pct, 4),
+                            "method":                   method_,
+                            "baseline_ppl":             round(
+                                baseline_ppl_per_ds.get(ds_name_, baseline_ppl), 4),
+                            "dtype":                    dtype_str,
+                            "calibration_num_samples":  n_calib_samples,
+                            "eval_num_samples":         len(all_eval_corpora[ds_name_]),
+                            "calibration_num_tokens":   n_calib_tokens,
+                            "eval_num_tokens":          (
+                                len(all_eval_corpora[ds_name_]) * max_seq),
+                            "cap_hit_layers_count":     len(cap_hits),
+                            "target_reached":           sel_info["target_reached"],
+                            "notes":                    "",
+                        }
+                        r.update(extra)
+                        return r
+
+                    def _fill_ppl(row: Dict, m, ds_name_: str) -> Tuple[float, float]:
+                        """Evaluate m on dataset ds_name_; populate compression cols."""
+                        cur_texts_   = all_eval_corpora[ds_name_]
+                        cur_bppl_    = baseline_ppl_per_ds.get(ds_name_, baseline_ppl)
+                        fp_ok    = verify_forward_pass(m, tokenizer, device)
+                        ppl_info = evaluate_perplexity(
+                            m, tokenizer, texts=cur_texts_,
+                            max_seq_len=max_seq, batch_size=batch_sz, device=device,
+                        )
+                        ppl   = ppl_info["perplexity"]
+                        delta = ppl - cur_bppl_
+                        pp    = count_parameters(m)
+                        pf    = estimate_mlp_flops(m, seq_len=max_seq)
+
+                        mlp_par_red = round(
+                            100 * (1 - pp["mlp"] / baseline_params["mlp"]), 4)
+                        mlp_flp_red = round(
+                            100 * (1 - pf["total_flops"]
+                                   / baseline_flops["total_flops"]), 4)
+                        total_par_red = round(
+                            100 * (1 - pp["total"] / baseline_params["total"]), 4)
+
+                        # Attention FLOPs ≈ 8 * seq * d_model^2 * n_layers (approx)
+                        _n_ly  = getattr(cfg_m, "num_hidden_layers", 1)
+                        _d_m   = getattr(cfg_m, "hidden_size", 1)
+                        _attn  = 8 * max_seq * (_d_m ** 2) * _n_ly
+                        _tb    = baseline_flops["total_flops"] + _attn
+                        _mlp_s = baseline_flops["total_flops"] - pf["total_flops"]
+                        est_tot_flp_red = round(
+                            100 * _mlp_s / _tb if _tb > 0 else 0.0, 4)
+
+                        row.update({
+                            "compressed_ppl":                round(ppl,   4),
+                            "delta_ppl":                     round(delta, 4),
+                            "relative_ppl_increase_percent": round(
+                                100.0 * delta / cur_bppl_, 4),
+                            "mlp_channel_pruning_percent":   round(actual_pct, 4),
+                            "mlp_param_reduction_percent":   mlp_par_red,
+                            "mlp_flop_reduction_percent":    mlp_flp_red,
+                            "total_model_param_reduction_percent":       total_par_red,
+                            "estimated_total_forward_flop_reduction_percent":
+                                                             est_tot_flp_red,
+                            "notes": row.get("notes", "") or ("" if fp_ok
+                                                              else "forward_pass_failed"),
+                        })
+                        return round(ppl, 4), round(delta, 4)
+
+                    # ── Method loop (prune/reconstruct once; eval on all datasets) ──
+                    all_target_rows: List[Dict] = []
+                    # dppl_delete per dataset (needed for damage_reduction of resid methods)
+                    dppl_delete_per_ds: Dict[str, Optional[float]] = {
+                        ds: None for ds in EVAL_DATASETS
                     }
-                    r.update(extra)
-                    return r
 
-                def _fill_ppl(row: Dict, m, ds_name_: str) -> Tuple[float, float]:
-                    """Evaluate m on dataset ds_name_; populate compression cols."""
-                    cur_texts_   = all_eval_corpora[ds_name_]
-                    cur_bppl_    = baseline_ppl_per_ds.get(ds_name_, baseline_ppl)
-                    fp_ok    = verify_forward_pass(m, tokenizer, device)
-                    ppl_info = evaluate_perplexity(
-                        m, tokenizer, texts=cur_texts_,
-                        max_seq_len=max_seq, batch_size=batch_sz, device=device,
-                    )
-                    ppl   = ppl_info["perplexity"]
-                    delta = ppl - cur_bppl_
-                    pp    = count_parameters(m)
-                    pf    = estimate_mlp_flops(m, seq_len=max_seq)
+                    for method in METHODS:
 
-                    mlp_par_red = round(
-                        100 * (1 - pp["mlp"] / baseline_params["mlp"]), 4)
-                    mlp_flp_red = round(
-                        100 * (1 - pf["total_flops"]
-                               / baseline_flops["total_flops"]), 4)
-                    total_par_red = round(
-                        100 * (1 - pp["total"] / baseline_params["total"]), 4)
+                        # ── pure_delete ──────────────────────────────────────────
+                        if method == "pure_delete":
+                            print(f"    [pure_delete] pruning ... ", end="", flush=True)
+                            pruned_model = None
+                            try:
+                                pruned_model, _ = prune_model_by_layer_indices(
+                                    model, prune_per_layer,
+                                    label=f"tp_del_{target_pct}",
+                                )
+                                # Physical shape verification (once per pruning)
+                                _n_rm = _verify_pruned_shapes(
+                                    layers,
+                                    get_transformer_layers(pruned_model),
+                                    prune_per_layer,
+                                    label=f"pure_delete/{model_name}/{target_pct}%",
+                                )
+                                print(f"shape OK ({_n_rm:,} removed)")
+                                # Evaluate on each dataset
+                                for _ds in EVAL_DATASETS:
+                                    row_del = _base_row("pure_delete", _ds)
+                                    _, _dppl = _fill_ppl(row_del, pruned_model, _ds)
+                                    row_del["pure_delete_delta_ppl"]    = _dppl
+                                    row_del["damage_reduction_percent"] = float("nan")
+                                    dppl_delete_per_ds[_ds] = _dppl
+                                    print(
+                                        f"      [{_ds}] PPL={row_del['compressed_ppl']:.4f}"
+                                        f"  dPPL={_dppl:+.4f}"
+                                        f"  rel={row_del['relative_ppl_increase_percent']:+.2f}%"
+                                    )
+                                    all_target_rows.append(row_del)
+                            except Exception as exc:
+                                logger.error("pure_delete %s t=%.1f%%: %s",
+                                             model_name, target_pct, exc, exc_info=True)
+                                for _ds in EVAL_DATASETS:
+                                    r = _base_row("pure_delete", _ds)
+                                    r["notes"] = f"ERROR: {exc}"
+                                    all_target_rows.append(r)
+                                print(f"FAILED: {exc}")
+                            finally:
+                                if pruned_model is not None:
+                                    del pruned_model
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            continue
 
-                    # Attention FLOPs ≈ 8 * seq * d_model^2 * n_layers (approx)
-                    _n_ly  = getattr(cfg_m, "num_hidden_layers", 1)
-                    _d_m   = getattr(cfg_m, "hidden_size", 1)
-                    _attn  = 8 * max_seq * (_d_m ** 2) * _n_ly
-                    _tb    = baseline_flops["total_flops"] + _attn
-                    _mlp_s = baseline_flops["total_flops"] - pf["total_flops"]
-                    est_tot_flp_red = round(
-                        100 * _mlp_s / _tb if _tb > 0 else 0.0, 4)
+                        # ── residual methods ─────────────────────────────────────
+                        top_k = _parse_top_k(method)
+                        if top_k == -1:
+                            logger.warning("Unknown method '%s' -- skipping", method)
+                            continue
+                        if train_r is None or heldout_r is None:
+                            logger.error(
+                                "Calibration inputs needed for '%s' but missing", method
+                            )
+                            continue
 
-                    row.update({
-                        "compressed_ppl":                round(ppl,   4),
-                        "delta_ppl":                     round(delta, 4),
-                        "relative_ppl_increase_percent": round(
-                            100.0 * delta / cur_bppl_, 4),
-                        "mlp_channel_pruning_percent":   round(actual_pct, 4),
-                        "mlp_param_reduction_percent":   mlp_par_red,
-                        "mlp_flop_reduction_percent":    mlp_flp_red,
-                        "total_model_param_reduction_percent":       total_par_red,
-                        "estimated_total_forward_flop_reduction_percent":
-                                                         est_tot_flp_red,
-                        "notes": row.get("notes", "") or ("" if fp_ok
-                                                          else "forward_pass_failed"),
-                    })
-                    return round(ppl, 4), round(delta, 4)
-
-                # ── Method loop (prune/reconstruct once; eval on all datasets) ──
-                all_target_rows: List[Dict] = []
-                # dppl_delete per dataset (needed for damage_reduction of resid methods)
-                dppl_delete_per_ds: Dict[str, Optional[float]] = {
-                    ds: None for ds in EVAL_DATASETS
-                }
-
-                for method in METHODS:
-
-                    # ── pure_delete ──────────────────────────────────────────
-                    if method == "pure_delete":
-                        print(f"    [pure_delete] pruning ... ", end="", flush=True)
+                        print(f"    [{method}] reconstructing ... ", end="", flush=True)
                         pruned_model = None
                         try:
-                            pruned_model, _ = prune_model_by_layer_indices(
-                                model, prune_per_layer,
-                                label=f"tp_del_{target_pct}",
+                            pruned_model, build_info = apply_residual_down_reconstruction_timed(
+                                model, prune_per_layer, keep_per_layer,
+                                train_r, heldout_r,
+                                ridge_lambda=BEST_RESIDUAL_LAM,
+                                tau=BEST_RESIDUAL_TAU,
+                                top_k=top_k,
                             )
-                            # Physical shape verification (once per pruning)
-                            _n_rm = _verify_pruned_shapes(
-                                layers,
-                                get_transformer_layers(pruned_model),
-                                prune_per_layer,
-                                label=f"pure_delete/{model_name}/{target_pct}%",
-                            )
-                            print(f"shape OK ({_n_rm:,} removed)")
+                            n_s = build_info["n_stable_layers"]
+                            n_u = build_info["n_unstable_layers"]
+                            t_s   = build_info.get("total_recon_time_s", float("nan"))
+                            gb_mb = build_info.get("peak_gpu_mb", float("nan"))
+                            print(f"done  t={t_s:.1f}s  stable={n_s}/{n_s+n_u}")
+
+                            if build_info.get("all_unstable", False):
+                                for _ds in EVAL_DATASETS:
+                                    r = _base_row(method, _ds,
+                                                  ridge_lambda=BEST_RESIDUAL_LAM,
+                                                  tau=BEST_RESIDUAL_TAU)
+                                    r["n_stable_layers"]             = n_s
+                                    r["n_unstable_layers"]           = n_u
+                                    r["reconstruction_time_seconds"] = t_s
+                                    r["peak_gpu_memory_MB"]          = gb_mb
+                                    r["notes"] = "SKIPPED_PPL:all_layers_unstable"
+                                    all_target_rows.append(r)
+                                continue
+
                             # Evaluate on each dataset
                             for _ds in EVAL_DATASETS:
-                                row_del = _base_row("pure_delete", _ds)
-                                _, _dppl = _fill_ppl(row_del, pruned_model, _ds)
-                                row_del["pure_delete_delta_ppl"]    = _dppl
-                                row_del["damage_reduction_percent"] = float("nan")
-                                dppl_delete_per_ds[_ds] = _dppl
+                                row_res = _base_row(method, _ds,
+                                                    ridge_lambda=BEST_RESIDUAL_LAM,
+                                                    tau=BEST_RESIDUAL_TAU)
+                                row_res["n_stable_layers"]             = n_s
+                                row_res["n_unstable_layers"]           = n_u
+                                row_res["reconstruction_time_seconds"] = t_s
+                                row_res["peak_gpu_memory_MB"]          = gb_mb
+                                _, dppl_res = _fill_ppl(row_res, pruned_model, _ds)
+
+                                # Damage reduction (per-dataset baseline)
+                                dppl_del = dppl_delete_per_ds.get(_ds)
+                                if dppl_del is not None and abs(dppl_del) >= 0.05:
+                                    dmg = round(
+                                        100.0 * (dppl_del - dppl_res) / dppl_del, 2)
+                                    row_res["damage_reduction_percent"] = dmg
+                                    row_res["pure_delete_delta_ppl"]    = round(dppl_del, 4)
+                                else:
+                                    row_res["damage_reduction_percent"] = float("nan")
+
+                                dm   = row_res.get("damage_reduction_percent", float("nan"))
+                                dm_s = f"  dmg_red={dm:+.1f}%" if dm == dm else ""
                                 print(
-                                    f"      [{_ds}] PPL={row_del['compressed_ppl']:.4f}"
-                                    f"  dPPL={_dppl:+.4f}"
-                                    f"  rel={row_del['relative_ppl_increase_percent']:+.2f}%"
+                                    f"      [{_ds}] PPL={row_res['compressed_ppl']:.4f}"
+                                    f"  dPPL={dppl_res:+.4f}"
+                                    f"  rel={row_res['relative_ppl_increase_percent']:+.2f}%"
+                                    + dm_s
                                 )
-                                all_target_rows.append(row_del)
+                                all_target_rows.append(row_res)
+
                         except Exception as exc:
-                            logger.error("pure_delete %s t=%.1f%%: %s",
-                                         model_name, target_pct, exc, exc_info=True)
+                            logger.error("[%s] %s t=%.1f%%: %s",
+                                         method, model_name, target_pct, exc, exc_info=True)
                             for _ds in EVAL_DATASETS:
-                                r = _base_row("pure_delete", _ds)
+                                r = _base_row(method, _ds)
                                 r["notes"] = f"ERROR: {exc}"
                                 all_target_rows.append(r)
                             print(f"FAILED: {exc}")
@@ -910,92 +996,6 @@ def run_target_pruning_mode(
                                 del pruned_model
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                        continue
-
-                    # ── residual methods ─────────────────────────────────────
-                    top_k = _parse_top_k(method)
-                    if top_k == -1:
-                        logger.warning("Unknown method '%s' -- skipping", method)
-                        continue
-                    if train_r is None or heldout_r is None:
-                        logger.error(
-                            "Calibration inputs needed for '%s' but missing", method
-                        )
-                        continue
-
-                    print(f"    [{method}] reconstructing ... ", end="", flush=True)
-                    pruned_model = None
-                    try:
-                        pruned_model, build_info = apply_residual_down_reconstruction_timed(
-                            model, prune_per_layer, keep_per_layer,
-                            train_r, heldout_r,
-                            ridge_lambda=BEST_RESIDUAL_LAM,
-                            tau=BEST_RESIDUAL_TAU,
-                            top_k=top_k,
-                        )
-                        n_s = build_info["n_stable_layers"]
-                        n_u = build_info["n_unstable_layers"]
-                        t_s   = build_info.get("total_recon_time_s", float("nan"))
-                        gb_mb = build_info.get("peak_gpu_mb", float("nan"))
-                        print(f"done  t={t_s:.1f}s  stable={n_s}/{n_s+n_u}")
-
-                        if build_info.get("all_unstable", False):
-                            for _ds in EVAL_DATASETS:
-                                r = _base_row(method, _ds,
-                                              ridge_lambda=BEST_RESIDUAL_LAM,
-                                              tau=BEST_RESIDUAL_TAU)
-                                r["n_stable_layers"]             = n_s
-                                r["n_unstable_layers"]           = n_u
-                                r["reconstruction_time_seconds"] = t_s
-                                r["peak_gpu_memory_MB"]          = gb_mb
-                                r["notes"] = "SKIPPED_PPL:all_layers_unstable"
-                                all_target_rows.append(r)
-                            continue
-
-                        # Evaluate on each dataset
-                        for _ds in EVAL_DATASETS:
-                            row_res = _base_row(method, _ds,
-                                                ridge_lambda=BEST_RESIDUAL_LAM,
-                                                tau=BEST_RESIDUAL_TAU)
-                            row_res["n_stable_layers"]             = n_s
-                            row_res["n_unstable_layers"]           = n_u
-                            row_res["reconstruction_time_seconds"] = t_s
-                            row_res["peak_gpu_memory_MB"]          = gb_mb
-                            _, dppl_res = _fill_ppl(row_res, pruned_model, _ds)
-
-                            # Damage reduction (per-dataset baseline)
-                            dppl_del = dppl_delete_per_ds.get(_ds)
-                            if dppl_del is not None and abs(dppl_del) >= 0.05:
-                                dmg = round(
-                                    100.0 * (dppl_del - dppl_res) / dppl_del, 2)
-                                row_res["damage_reduction_percent"] = dmg
-                                row_res["pure_delete_delta_ppl"]    = round(dppl_del, 4)
-                            else:
-                                row_res["damage_reduction_percent"] = float("nan")
-
-                            dm   = row_res.get("damage_reduction_percent", float("nan"))
-                            dm_s = f"  dmg_red={dm:+.1f}%" if dm == dm else ""
-                            print(
-                                f"      [{_ds}] PPL={row_res['compressed_ppl']:.4f}"
-                                f"  dPPL={dppl_res:+.4f}"
-                                f"  rel={row_res['relative_ppl_increase_percent']:+.2f}%"
-                                + dm_s
-                            )
-                            all_target_rows.append(row_res)
-
-                    except Exception as exc:
-                        logger.error("[%s] %s t=%.1f%%: %s",
-                                     method, model_name, target_pct, exc, exc_info=True)
-                        for _ds in EVAL_DATASETS:
-                            r = _base_row(method, _ds)
-                            r["notes"] = f"ERROR: {exc}"
-                            all_target_rows.append(r)
-                        print(f"FAILED: {exc}")
-                    finally:
-                        if pruned_model is not None:
-                            del pruned_model
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
 
                     # Flush after every (model, target_pct, selector)
                     _flush_csv(main_csv_path, all_target_rows, MAIN_CSV_KEYS)
@@ -1028,14 +1028,14 @@ def run_target_pruning_mode(
 
     # ── Final summary table ───────────────────────────────────────────────────
     ppl_rows = [r for r in all_results if "compressed_ppl" in r]
-    W = 172
+    W = 192
     print(f"\n{'=' * W}")
     print(f"TARGET-PRUNING SUMMARY  (n_eval={n_eval_actual})")
     print(f"{'─' * W}")
     hdr = (
         f"  {'model':>22}  {'tgt%':>5}  {'act%':>6}  {'pruned':>8}  "
         f"{'mlp_par%':>8}  {'tot_par%':>8}  {'mlp_flp%':>8}  {'est_flp%':>8}  "
-        f"{'method':>30}  "
+        f"{'selector':>18}  {'method':>30}  "
         f"{'bPPL':>8}  {'PPL':>9}  {'dPPL':>9}  {'rel%':>7}  {'dmg_red':>9}  "
         f"{'t_s':>6}  {'gpu_MB':>7}"
     )
@@ -1068,6 +1068,7 @@ def run_target_pruning_mode(
             f"  {str(r.get('model',''))[-22:]:>22}  "
             f"{float(r.get('target_pruning_percent', 0)):>5.1f}  {act_s}  "
             f"{str(n_prn):>8}  {par_s}  {tpar_s}  {flp_s}  {eflp_s}  "
+            f"{str(r.get('selector',''))[:18]:>18}  "
             f"{str(r.get('method',''))[:30]:>30}  "
             f"{float(r.get('baseline_ppl', 0)):>8.4f}  "
             f"{float(r.get('compressed_ppl', 0)):>9.4f}  "
