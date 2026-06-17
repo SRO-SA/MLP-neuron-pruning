@@ -69,5 +69,18 @@ device_map: "auto"
 # 64 = tensor-core friendly; 16 = minimum BF16 alignment
 moe_channel_alignment: 16
 
+# How to aggregate per-expert scores for packed same-channel pruning.
+# p95 / max = conservative (prune only channels weak across most experts).
+# router_weighted_mean = route-traffic weighted average. mean = plain average.
+# Recommended: p95 or max (safer than mean for same-channel physical pruning).
+moe_same_channel_aggregation: "p95"
+
+# Pruning mode:
+#   packed_same_channel : physical pruning (removes channels from packed tensors,
+#                         requires same channel across all experts per layer)
+#   per_expert_mask     : mask-only (zeros weights, no shape change,
+#                         true per-expert selection — tests mathematical validity)
+moe_pruning_mode: "packed_same_channel"
+
 # Reproducibility
 seed: 42

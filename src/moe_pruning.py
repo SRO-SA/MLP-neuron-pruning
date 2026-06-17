@@ -80,16 +80,26 @@ MOE_MAIN_CSV_KEYS = [
 ]
 
 MOE_SUMMARY_CSV_KEYS = [
+    # Identity
     "model", "target_pruning_percent", "eval_dataset",
-    "selector", "method",
+    "pruning_mode", "aggregation_mode", "selector", "method",
+    "physical_pruning", "speedup_expected", "same_channel_across_experts",
+    # Layer counts
+    "smoke_layers_used", "total_moe_layers",
+    # Accounting
     "total_experts", "experts_pruned", "experts_skipped",
     "total_mlp_neurons_before", "total_mlp_neurons_pruned",
-    "actual_pruning_percent",
+    "requested_target_pct", "actual_pruning_percent",
+    "selected_layer_channels", "removed_expert_neurons",
+    "old_intermediate", "new_intermediate", "moe_channel_alignment",
+    # PPL
     "baseline_ppl", "compressed_ppl", "delta_ppl",
-    "relative_ppl_increase_percent",
-    "damage_reduction_percent",
-    "reconstruction_time_seconds", "peak_gpu_memory_MB",
-    "dtype", "notes",
+    "relative_ppl_increase_percent", "damage_reduction_percent",
+    # Diagnostics
+    "forward_check", "reconstruction_time_seconds",
+    "peak_gpu_memory_MB", "gpu0_peak_mb", "gpu1_peak_mb",
+    "time_sec", "dtype", "notes",
+    "csv_path", "json_path",
 ]
 
 
@@ -845,6 +855,175 @@ def apply_expert_residual_reconstruction(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _aggregate_expert_scores(
+    stacked: "torch.Tensor",
+    aggregation: str,
+    routing_weights: "Optional[torch.Tensor]" = None,
+) -> "torch.Tensor":
+    """Aggregate [n_experts, d_ff] per-expert scores → [d_ff] layer score.
+
+    aggregation options
+    -------------------
+    p95               : 95th-percentile over experts (conservative — channel
+                        must be weak for 95% of experts to be pruned)
+    max               : maximum over experts (even more conservative)
+    router_weighted_mean : route-traffic-weighted average
+    mean              : plain average (fallback / least conservative)
+    """
+    if aggregation == "max":
+        return stacked.max(dim=0).values
+    if aggregation == "p95":
+        return torch.quantile(stacked.float(), 0.95, dim=0)
+    if aggregation == "router_weighted_mean" and routing_weights is not None:
+        w = routing_weights.float()
+        total = w.sum()
+        if total > 0:
+            w = w / total
+        else:
+            w = torch.ones_like(w) / max(len(w), 1)
+        return (stacked.float() * w.unsqueeze(1)).sum(dim=0)
+    # fallback: plain mean
+    return stacked.float().mean(dim=0)
+
+
+def _print_per_layer_distribution(
+    per_expert_pruned: Dict,
+    expert_sizes: Dict,
+    moe_layers: List,
+    routed_counts: Dict,
+    total_expert_neurons: int,
+    chan_align: int,
+) -> None:
+    """Print a per-layer summary of channel pruning decisions."""
+    li_to_info = {i.layer_idx: i for i in moe_layers}
+    pruned_layers = sorted(
+        set(_li for (_li, _ei), plist in per_expert_pruned.items() if plist),
+        key=lambda x: x,
+    )
+    if not pruned_layers:
+        return
+
+    print("\n  Per-layer pruning distribution:")
+    hdr = (
+        f"    {'layer':>6}  {'n_exp':>6}  {'old_i':>6}  "
+        f"{'pruned':>7}  {'new_i':>6}  "
+        f"{'rem_en':>9}  {'lyr%':>6}  "
+        f"{'0rt':>4}  {'min_rt':>6}  {'med_rt':>6}  {'max_rt':>6}"
+    )
+    print(hdr)
+    print("    " + "─" * (len(hdr) - 4))
+
+    for _li in pruned_layers:
+        info  = li_to_info[_li]
+        n_exp = info.num_experts
+        # packed → single (li, -1) key; unpacked → per-expert (li, ei) keys
+        packed = info.experts_packed
+
+        if packed:
+            key   = (_li, -1)
+            plist = per_expert_pruned.get(key, [])
+            old_i = expert_sizes.get(key, 0)
+            n_pr  = len(plist)
+            new_i = old_i - n_pr
+            rem   = n_pr * n_exp
+            pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
+            # Routing stats
+            cnts  = [routed_counts.get((_li, ej), 0) for ej in range(n_exp)]
+            z     = sum(1 for c in cnts if c == 0)
+            nz    = sorted(c for c in cnts if c > 0) or [0]
+            mn, mx, med = nz[0], nz[-1], nz[len(nz)//2]
+            print(
+                f"    {_li:>6}  {n_exp:>6}  {old_i:>6}  "
+                f"{n_pr:>7}  {new_i:>6}  "
+                f"{rem:>9,}  {pct:>5.2f}%  "
+                f"{z:>4}  {mn:>6}  {med:>6}  {mx:>6}"
+            )
+        else:
+            # Print one line per pruned expert
+            for ei in range(n_exp):
+                key   = (_li, ei)
+                plist = per_expert_pruned.get(key, [])
+                if not plist:
+                    continue
+                old_i = expert_sizes.get(key, 0)
+                n_pr  = len(plist)
+                new_i = old_i - n_pr
+                rem   = n_pr
+                pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
+                n_rt  = routed_counts.get((_li, ei), 0)
+                print(
+                    f"    {_li:>6}  {1:>6}  {old_i:>6}  "
+                    f"{n_pr:>7}  {new_i:>6}  "
+                    f"{rem:>9,}  {pct:>5.2f}%  "
+                    f"{'n/a':>4}  {n_rt:>6}  {n_rt:>6}  {n_rt:>6}"
+                )
+    print()
+
+
+def _print_moe_summary_table(
+    all_results: List[Dict],
+    n_smoke_layers: int,
+    total_moe_layers: int,
+    main_csv_path: str,
+    json_path: str,
+) -> None:
+    """Print final MoE experiment summary table."""
+    rows = [r for r in all_results if "baseline_ppl" in r and "model" in r]
+    if not rows:
+        return
+
+    W = 170
+    print(f"\n{'=' * W}")
+    print("MOE EXPERIMENT SUMMARY")
+    print(f"{'=' * W}")
+
+    hdr = (
+        f"  {'model':>22}  {'s/t':>5}  {'tgt%':>5}  {'act%':>6}  "
+        f"{'sel_ch':>6}  {'rem_en':>9}  {'old_i':>5}  {'new_i':>5}  "
+        f"{'aln':>3}  {'agg':>10}  {'p_mode':>22}  {'method':>11}  "
+        f"{'dataset':>10}  {'bPPL':>8}  {'cPPL':>9}  {'dPPL':>8}  {'rel%':>7}  "
+        f"{'fwd':>4}  {'status':>16}"
+    )
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+
+    for r in rows:
+        mdl   = str(r.get("model",""))[-22:]
+        st    = f"{n_smoke_layers}/{total_moe_layers}"
+        tgt   = r.get("requested_target_pct", r.get("target_pruning_percent", 0.0))
+        act   = r.get("actual_pruning_percent", 0.0)
+        sel   = r.get("selected_layer_channels", "?")
+        rem   = r.get("removed_expert_neurons", "?")
+        old_i = r.get("old_intermediate", "?")
+        new_i = r.get("new_intermediate", "?")
+        aln   = r.get("moe_channel_alignment", "?")
+        agg   = str(r.get("aggregation_mode",""))[:10]
+        pm    = str(r.get("pruning_mode",""))[:22]
+        meth  = str(r.get("method",""))[:11]
+        ds    = str(r.get("eval_dataset",""))[:10]
+        bppl  = r.get("baseline_ppl", float("nan"))
+        cppl  = r.get("compressed_ppl", float("nan"))
+        dppl  = r.get("delta_ppl", float("nan"))
+        rel   = r.get("relative_ppl_increase_percent", float("nan"))
+        fwd   = "OK" if r.get("forward_check", True) else "FAIL"
+        st_s  = str(r.get("notes","") or "ok")[:16]
+        try:
+            print(
+                f"  {mdl:>22}  {st:>5}  {tgt:>5.1f}  {act:>6.3f}  "
+                f"{str(sel):>6}  {str(rem):>9}  {str(old_i):>5}  {str(new_i):>5}  "
+                f"{str(aln):>3}  {agg:>10}  {pm:>22}  {meth:>11}  "
+                f"{ds:>10}  {bppl:>8.4f}  {cppl:>9.4f}  {dppl:>8.4f}  {rel:>7.2f}  "
+                f"{fwd:>4}  {st_s:>16}"
+            )
+        except (TypeError, ValueError):
+            print(f"  {mdl}  (row format error)")
+
+    print(f"{'=' * W}")
+    print(f"  CSV : {main_csv_path}")
+    print(f"  JSON: {json_path}")
+    print(f"{'=' * W}\n")
+
+
 def _log_gpu_memory(label: str = "") -> None:
     """Log current/peak GPU memory for all visible devices."""
     if not torch.cuda.is_available():
@@ -923,6 +1102,8 @@ def run_moe_target_pruning_mode(
     inplace_prune  = bool(cfg.get("moe_inplace_pruning", True))
     device_map_cfg = str(cfg.get("device_map", "auto"))
     chan_align     = int(cfg.get("moe_channel_alignment", 16))
+    chan_agg       = str(cfg.get("moe_same_channel_aggregation", "p95"))
+    pruning_mode   = str(cfg.get("moe_pruning_mode", "packed_same_channel"))
     EVAL_DATASETS  = [str(d) for d in (
         eval_datasets_override or cfg.get("eval_datasets", ["wikitext2"]))]
 
@@ -936,6 +1117,8 @@ def run_moe_target_pruning_mode(
     print(f"  max_expert_frac: {max_exp_frac:.0%}")
     print(f"  min_exp_tokens : {min_exp_tokens}")
     print(f"  chan_alignment : {chan_align}")
+    print(f"  aggregation    : {chan_agg}")
+    print(f"  pruning_mode   : {pruning_mode}")
     if smoke_test:
         print("  SMOKE TEST MODE: only first 4 MoE layers will be processed")
     if inplace_prune:
@@ -1117,20 +1300,36 @@ def run_moe_target_pruning_mode(
                 all_expert_scores: List[Tuple[int, int, torch.Tensor]] = []
                 print("  Computing expert scores ...")
                 for info in moe_layers:
-                    if info.experts_packed:
-                        per_exp_s = []
+                    if info.experts_packed and pruning_mode == "packed_same_channel":
+                        # Aggregate per-expert scores to a single layer-level score.
+                        # Selection then picks globally across layers using this score.
+                        per_exp_s: List[torch.Tensor] = []
+                        rt_weights: List[float] = []
+                        _total_rt = max(
+                            sum(routed_counts.get((info.layer_idx, ej), 0)
+                                for ej in range(info.num_experts)),
+                            1,
+                        )
                         for ei, exp in enumerate(info.expert_modules):
                             try:
                                 per_exp_s.append(get_expert_scores(exp).float())
+                                rt_weights.append(
+                                    routed_counts.get((info.layer_idx, ei), 0)
+                                    / _total_rt
+                                )
                             except Exception as _se:
                                 logger.warning(
                                     "score layer=%d ei=%d: %s",
                                     info.layer_idx, ei, _se,
                                 )
                         if per_exp_s:
-                            avg_s = torch.stack(per_exp_s, dim=0).mean(dim=0)
-                            all_expert_scores.append((info.layer_idx, -1, avg_s))
+                            stacked_s = torch.stack(per_exp_s, dim=0)  # [n_exp, d_ff]
+                            rt_t      = torch.tensor(rt_weights, dtype=torch.float32)
+                            agg_s     = _aggregate_expert_scores(stacked_s, chan_agg, rt_t)
+                            all_expert_scores.append((info.layer_idx, -1, agg_s))
                     else:
+                        # per_expert_mask mode (packed or unpacked) OR unpacked
+                        # packed_same_channel: use true per-expert scores.
                         for ei, exp in enumerate(info.expert_modules):
                             try:
                                 s = get_expert_scores(exp)
@@ -1243,6 +1442,10 @@ def run_moe_target_pruning_mode(
                 print(f"    removed_expert_neurons   : {actual_pruned:,}")
                 print(f"    actual_pct               : {actual_pct:.3f}%  "
                       f"(requested {target_pct:.1f}%)")
+                _print_per_layer_distribution(
+                    per_expert_pruned, expert_sizes, moe_layers,
+                    routed_counts, total_expert_neurons, chan_align,
+                )
 
                 # ── Release calibration caches before pruning ─────────────────
                 # pure_delete needs no per-expert activations during pruning;
@@ -1274,122 +1477,212 @@ def run_moe_target_pruning_mode(
 
                     if torch.cuda.is_available():
                         torch.cuda.reset_peak_memory_stats()
+                    _t_start = time.perf_counter()
 
                     # ── In-place pruning — no deepcopy ────────────────────────
-                    for (li, ei), prune_list in per_expert_pruned.items():
-                        if not prune_list:
-                            continue
+                    # Determine summary intermediate sizes (updated per-layer)
+                    _old_inter_summary = 0
+                    _new_inter_summary = 0
 
-                        info      = layer_idx_to_info[li]
-                        d_ff_orig = expert_sizes[(li, ei)]
-                        prune_idx = torch.tensor(sorted(prune_list), dtype=torch.long)
+                    if pruning_mode == "per_expert_mask":
+                        # ── MASK-ONLY: zero weights without changing shapes ────
+                        # Groups by layer so we do one container pass per layer.
+                        layers_to_mask: Dict[int, Dict[int, List[int]]] = {}
+                        for (li, ei), prune_list in per_expert_pruned.items():
+                            if prune_list:
+                                layers_to_mask.setdefault(li, {})[ei] = prune_list
 
-                        if ei == -1:
-                            # ── Packed layer: global same-channel pruning ─────
-                            ec              = info.experts_container
-                            n_pruned_actual = len(prune_idx)
-                            new_inter_exp   = d_ff_orig - n_pruned_actual
-                            removed_en      = n_pruned_actual * info.num_experts
-                            new_inter = prune_packed_experts_global(
-                                ec, prune_idx, alignment=chan_align
+                        total_masked_en = 0
+                        for li, exp_dict in sorted(layers_to_mask.items()):
+                            info = layer_idx_to_info[li]
+                            if info.experts_packed and info.experts_container is not None:
+                                ec    = info.experts_container
+                                gu    = ec.gate_up_proj.data  # [n_exp, 2*i, h]
+                                dp    = ec.down_proj.data     # [n_exp, h, i]
+                                inter = gu.shape[1] // 2
+                                if _old_inter_summary == 0:
+                                    _old_inter_summary = inter
+                                    _new_inter_summary = inter  # unchanged
+                                for ei, prune_list in exp_dict.items():
+                                    for ch in prune_list:
+                                        gu[ei, ch, :].zero_()
+                                        gu[ei, ch + inter, :].zero_()
+                                        dp[ei, :, ch].zero_()
+                                        total_masked_en += 1
+                                    experts_pruned += 1
+                            else:
+                                for ei, prune_list in exp_dict.items():
+                                    expert   = info.expert_modules[ei]
+                                    d_ff_exp = expert_sizes.get((li, ei), 0)
+                                    if _old_inter_summary == 0:
+                                        _old_inter_summary = d_ff_exp
+                                        _new_inter_summary = d_ff_exp
+                                    for ch in prune_list:
+                                        if hasattr(expert, "gate_proj"):
+                                            expert.gate_proj.weight.data[ch, :].zero_()
+                                        if hasattr(expert, "up_proj"):
+                                            expert.up_proj.weight.data[ch, :].zero_()
+                                        if hasattr(expert, "down_proj"):
+                                            expert.down_proj.weight.data[:, ch].zero_()
+                                        total_masked_en += 1
+                                    experts_pruned += 1
+
+                            n_masked_this_layer = sum(len(v) for v in exp_dict.values())
+                            print(
+                                f"      Layer {li}: masked {n_masked_this_layer} "
+                                f"expert-channel units across "
+                                f"{len(exp_dict)} experts  "
+                                f"[no shape change]"
                             )
-                            for pv in info.expert_modules:
-                                if isinstance(pv, PackedExpertView):
-                                    pv.moe_intermediate = new_inter
-                            experts_pruned += info.num_experts
                             rows.append({
                                 "model": model_name,
-                                "target_pruning_percent": target_pct,
-                                "layer_index": li, "expert_index": -1,
-                                "selector": "rmsnorm_bound_avg",
-                                "method": method,
-                                "d_ff_before": d_ff_orig,
-                                "d_ff_after":  new_inter,
-                                "n_pruned": n_pruned_actual,
-                                "pruning_percent": round(
-                                    100.0 * n_pruned_actual / d_ff_orig, 2),
-                                "n_routed_tokens": sum(
-                                    routed_counts.get((li, ej), 0)
-                                    for ej in range(info.num_experts)
-                                ),
-                                "skipped": False, "dtype": dtype_str,
-                                "old_moe_intermediate": d_ff_orig,
-                                "new_moe_intermediate": new_inter,
-                                "moe_channel_alignment": chan_align,
-                                "removed_expert_neurons": removed_en,
-                                "actual_expert_neuron_pct": round(
-                                    100.0 * removed_en / total_expert_neurons, 4),
+                                "layer_index": li, "expert_index": sorted(exp_dict.keys()),
+                                "method": method, "dtype": dtype_str,
+                                "n_masked_units": n_masked_this_layer,
                             })
-                            print(
-                                f"      Layer {li}: "
-                                f"pruned {n_pruned_actual} channels from "
-                                f"{info.num_experts} packed experts "
-                                f"({d_ff_orig}→{new_inter})  "
-                                f"new_inter%{chan_align}={new_inter % chan_align}  "
-                                f"removed_expert_neurons={removed_en:,}"
-                            )
 
-                        else:
-                            # ── Unpacked layer: per-expert in-place ───────────
-                            n_routed  = routed_counts.get((li, ei), 0)
-                            if n_routed < min_exp_tokens:
-                                experts_skipped += 1
-                                logger.info(
-                                    "Layer %d Expert %d: skipped "
-                                    "(%d routed < %d)",
-                                    li, ei, n_routed, min_exp_tokens,
+                        # Update actual_pruned to reflect mask-only count
+                        actual_pruned = total_masked_en
+                        actual_pct    = (
+                            100.0 * actual_pruned / total_expert_neurons
+                            if total_expert_neurons else 0.0
+                        )
+
+                    else:
+                        # ── packed_same_channel: physical in-place pruning ─────
+                        for (li, ei), prune_list in per_expert_pruned.items():
+                            if not prune_list:
+                                continue
+
+                            info      = layer_idx_to_info[li]
+                            d_ff_orig = expert_sizes[(li, ei)]
+                            prune_idx = torch.tensor(sorted(prune_list), dtype=torch.long)
+
+                            if ei == -1:
+                                # Packed layer: global same-channel pruning
+                                ec              = info.experts_container
+                                n_pruned_actual = len(prune_idx)
+                                removed_en      = n_pruned_actual * info.num_experts
+                                new_inter = prune_packed_experts_global(
+                                    ec, prune_idx, alignment=chan_align
                                 )
+                                for pv in info.expert_modules:
+                                    if isinstance(pv, PackedExpertView):
+                                        pv.moe_intermediate = new_inter
+                                experts_pruned += info.num_experts
+                                _old_inter_summary = _old_inter_summary or d_ff_orig
+                                _new_inter_summary = new_inter
+                                rows.append({
+                                    "model": model_name,
+                                    "target_pruning_percent": target_pct,
+                                    "layer_index": li, "expert_index": -1,
+                                    "pruning_mode": pruning_mode,
+                                    "physical_pruning": True,
+                                    "speedup_expected": True,
+                                    "same_channel_across_experts": True,
+                                    "aggregation_mode": chan_agg,
+                                    "selector": f"rmsnorm_bound_{chan_agg}",
+                                    "method": method,
+                                    "d_ff_before": d_ff_orig,
+                                    "d_ff_after":  new_inter,
+                                    "n_pruned": n_pruned_actual,
+                                    "pruning_percent": round(
+                                        100.0 * n_pruned_actual / d_ff_orig, 2),
+                                    "n_routed_tokens": sum(
+                                        routed_counts.get((li, ej), 0)
+                                        for ej in range(info.num_experts)
+                                    ),
+                                    "skipped": False, "dtype": dtype_str,
+                                    "old_moe_intermediate": d_ff_orig,
+                                    "new_moe_intermediate": new_inter,
+                                    "moe_channel_alignment": chan_align,
+                                    "removed_expert_neurons": removed_en,
+                                    "actual_expert_neuron_pct": round(
+                                        100.0 * removed_en / total_expert_neurons, 4),
+                                })
+                                print(
+                                    f"      Layer {li}: "
+                                    f"pruned {n_pruned_actual} channels from "
+                                    f"{info.num_experts} packed experts "
+                                    f"({d_ff_orig}→{new_inter})  "
+                                    f"new_inter%{chan_align}={new_inter % chan_align}  "
+                                    f"removed_expert_neurons={removed_en:,}"
+                                )
+
+                            else:
+                                # Unpacked layer: per-expert in-place
+                                n_routed  = routed_counts.get((li, ei), 0)
+                                if n_routed < min_exp_tokens:
+                                    experts_skipped += 1
+                                    logger.info(
+                                        "Layer %d Expert %d: skipped "
+                                        "(%d routed < %d)",
+                                        li, ei, n_routed, min_exp_tokens,
+                                    )
+                                    rows.append({
+                                        "model": model_name,
+                                        "target_pruning_percent": target_pct,
+                                        "layer_index": li, "expert_index": ei,
+                                        "pruning_mode": pruning_mode,
+                                        "physical_pruning": True,
+                                        "speedup_expected": True,
+                                        "same_channel_across_experts": False,
+                                        "aggregation_mode": "N/A",
+                                        "selector": "rmsnorm_bound",
+                                        "method": method,
+                                        "d_ff_before": d_ff_orig,
+                                        "d_ff_after": d_ff_orig,
+                                        "n_pruned": 0, "pruning_percent": 0.0,
+                                        "n_routed_tokens": n_routed,
+                                        "skipped": True, "dtype": dtype_str,
+                                    })
+                                    continue
+
+                                expert    = info.expert_modules[ei]
+                                keep_mask = torch.ones(d_ff_orig, dtype=torch.bool)
+                                keep_mask[prune_idx] = False
+                                keep_idx  = keep_mask.nonzero(as_tuple=True)[0]
+                                calib_inp = (
+                                    _calib_ref.get((li, ei), None)
+                                    if _calib_ref is not None else None
+                                )
+
+                                recon_info: Dict = {}
+                                if method != "pure_delete" and calib_inp is not None:
+                                    t_r0 = time.perf_counter()
+                                    recon_info = apply_expert_residual_reconstruction(
+                                        expert, prune_idx, keep_idx, calib_inp,
+                                        ridge_lambda=BEST_RESIDUAL_LAM,
+                                        tau=BEST_RESIDUAL_TAU,
+                                    )
+                                    t_recon_total += time.perf_counter() - t_r0
+
+                                prune_expert_channels(expert, prune_idx)
+                                experts_pruned += 1
+
+                                d_ff_new = d_ff_orig - len(prune_idx)
                                 rows.append({
                                     "model": model_name,
                                     "target_pruning_percent": target_pct,
                                     "layer_index": li, "expert_index": ei,
+                                    "pruning_mode": pruning_mode,
+                                    "physical_pruning": True,
+                                    "speedup_expected": True,
+                                    "same_channel_across_experts": False,
+                                    "aggregation_mode": "N/A",
                                     "selector": "rmsnorm_bound",
                                     "method": method,
-                                    "d_ff_before": d_ff_orig,
-                                    "d_ff_after": d_ff_orig,
-                                    "n_pruned": 0, "pruning_percent": 0.0,
+                                    "d_ff_before": d_ff_orig, "d_ff_after": d_ff_new,
+                                    "n_pruned": len(prune_idx),
+                                    "pruning_percent": round(
+                                        100.0 * len(prune_idx) / d_ff_orig, 2),
                                     "n_routed_tokens": n_routed,
-                                    "skipped": True, "dtype": dtype_str,
+                                    "skipped": False,
+                                    "reconstruction_time_seconds": round(
+                                        t_recon_total, 2),
+                                    "dtype": dtype_str,
+                                    "notes": recon_info.get("status", ""),
                                 })
-                                continue
-
-                            expert    = info.expert_modules[ei]
-                            keep_mask = torch.ones(d_ff_orig, dtype=torch.bool)
-                            keep_mask[prune_idx] = False
-                            keep_idx  = keep_mask.nonzero(as_tuple=True)[0]
-                            calib_inp = _calib_ref.get((li, ei), None)
-
-                            recon_info: Dict = {}
-                            if method != "pure_delete" and calib_inp is not None:
-                                t_r0 = time.perf_counter()
-                                recon_info = apply_expert_residual_reconstruction(
-                                    expert, prune_idx, keep_idx, calib_inp,
-                                    ridge_lambda=BEST_RESIDUAL_LAM,
-                                    tau=BEST_RESIDUAL_TAU,
-                                )
-                                t_recon_total += time.perf_counter() - t_r0
-
-                            prune_expert_channels(expert, prune_idx)
-                            experts_pruned += 1
-
-                            d_ff_new = d_ff_orig - len(prune_idx)
-                            rows.append({
-                                "model": model_name,
-                                "target_pruning_percent": target_pct,
-                                "layer_index": li, "expert_index": ei,
-                                "selector": "rmsnorm_bound",
-                                "method": method,
-                                "d_ff_before": d_ff_orig, "d_ff_after": d_ff_new,
-                                "n_pruned": len(prune_idx),
-                                "pruning_percent": round(
-                                    100.0 * len(prune_idx) / d_ff_orig, 2),
-                                "n_routed_tokens": n_routed,
-                                "skipped": False,
-                                "reconstruction_time_seconds": round(
-                                    t_recon_total, 2),
-                                "dtype": dtype_str,
-                                "notes": recon_info.get("status", ""),
-                            })
 
                     _log_gpu_memory("after pruning")
 
@@ -1399,8 +1692,23 @@ def run_moe_target_pruning_mode(
                     _log_gpu_memory("after forward check")
 
                     _has_packed = any(i.experts_packed for i in moe_layers)
-                    _sel_str    = ("rmsnorm_bound_avg"
-                                   if _has_packed else "rmsnorm_bound")
+                    _sel_str    = (f"rmsnorm_bound_{chan_agg}"
+                                   if (_has_packed and pruning_mode == "packed_same_channel")
+                                   else ("rmsnorm_bound_per_expert"
+                                         if pruning_mode == "per_expert_mask"
+                                         else "rmsnorm_bound"))
+                    _phys       = (pruning_mode == "packed_same_channel")
+                    _t_end      = time.perf_counter()
+                    _gpu0_peak  = (
+                        torch.cuda.max_memory_allocated(0) / 1024**2
+                        if torch.cuda.is_available() and torch.cuda.device_count() > 0
+                        else 0.0
+                    )
+                    _gpu1_peak  = (
+                        torch.cuda.max_memory_allocated(1) / 1024**2
+                        if torch.cuda.is_available() and torch.cuda.device_count() > 1
+                        else 0.0
+                    )
 
                     if not fp_ok:
                         print("    ERROR: forward pass failed — skipping PPL eval")
@@ -1409,8 +1717,19 @@ def run_moe_target_pruning_mode(
                                 "model": model_name,
                                 "target_pruning_percent": target_pct,
                                 "eval_dataset": _ds,
+                                "pruning_mode":  pruning_mode,
+                                "aggregation_mode": chan_agg,
                                 "selector": _sel_str,
                                 "method": method,
+                                "physical_pruning": _phys,
+                                "speedup_expected": _phys,
+                                "same_channel_across_experts": (
+                                    pruning_mode == "packed_same_channel"
+                                ),
+                                "smoke_layers_used": len(moe_layers),
+                                "total_moe_layers": len(
+                                    [i for i in layer_infos if i.is_moe]
+                                ),
                                 "total_experts":    sum(len(i.expert_modules)
                                                         for i in moe_layers),
                                 "experts_pruned":   experts_pruned,
@@ -1421,16 +1740,24 @@ def run_moe_target_pruning_mode(
                                 "requested_target_pct":     target_pct,
                                 "selected_layer_channels":  selected_layer_channels,
                                 "removed_expert_neurons":   actual_pruned,
-                                "moe_channel_alignment":    chan_align,
+                                "old_intermediate": _old_inter_summary,
+                                "new_intermediate": _new_inter_summary,
+                                "moe_channel_alignment": chan_align,
                                 "baseline_ppl":    round(baseline_ppl_per_ds[_ds], 4),
                                 "compressed_ppl":  float("nan"),
                                 "delta_ppl":       float("nan"),
                                 "relative_ppl_increase_percent": float("nan"),
                                 "damage_reduction_percent":       float("nan"),
-                                "reconstruction_time_seconds":    round(t_recon_total, 2),
+                                "forward_check":   False,
+                                "reconstruction_time_seconds": round(t_recon_total, 2),
                                 "peak_gpu_memory_MB": round(peak_gpu_mb, 1),
+                                "gpu0_peak_mb":  round(_gpu0_peak, 1),
+                                "gpu1_peak_mb":  round(_gpu1_peak, 1),
+                                "time_sec":      round(_t_end - _t_start, 1),
                                 "dtype": dtype_str,
                                 "notes": "forward_pass_failed",
+                                "csv_path": main_csv_path,
+                                "json_path": json_path,
                             }
                             all_results.append(err_row)
                             _flush_csv(main_csv_path, [err_row], MOE_SUMMARY_CSV_KEYS)
@@ -1460,8 +1787,19 @@ def run_moe_target_pruning_mode(
                             "model": model_name,
                             "target_pruning_percent": target_pct,
                             "eval_dataset": _ds,
+                            "pruning_mode":  pruning_mode,
+                            "aggregation_mode": chan_agg,
                             "selector": _sel_str,
                             "method": method,
+                            "physical_pruning": _phys,
+                            "speedup_expected": _phys,
+                            "same_channel_across_experts": (
+                                pruning_mode == "packed_same_channel"
+                            ),
+                            "smoke_layers_used": len(moe_layers),
+                            "total_moe_layers": len(
+                                [i for i in layer_infos if i.is_moe]
+                            ),
                             "total_experts":    sum(len(i.expert_modules)
                                                     for i in moe_layers),
                             "experts_pruned":   experts_pruned,
@@ -1472,16 +1810,24 @@ def run_moe_target_pruning_mode(
                             "requested_target_pct":     target_pct,
                             "selected_layer_channels":  selected_layer_channels,
                             "removed_expert_neurons":   actual_pruned,
+                            "old_intermediate": _old_inter_summary,
+                            "new_intermediate": _new_inter_summary,
                             "moe_channel_alignment":    chan_align,
                             "baseline_ppl":             round(cur_bppl, 4),
                             "compressed_ppl":           round(ppl, 4),
                             "delta_ppl":                round(delta, 4),
                             "relative_ppl_increase_percent": round(rel, 4),
                             "damage_reduction_percent": float("nan"),
+                            "forward_check":            True,
                             "reconstruction_time_seconds": round(t_recon_total, 2),
                             "peak_gpu_memory_MB":        round(peak_gpu_mb, 1),
+                            "gpu0_peak_mb":  round(_gpu0_peak, 1),
+                            "gpu1_peak_mb":  round(_gpu1_peak, 1),
+                            "time_sec":      round(_t_end - _t_start, 1),
                             "dtype": dtype_str,
                             "notes": "",
+                            "csv_path": main_csv_path,
+                            "json_path": json_path,
                         }
                         print(
                             f"    [{_ds}] baseline={cur_bppl:.4f}  "
@@ -1531,5 +1877,14 @@ def run_moe_target_pruning_mode(
     with open(json_path, "w") as fh:
         json.dump(report, fh, indent=2, default=str)
 
-    print(f"\nMoE Summary CSV : {main_csv_path}")
+    _total_moe = len([i for i in (layer_infos if "layer_infos" in dir() else [])
+                      if getattr(i, "is_moe", False)])
+    _print_moe_summary_table(
+        all_results,
+        n_smoke_layers=len(moe_layers) if "moe_layers" in dir() else 0,
+        total_moe_layers=_total_moe,
+        main_csv_path=main_csv_path,
+        json_path=json_path,
+    )
+    print(f"MoE Summary CSV : {main_csv_path}")
     print(f"MoE JSON report : {json_path}\n")
