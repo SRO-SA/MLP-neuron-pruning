@@ -99,6 +99,10 @@ MOE_SUMMARY_CSV_KEYS = [
     "forward_check", "reconstruction_time_seconds",
     "peak_gpu_memory_MB", "gpu0_peak_mb", "gpu1_peak_mb",
     "time_sec", "dtype", "notes",
+    # Structural / residual stats
+    "shape_changed",
+    "residual_stable_experts", "residual_skipped_experts",
+    "residual_failed_experts", "residual_time_sec",
     "csv_path", "json_path",
 ]
 
@@ -420,6 +424,197 @@ def get_expert_scores(expert_module) -> torch.Tensor:
         logger.warning("Expert score fallback to down_norm: %s", exc)
         w = get_expert_weights(expert_module)
         return w["down_proj"].detach().float().cpu().norm(dim=0)
+
+# ---------------------------------------------------------------------------
+# Activation-based expert scoring
+# ---------------------------------------------------------------------------
+
+def compute_activation_scores_for_expert(
+    expert_module,
+    calib_inputs: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Activation-weighted importance score for SwiGLU expert channels.
+
+    score_i = mean_over_tokens( |SiLU(x @ gate_i.T) * (x @ up_i.T)| ) * ||down[:, i]||
+
+    This measures how much each intermediate neuron actually fires on
+    calibration data, weighted by how large a change its removal causes
+    in the output (down column norm).
+
+    Args:
+        expert_module: module with gate/up/down weights accessible via
+                       get_expert_weights().
+        calib_inputs:  [N, d_model] float tensor of calibration hidden states
+                       routed to this expert.
+
+    Returns:
+        [d_ff] float32 CPU tensor of scores.
+    """
+    import torch.nn.functional as _F
+    if calib_inputs is None or calib_inputs.shape[0] == 0:
+        # Fallback to weight-only score if no calibration data
+        return get_expert_scores(expert_module)
+    try:
+        w      = get_expert_weights(expert_module)
+        gate   = w["gate_proj"].detach().float()   # [d_ff, d_model]
+        up     = w["up_proj"].detach().float()     # [d_ff, d_model]
+        down   = w["down_proj"].detach().float()   # [d_model, d_ff]
+        X      = calib_inputs.detach().float()     # [N, d_model]
+
+        # Move everything to the same device (CPU keeps memory usage low)
+        X    = X.cpu()
+        gate = gate.cpu()
+        up   = up.cpu()
+        down = down.cpu()
+
+        with torch.no_grad():
+            gate_out  = X @ gate.T                       # [N, d_ff]
+            up_out    = X @ up.T                         # [N, d_ff]
+            act       = _F.silu(gate_out) * up_out       # [N, d_ff]
+            act_score = act.abs().mean(dim=0)             # [d_ff]
+            down_norms = down.norm(dim=0)                 # [d_ff] column norms
+            scores    = act_score * down_norms
+        return scores
+    except Exception as exc:
+        logger.warning("activation_score fallback to rmsnorm_bound: %s", exc)
+        return get_expert_scores(expert_module)
+
+
+def _score_expert_moe(
+    expert_module,
+    selector: str,
+    calib_inputs: "Optional[torch.Tensor]" = None,
+) -> torch.Tensor:
+    """
+    Dispatcher: returns [d_ff] importance scores for one expert.
+
+    selector options:
+      "rmsnorm_bound"    – weight-only RMSNorm-bounded SwiGLU score
+      "activation_score" – activation × down-column-norm score (needs calib)
+    """
+    if selector == "activation_score":
+        return compute_activation_scores_for_expert(expert_module, calib_inputs)
+    else:
+        # default: rmsnorm_bound (weight-only, no calib needed)
+        return get_expert_scores(expert_module)
+
+
+# ---------------------------------------------------------------------------
+# Packed-expert residual reconstruction
+# ---------------------------------------------------------------------------
+
+def apply_packed_residual_for_layer(
+    experts_container,
+    prune_idx:   torch.Tensor,
+    keep_idx:    torch.Tensor,
+    expert_activations_for_layer: "Dict[int, Optional[torch.Tensor]]",
+    min_tokens:   int   = 16,
+    ridge_lambda: float = 1e-2,
+    tau:          float = 1.0,
+    solve_on_cpu: bool  = True,
+) -> "Dict":
+    """
+    Ridge-regression residual reconstruction for packed MoE experts.
+
+    MUST be called BEFORE prune_packed_experts_global because it reads
+    the full (pre-pruning) gate_up_proj and down_proj.
+
+    For each expert e in the packed layer we want to minimise:
+        || A_K · ΔD^T - A_P · W_P^T ||_F
+    where:
+        A = SiLU(X_e @ G_e^T) ⊙ (X_e @ U_e^T)   # [N, d_ff] activations
+        A_K = A[:, keep_idx],  A_P = A[:, prune_idx]
+        W_P = down_proj[e, :, prune_idx]           # pruned columns
+
+    Dual-form ridge solve (efficient when N < n_kept):
+        (A_K A_K^T + λ I) B = E,   E = A_P W_P^T   # [N, d_model]
+        ΔD = A_K^T B                                # [n_kept, d_model]
+
+    Update: down_proj[e, :, keep_idx] += τ · ΔD^T  (in-place, pre-pruning)
+
+    Returns stats dict with n_stable, n_skipped, n_failed, mean_tokens.
+    """
+    import torch.nn.functional as _F
+
+    gu     = experts_container.gate_up_proj.data   # [n_exp, 2*inter, d_model]
+    dp     = experts_container.down_proj.data       # [n_exp, d_model, inter]
+    inter  = gu.shape[1] // 2
+    n_exp  = gu.shape[0]
+
+    n_stable = n_skipped = n_failed = 0
+    n_tokens_list: "List[int]" = []
+
+    for ei in range(n_exp):
+        X_raw = expert_activations_for_layer.get(ei, None)
+        if X_raw is None or X_raw.shape[0] < min_tokens:
+            n_skipped += 1
+            continue
+
+        N = X_raw.shape[0]
+        try:
+            with torch.no_grad():
+                X      = X_raw.detach().float()
+                gate_e = gu[ei, :inter, :].detach().float()   # [inter, d_model]
+                up_e   = gu[ei, inter:, :].detach().float()   # [inter, d_model]
+                down_e = dp[ei].detach().float()               # [d_model, inter]
+
+                if solve_on_cpu:
+                    X      = X.cpu()
+                    gate_e = gate_e.cpu()
+                    up_e   = up_e.cpu()
+                    down_e = down_e.cpu()
+
+                # SwiGLU activations [N, inter]
+                act_all = _F.silu(X @ gate_e.T) * (X @ up_e.T)
+
+                _prune = prune_idx.to(act_all.device)
+                _keep  = keep_idx.to(act_all.device)
+
+                A_P = act_all[:, _prune]      # [N, n_pruned]
+                A_K = act_all[:, _keep]       # [N, n_kept]
+                W_P = down_e[:, _prune.to(down_e.device)]     # [d_model, n_pruned]
+
+                # Target residual: what the pruned neurons were contributing
+                E   = A_P @ W_P.T             # [N, d_model]
+
+                # Dual-form ridge (N×N system, efficient when N is small)
+                AAt = A_K @ A_K.T             # [N, N]
+                lam = ridge_lambda * float(AAt.diagonal().mean())
+                reg = lam * torch.eye(N, dtype=torch.float32, device=AAt.device)
+
+                B     = torch.linalg.solve(AAt + reg, E)  # [N, d_model]
+                Delta = A_K.T @ B                          # [n_kept, d_model]
+
+                W_K     = down_e[:, _keep.to(down_e.device)]  # [d_model, n_kept]
+                W_K_new = W_K + tau * Delta.T                  # [d_model, n_kept]
+
+                # Write back at original dtype and device
+                dp[ei, :, keep_idx.to(dp.device)] = W_K_new.to(
+                    device=dp.device, dtype=dp.dtype
+                )
+
+            n_stable += 1
+            n_tokens_list.append(N)
+
+        except Exception as exc:
+            logger.warning(
+                "apply_packed_residual: expert %d solve failed: %s", ei, exc
+            )
+            n_failed += 1
+
+    mean_toks = (
+        round(sum(n_tokens_list) / len(n_tokens_list))
+        if n_tokens_list else 0
+    )
+    return {
+        "n_stable":  n_stable,
+        "n_skipped": n_skipped,
+        "n_failed":  n_failed,
+        "mean_tokens": mean_toks,
+    }
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -972,7 +1167,7 @@ def _print_moe_summary_table(
     if not rows:
         return
 
-    W = 170
+    W = 190
     print(f"\n{'=' * W}")
     print("MOE EXPERIMENT SUMMARY")
     print(f"{'=' * W}")
@@ -980,7 +1175,8 @@ def _print_moe_summary_table(
     hdr = (
         f"  {'model':>22}  {'s/t':>5}  {'tgt%':>5}  {'act%':>6}  "
         f"{'sel_ch':>6}  {'rem_en':>9}  {'old_i':>5}  {'new_i':>5}  "
-        f"{'aln':>3}  {'agg':>10}  {'p_mode':>22}  {'method':>11}  "
+        f"{'aln':>3}  {'selector':>18}  {'agg':>8}  {'p_mode':>22}  {'method':>18}  "
+        f"{'shp':>5}  {'r_stbl':>6}  {'r_skip':>6}  {'r_fail':>6}  "
         f"{'dataset':>10}  {'bPPL':>8}  {'cPPL':>9}  {'dPPL':>8}  {'rel%':>7}  "
         f"{'fwd':>4}  {'status':>16}"
     )
@@ -988,30 +1184,36 @@ def _print_moe_summary_table(
     print("  " + "─" * (len(hdr) - 2))
 
     for r in rows:
-        mdl   = str(r.get("model",""))[-22:]
-        st    = f"{n_smoke_layers}/{total_moe_layers}"
-        tgt   = r.get("requested_target_pct", r.get("target_pruning_percent", 0.0))
-        act   = r.get("actual_pruning_percent", 0.0)
-        sel   = r.get("selected_layer_channels", "?")
-        rem   = r.get("removed_expert_neurons", "?")
-        old_i = r.get("old_intermediate", "?")
-        new_i = r.get("new_intermediate", "?")
-        aln   = r.get("moe_channel_alignment", "?")
-        agg   = str(r.get("aggregation_mode",""))[:10]
-        pm    = str(r.get("pruning_mode",""))[:22]
-        meth  = str(r.get("method",""))[:11]
-        ds    = str(r.get("eval_dataset",""))[:10]
-        bppl  = r.get("baseline_ppl", float("nan"))
-        cppl  = r.get("compressed_ppl", float("nan"))
-        dppl  = r.get("delta_ppl", float("nan"))
-        rel   = r.get("relative_ppl_increase_percent", float("nan"))
-        fwd   = "OK" if r.get("forward_check", True) else "FAIL"
-        st_s  = str(r.get("notes","") or "ok")[:16]
+        mdl    = str(r.get("model",""))[-22:]
+        st     = f"{n_smoke_layers}/{total_moe_layers}"
+        tgt    = r.get("requested_target_pct", r.get("target_pruning_percent", 0.0))
+        act    = r.get("actual_pruning_percent", 0.0)
+        sel    = r.get("selected_layer_channels", "?")
+        rem    = r.get("removed_expert_neurons", "?")
+        old_i  = r.get("old_intermediate", "?")
+        new_i  = r.get("new_intermediate", "?")
+        aln    = r.get("moe_channel_alignment", "?")
+        selstr = str(r.get("selector",""))[:18]
+        agg    = str(r.get("aggregation_mode",""))[:8]
+        pm     = str(r.get("pruning_mode",""))[:22]
+        meth   = str(r.get("method",""))[:18]
+        shp    = "Y" if r.get("shape_changed", False) else "N"
+        r_stbl = r.get("residual_stable_experts", "-")
+        r_skip = r.get("residual_skipped_experts", "-")
+        r_fail = r.get("residual_failed_experts", "-")
+        ds     = str(r.get("eval_dataset",""))[:10]
+        bppl   = r.get("baseline_ppl", float("nan"))
+        cppl   = r.get("compressed_ppl", float("nan"))
+        dppl   = r.get("delta_ppl", float("nan"))
+        rel    = r.get("relative_ppl_increase_percent", float("nan"))
+        fwd    = "OK" if r.get("forward_check", True) else "FAIL"
+        st_s   = str(r.get("notes","") or "ok")[:16]
         try:
             print(
                 f"  {mdl:>22}  {st:>5}  {tgt:>5.1f}  {act:>6.3f}  "
                 f"{str(sel):>6}  {str(rem):>9}  {str(old_i):>5}  {str(new_i):>5}  "
-                f"{str(aln):>3}  {agg:>10}  {pm:>22}  {meth:>11}  "
+                f"{str(aln):>3}  {selstr:>18}  {agg:>8}  {pm:>22}  {meth:>18}  "
+                f"{str(shp):>5}  {str(r_stbl):>6}  {str(r_skip):>6}  {str(r_fail):>6}  "
                 f"{ds:>10}  {bppl:>8.4f}  {cppl:>9.4f}  {dppl:>8.4f}  {rel:>7.2f}  "
                 f"{fwd:>4}  {st_s:>16}"
             )
@@ -1104,6 +1306,11 @@ def run_moe_target_pruning_mode(
     chan_align     = int(cfg.get("moe_channel_alignment", 16))
     chan_agg       = str(cfg.get("moe_same_channel_aggregation", "p95"))
     pruning_mode   = str(cfg.get("moe_pruning_mode", "packed_same_channel"))
+    moe_selector   = str(cfg.get("moe_selector", "rmsnorm_bound"))
+    resid_lambda   = float(cfg.get("residual_lambda", 1e-2))
+    resid_tau      = float(cfg.get("residual_tau", 1.0))
+    min_resid_tok  = int(cfg.get("min_residual_tokens_per_expert", 16))
+    resid_on_cpu   = bool(cfg.get("solve_residual_on_cpu", True))
     EVAL_DATASETS  = [str(d) for d in (
         eval_datasets_override or cfg.get("eval_datasets", ["wikitext2"]))]
 
@@ -1119,6 +1326,7 @@ def run_moe_target_pruning_mode(
     print(f"  chan_alignment : {chan_align}")
     print(f"  aggregation    : {chan_agg}")
     print(f"  pruning_mode   : {pruning_mode}")
+    print(f"  moe_selector   : {moe_selector}")
     if smoke_test:
         print("  SMOKE TEST MODE: only first 4 MoE layers will be processed")
     if inplace_prune:
@@ -1312,7 +1520,14 @@ def run_moe_target_pruning_mode(
                         )
                         for ei, exp in enumerate(info.expert_modules):
                             try:
-                                per_exp_s.append(get_expert_scores(exp).float())
+                                _calib_ei = (
+                                    expert_activations.get((info.layer_idx, ei))
+                                    if moe_selector == "activation_score"
+                                    else None
+                                )
+                                per_exp_s.append(
+                                    _score_expert_moe(exp, moe_selector, _calib_ei).float()
+                                )
                                 rt_weights.append(
                                     routed_counts.get((info.layer_idx, ei), 0)
                                     / _total_rt
@@ -1332,7 +1547,12 @@ def run_moe_target_pruning_mode(
                         # packed_same_channel: use true per-expert scores.
                         for ei, exp in enumerate(info.expert_modules):
                             try:
-                                s = get_expert_scores(exp)
+                                _calib_ei = (
+                                    expert_activations.get((info.layer_idx, ei))
+                                    if moe_selector == "activation_score"
+                                    else None
+                                )
+                                s = _score_expert_moe(exp, moe_selector, _calib_ei)
                                 all_expert_scores.append((info.layer_idx, ei, s))
                             except Exception as _se:
                                 logger.warning(
@@ -1483,6 +1703,20 @@ def run_moe_target_pruning_mode(
                     # Determine summary intermediate sizes (updated per-layer)
                     _old_inter_summary = 0
                     _new_inter_summary = 0
+                    # For per_expert_mask, shape never changes — pre-populate from
+                    # expert_sizes so the summary always shows the correct value
+                    # even when layers_to_mask ends up empty.
+                    if pruning_mode == "per_expert_mask":
+                        _any_key = next(
+                            (k for k in expert_sizes if k[1] >= 0), None
+                        )
+                        if _any_key:
+                            _old_inter_summary = expert_sizes[_any_key]
+                            _new_inter_summary = _old_inter_summary
+                    # Residual reconstruction counters
+                    _resid_stable  = 0
+                    _resid_skipped = 0
+                    _resid_failed  = 0
 
                     if pruning_mode == "per_expert_mask":
                         # ── MASK-ONLY: zero weights without changing shapes ────
@@ -1504,6 +1738,56 @@ def run_moe_target_pruning_mode(
                                     _old_inter_summary = inter
                                     _new_inter_summary = inter  # unchanged
                                 for ei, prune_list in exp_dict.items():
+                                    _prune_idx_e = torch.tensor(
+                                        sorted(prune_list), dtype=torch.long
+                                    )
+                                    _keep_mask_e = torch.ones(inter, dtype=torch.bool)
+                                    _keep_mask_e[_prune_idx_e] = False
+                                    _keep_idx_e = _keep_mask_e.nonzero(as_tuple=True)[0]
+
+                                    # ── residual_mask_moe: compensate before zeroing ──
+                                    if method == "residual_mask_moe" and _calib_ref is not None:
+                                        _X_e = _calib_ref.get((li, ei))
+                                        if _X_e is not None and _X_e.shape[0] >= min_resid_tok:
+                                            import torch.nn.functional as _F
+                                            try:
+                                                with torch.no_grad():
+                                                    _X_f  = _X_e.detach().float()
+                                                    _gw_e = gu[ei, :inter, :].detach().float()
+                                                    _uw_e = gu[ei, inter:, :].detach().float()
+                                                    _dw_e = dp[ei].detach().float()
+                                                    if resid_on_cpu:
+                                                        _X_f  = _X_f.cpu()
+                                                        _gw_e = _gw_e.cpu()
+                                                        _uw_e = _uw_e.cpu()
+                                                        _dw_e = _dw_e.cpu()
+                                                    _dev = _X_f.device
+                                                    _act = _F.silu(_X_f @ _gw_e.T) * (_X_f @ _uw_e.T)
+                                                    _AP  = _act[:, _prune_idx_e.to(_dev)]
+                                                    _AK  = _act[:, _keep_idx_e.to(_dev)]
+                                                    _WP  = _dw_e[:, _prune_idx_e.to(_dw_e.device)]
+                                                    _E   = _AP @ _WP.T
+                                                    _AAt = _AK @ _AK.T
+                                                    _N   = _X_f.shape[0]
+                                                    _lam = resid_lambda * float(_AAt.diagonal().mean())
+                                                    _reg = _lam * torch.eye(_N, dtype=torch.float32, device=_AAt.device)
+                                                    _B   = torch.linalg.solve(_AAt + _reg, _E)
+                                                    _D   = _AK.T @ _B
+                                                    _WK  = _dw_e[:, _keep_idx_e.to(_dw_e.device)]
+                                                    _WKn = _WK + resid_tau * _D.T
+                                                    dp[ei, :, _keep_idx_e.to(dp.device)] = _WKn.to(
+                                                        device=dp.device, dtype=dp.dtype
+                                                    )
+                                                _resid_stable += 1
+                                            except Exception as _re:
+                                                logger.warning(
+                                                    "residual_mask_moe layer=%d ei=%d: %s",
+                                                    li, ei, _re,
+                                                )
+                                                _resid_failed += 1
+                                        else:
+                                            _resid_skipped += 1
+
                                     for ch in prune_list:
                                         gu[ei, ch, :].zero_()
                                         gu[ei, ch + inter, :].zero_()
@@ -1563,6 +1847,38 @@ def run_moe_target_pruning_mode(
                                 ec              = info.experts_container
                                 n_pruned_actual = len(prune_idx)
                                 removed_en      = n_pruned_actual * info.num_experts
+
+                                # keep_idx in old d_ff space (needed for residual)
+                                _km = torch.ones(d_ff_orig, dtype=torch.bool)
+                                _km[prune_idx] = False
+                                _keep_idx_packed = _km.nonzero(as_tuple=True)[0]
+
+                                # ── residual_full_moe: compensate BEFORE pruning ──
+                                if method == "residual_full_moe" and _calib_ref is not None:
+                                    _t_rs = time.perf_counter()
+                                    _layer_acts = {
+                                        _ei2: _calib_ref.get((li, _ei2))
+                                        for _ei2 in range(info.num_experts)
+                                    }
+                                    _rs = apply_packed_residual_for_layer(
+                                        ec, prune_idx, _keep_idx_packed, _layer_acts,
+                                        min_tokens=min_resid_tok,
+                                        ridge_lambda=resid_lambda,
+                                        tau=resid_tau,
+                                        solve_on_cpu=resid_on_cpu,
+                                    )
+                                    t_recon_total += time.perf_counter() - _t_rs
+                                    _resid_stable  += _rs["n_stable"]
+                                    _resid_skipped += _rs["n_skipped"]
+                                    _resid_failed  += _rs["n_failed"]
+                                    print(
+                                        f"      [residual_full_moe layer {li}] "
+                                        f"stable={_rs['n_stable']}  "
+                                        f"skip={_rs['n_skipped']}  "
+                                        f"fail={_rs['n_failed']}  "
+                                        f"mean_tok={_rs['mean_tokens']}"
+                                    )
+
                                 new_inter = prune_packed_experts_global(
                                     ec, prune_idx, alignment=chan_align
                                 )
@@ -1692,11 +2008,12 @@ def run_moe_target_pruning_mode(
                     _log_gpu_memory("after forward check")
 
                     _has_packed = any(i.experts_packed for i in moe_layers)
-                    _sel_str    = (f"rmsnorm_bound_{chan_agg}"
-                                   if (_has_packed and pruning_mode == "packed_same_channel")
-                                   else ("rmsnorm_bound_per_expert"
-                                         if pruning_mode == "per_expert_mask"
-                                         else "rmsnorm_bound"))
+                    if pruning_mode == "packed_same_channel" and _has_packed:
+                        _sel_str = f"{moe_selector}_{chan_agg}"
+                    elif pruning_mode == "per_expert_mask":
+                        _sel_str = f"{moe_selector}_per_expert"
+                    else:
+                        _sel_str = moe_selector
                     _phys       = (pruning_mode == "packed_same_channel")
                     _t_end      = time.perf_counter()
                     _gpu0_peak  = (
@@ -1750,6 +2067,11 @@ def run_moe_target_pruning_mode(
                                 "damage_reduction_percent":       float("nan"),
                                 "forward_check":   False,
                                 "reconstruction_time_seconds": round(t_recon_total, 2),
+                                "shape_changed": pruning_mode == "packed_same_channel",
+                                "residual_stable_experts":  _resid_stable,
+                                "residual_skipped_experts": _resid_skipped,
+                                "residual_failed_experts":  _resid_failed,
+                                "residual_time_sec": round(t_recon_total, 2),
                                 "peak_gpu_memory_MB": round(peak_gpu_mb, 1),
                                 "gpu0_peak_mb":  round(_gpu0_peak, 1),
                                 "gpu1_peak_mb":  round(_gpu1_peak, 1),
@@ -1820,6 +2142,11 @@ def run_moe_target_pruning_mode(
                             "damage_reduction_percent": float("nan"),
                             "forward_check":            True,
                             "reconstruction_time_seconds": round(t_recon_total, 2),
+                            "shape_changed": pruning_mode == "packed_same_channel",
+                            "residual_stable_experts":  _resid_stable,
+                            "residual_skipped_experts": _resid_skipped,
+                            "residual_failed_experts":  _resid_failed,
+                            "residual_time_sec": round(t_recon_total, 2),
                             "peak_gpu_memory_MB":        round(peak_gpu_mb, 1),
                             "gpu0_peak_mb":  round(_gpu0_peak, 1),
                             "gpu1_peak_mb":  round(_gpu1_peak, 1),
