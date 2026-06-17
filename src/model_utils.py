@@ -56,6 +56,8 @@ def load_model_and_tokenizer(
     fallback_name: Optional[str] = None,
     device: str = "auto",
     dtype_str: str = "float32",
+    device_map: Optional[str] = None,
+    max_memory: Optional[dict] = None,
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer, str]:
     """Load a causal LM and tokenizer from HuggingFace Hub.
 
@@ -86,14 +88,23 @@ def load_model_and_tokenizer(
             logger.info("Loading tokenizer: %s", name)
             tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
-            logger.info("Loading model: %s  (dtype=%s, device=%s)", name, dtype_str, device_str)
-            model = AutoModelForCausalLM.from_pretrained(
-                name,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-            )
-            model = model.to(device_str)
+            logger.info("Loading model: %s  (dtype=%s, device=%s, device_map=%s)",
+                        name, dtype_str, device_str, device_map)
+            _load_kw = dict(torch_dtype=torch_dtype, trust_remote_code=True)
+            if device_map is not None:
+                _load_kw["device_map"] = device_map
+                if max_memory is not None:
+                    _load_kw["max_memory"] = max_memory
+            model = AutoModelForCausalLM.from_pretrained(name, **_load_kw)
+            if device_map is None:
+                model = model.to(device_str)
             model.eval()
+            if device_map is not None and hasattr(model, "hf_device_map"):
+                _dm = model.hf_device_map
+                _dv: dict = {}
+                for _ln, _dv_id in _dm.items():
+                    _dv[str(_dv_id)] = _dv.get(str(_dv_id), 0) + 1
+                print(f"  hf_device_map summary: {dict(sorted(_dv.items()))}")
 
             # Ensure pad token exists
             if tokenizer.pad_token_id is None:

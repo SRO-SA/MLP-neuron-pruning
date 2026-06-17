@@ -59,5 +59,11 @@ output_dir: "results"
 # Set true to run only first 4 MoE layers (fast correctness check)
 moe_smoke_test: true
 
+# Prune in-place (no deepcopy) — required for large MoE to avoid OOM
+moe_inplace_pruning: true
+
+# "auto" distributes across available GPUs; set "none" to disable
+device_map: "auto"
+
 # Reproducibility
 seed: 42
