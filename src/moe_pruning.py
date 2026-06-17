@@ -107,6 +107,20 @@ MOE_SUMMARY_CSV_KEYS = [
 ]
 
 
+MOE_DRYRUN_CSV_KEYS = [
+    "model", "target_pruning_percent", "pruning_mode",
+    "aggregation_mode", "selector", "max_layer_frac",
+    "moe_channel_alignment",
+    "layer_idx", "num_experts", "old_intermediate",
+    "selected_channels", "new_intermediate",
+    "removed_expert_neurons", "layer_pruning_pct",
+    "zero_routed_experts", "min_routed_tokens",
+    "median_routed_tokens", "max_routed_tokens",
+    "score_min", "score_median", "score_p95", "score_max",
+    "actual_overall_pct", "target_pct", "timestamp",
+]
+
+
 # ---------------------------------------------------------------------------
 # Architecture discovery
 # ---------------------------------------------------------------------------
@@ -1269,6 +1283,105 @@ def _print_moe_summary_table(
     print(f"{'=' * W}\n")
 
 
+def _print_dryrun_table(
+    per_expert_pruned, expert_sizes, moe_layers,
+    all_expert_scores, routed_counts,
+    total_expert_neurons, chan_align,
+    pruning_mode, aggregation_mode, selector,
+    target_pct, actual_pruned, actual_pct,
+    max_layer_frac, model_name, ts,
+):
+    """Enhanced per-layer table with score quantiles for dry-run analysis."""
+    li_to_info = {i.layer_idx: i for i in moe_layers}
+
+    # Build per-layer aggregated score tensor
+    layer_score_agg = {}
+    for _li, _ei, _s in all_expert_scores:
+        sf = _s.float().cpu()
+        if _ei == -1:
+            layer_score_agg[_li] = sf
+        else:
+            if _li not in layer_score_agg:
+                layer_score_agg[_li] = sf
+            else:
+                layer_score_agg[_li] = torch.stack(
+                    [layer_score_agg[_li], sf]
+                ).max(dim=0).values
+
+    pruned_layers = sorted(
+        set(_li for (_li, _ei), plist in per_expert_pruned.items() if plist)
+    )
+
+    SEP = "─"
+    print()
+    print("  DRY-RUN SELECTION TABLE")
+    hdr = (
+        f"  {'layer':>5}  {'n_exp':>5}  {'old_i':>5}  "
+        f"{'sel_ch':>6}  {'new_i':>5}  {'rem_en':>8}  {'lyr%':>5}  "
+        f"{'0rt':>4}  {'min_rt':>6}  {'med_rt':>6}  {'max_rt':>6}  "
+        f"{'s_min':>10}  {'s_med':>10}  {'s_p95':>10}  {'s_max':>10}"
+    )
+    print(hdr)
+    print("  " + SEP * (len(hdr) - 2))
+
+    rows = []
+    for _li in pruned_layers:
+        info  = li_to_info[_li]
+        n_exp = info.num_experts
+        cnts  = [routed_counts.get((_li, ej), 0) for ej in range(n_exp)]
+        z     = sum(1 for c in cnts if c == 0)
+        nz    = sorted(c for c in cnts if c > 0) or [0]
+        mn_rt, mx_rt, med_rt = nz[0], nz[-1], nz[len(nz) // 2]
+        s_vec = layer_score_agg.get(_li, torch.tensor([0.0]))
+        s_min = float(s_vec.min())
+        s_max = float(s_vec.max())
+        s_med = float(s_vec.median())
+        s_p95 = float(torch.quantile(s_vec, 0.95))
+        if info.experts_packed and pruning_mode == "packed_same_channel":
+            key    = (_li, -1)
+            plist  = per_expert_pruned.get(key, [])
+            old_i  = expert_sizes.get(key, 0)
+            sel_ch = len(plist)
+            new_i  = old_i - sel_ch
+            rem_en = sel_ch * n_exp
+        else:
+            sel_ch = sum(len(per_expert_pruned.get((_li, _ei), [])) for _ei in range(n_exp))
+            old_i  = expert_sizes.get((_li, 0), 0)
+            new_i  = old_i if pruning_mode == "per_expert_mask" else old_i - sel_ch
+            rem_en = sel_ch
+        lyr_pct = 100.0 * sel_ch / old_i if old_i else 0.0
+        try:
+            print(
+                f"  {_li:>5}  {n_exp:>5}  {old_i:>5}  "
+                f"{sel_ch:>6}  {new_i:>5}  {rem_en:>8,}  {lyr_pct:>4.1f}%  "
+                f"{z:>4}  {mn_rt:>6}  {med_rt:>6}  {mx_rt:>6}  "
+                f"{s_min:>10.4f}  {s_med:>10.4f}  {s_p95:>10.4f}  {s_max:>10.4f}"
+            )
+        except Exception:
+            print(f"  layer={_li}  (format error)")
+        rows.append({
+            "model": model_name, "target_pruning_percent": target_pct,
+            "pruning_mode": pruning_mode, "aggregation_mode": aggregation_mode,
+            "selector": selector, "max_layer_frac": max_layer_frac,
+            "moe_channel_alignment": chan_align,
+            "layer_idx": _li, "num_experts": n_exp, "old_intermediate": old_i,
+            "selected_channels": sel_ch, "new_intermediate": new_i,
+            "removed_expert_neurons": rem_en,
+            "layer_pruning_pct": round(lyr_pct, 3),
+            "zero_routed_experts": z,
+            "min_routed_tokens": mn_rt, "median_routed_tokens": med_rt,
+            "max_routed_tokens": mx_rt,
+            "score_min": round(s_min, 6), "score_median": round(s_med, 6),
+            "score_p95": round(s_p95, 6), "score_max": round(s_max, 6),
+            "actual_overall_pct": round(actual_pct, 4),
+            "target_pct": target_pct, "timestamp": ts,
+        })
+    print("  " + SEP * (len(hdr) - 2))
+    print(f"  Layers selected: {len(pruned_layers)}  actual_pct={actual_pct:.3f}%")
+    print()
+    return rows
+
+
 def _log_gpu_memory(label: str = "") -> None:
     """Log current/peak GPU memory for all visible devices."""
     if not torch.cuda.is_available():
@@ -1350,6 +1463,8 @@ def run_moe_target_pruning_mode(
     chan_agg       = str(cfg.get("moe_same_channel_aggregation", "p95"))
     pruning_mode   = str(cfg.get("moe_pruning_mode", "packed_same_channel"))
     moe_selector   = str(cfg.get("moe_selector", "rmsnorm_bound"))
+    dry_run        = bool(cfg.get("moe_selection_dry_run", False))
+    max_layer_frac = float(cfg.get("moe_max_layer_channel_prune_frac", 1.0))
     resid_lambda   = float(cfg.get("residual_lambda", 1e-2))
     resid_tau      = float(cfg.get("residual_tau", 1.0))
     min_resid_tok  = int(cfg.get("min_residual_tokens_per_expert", 16))
@@ -1370,6 +1485,12 @@ def run_moe_target_pruning_mode(
     print(f"  aggregation    : {chan_agg}")
     print(f"  pruning_mode   : {pruning_mode}")
     print(f"  moe_selector   : {moe_selector}")
+    if dry_run:
+        print("  DRY-RUN MODE   : selection only — no pruning, no PPL eval")
+    if max_layer_frac < 1.0:
+        _cap_ex = (int(768 * max_layer_frac) // chan_align) * chan_align
+        print(f"  max_layer_frac : {max_layer_frac:.0%} per layer"
+              f" (cap ~{_cap_ex} ch for d_ff=768 align={chan_align})")
     if smoke_test:
         print("  SMOKE TEST MODE: only first 4 MoE layers will be processed")
     if inplace_prune:
@@ -1509,15 +1630,19 @@ def run_moe_target_pruning_mode(
             )
             print(f"  Total expert MLP neurons (prunable): {total_expert_neurons:,}")
 
-            # Per-dataset baselines
-            baseline_ppl_per_ds = {}
-            for _ds in EVAL_DATASETS:
-                _bp = evaluate_perplexity(
-                    model, tokenizer, texts=all_eval_corpora[_ds],
-                    max_seq_len=max_seq, batch_size=batch_sz, device=device,
-                )
-                baseline_ppl_per_ds[_ds] = _bp["perplexity"]
-                print(f"  Baseline PPL ({_ds}): {_bp['perplexity']:.4f}")
+            # Per-dataset baselines (skipped for dry-run)
+            if dry_run:
+                baseline_ppl_per_ds = {_ds: float("nan") for _ds in EVAL_DATASETS}
+                print("  [dry-run] Skipping baseline PPL evaluation.")
+            else:
+                baseline_ppl_per_ds = {}
+                for _ds in EVAL_DATASETS:
+                    _bp = evaluate_perplexity(
+                        model, tokenizer, texts=all_eval_corpora[_ds],
+                        max_seq_len=max_seq, batch_size=batch_sz, device=device,
+                    )
+                    baseline_ppl_per_ds[_ds] = _bp["perplexity"]
+                    print(f"  Baseline PPL ({_ds}): {_bp['perplexity']:.4f}")
 
             baseline_params = count_parameters(model)
             _log_gpu_memory("after baseline PPL")
@@ -1656,6 +1781,12 @@ def run_moe_target_pruning_mode(
                     key = (li, ei)
                     if len(per_expert_pruned[key]) >= expert_caps[key]:
                         continue
+                    # Per-layer cap for packed same-channel
+                    if ei == -1 and max_layer_frac < 1.0:
+                        _d_ff_l = expert_sizes[key]
+                        _layer_cap = (int(_d_ff_l * max_layer_frac) // chan_align) * chan_align
+                        if _layer_cap > 0 and len(per_expert_pruned[key]) >= _layer_cap:
+                            continue
                     per_expert_pruned[key].append(ni)
                     wt = entry_weight[key]
                     removed_expert_neurons  += wt
@@ -1680,6 +1811,12 @@ def run_moe_target_pruning_mode(
                     if new_inter_aligned <= 0:
                         print(f"    WARNING: alignment={chan_align} would reduce "
                               f"layer {_li} to 0 channels — skipping alignment")
+                        continue
+                    # Cap extra by max_layer_frac to avoid exceeding per-layer limit
+                    if max_layer_frac < 1.0:
+                        _layer_cap = (int(old_inter * max_layer_frac) // chan_align) * chan_align
+                        extra = min(extra, max(0, _layer_cap - k))
+                    if extra == 0:
                         continue
                     # Find extra lowest-scoring channels NOT already in prune_list
                     pruned_set = set(prune_list)
@@ -1710,6 +1847,42 @@ def run_moe_target_pruning_mode(
                     routed_counts, total_expert_neurons, chan_align,
                     pruning_mode=pruning_mode,
                 )
+
+                # ── Dry-run: save selection analysis, skip pruning+PPL ──────────
+                if dry_run:
+                    _dr_rows = _print_dryrun_table(
+                        per_expert_pruned, expert_sizes, moe_layers,
+                        all_expert_scores, routed_counts,
+                        total_expert_neurons, chan_align,
+                        pruning_mode, chan_agg, moe_selector,
+                        target_pct, actual_pruned, actual_pct,
+                        max_layer_frac, model_name, ts,
+                    )
+                    _dr_csv = os.path.join(
+                        output_dir,
+                        f"moe_dryrun_{ts}_{target_pct}pct.csv",
+                    )
+                    _flush_csv(_dr_csv, _dr_rows, MOE_DRYRUN_CSV_KEYS)
+                    _dr_json = _dr_csv.replace(".csv", ".json")
+                    import json as _json
+                    with open(_dr_json, "w") as _jf:
+                        _json.dump({
+                            "model": model_name, "target_pct": target_pct,
+                            "actual_pct": round(actual_pct, 4),
+                            "pruning_mode": pruning_mode,
+                            "aggregation_mode": chan_agg,
+                            "selector": moe_selector,
+                            "max_layer_frac": max_layer_frac,
+                            "rows": _dr_rows,
+                        }, _jf, indent=2)
+                    print(f"  [dry-run] CSV  saved: {_dr_csv}")
+                    print(f"  [dry-run] JSON saved: {_dr_json}")
+                    del expert_activations
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _log_gpu_memory("dry-run after cache release")
+                    continue   # skip method loop — no pruning, no PPL
 
                 # ── Release calibration caches before pruning ─────────────────
                 # pure_delete needs no per-expert activations during pruning;

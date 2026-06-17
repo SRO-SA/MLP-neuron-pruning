@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------
+# Full-48 benchmark: packed_same_channel + p95 + 2% + pure_delete
+# Physical shape change, per-layer cap 10%, n_eval=256.
+#
+#   python run_experiment.py \
+#       --config configs/moe_full48_packed_p95_2pct.yaml \
+#       --moe-target-pruning
+# ---------------------------------------------------------------
+
+device: "auto"
+scaling_dtype: "auto"
+
+scaling_models:
+  - "Qwen/Qwen3-30B-A3B"
+
+target_pruning_percents:
+  - 2.0
+
+scaling_methods:
+  - "pure_delete"
+
+max_expert_frac: 0.20
+min_expert_tokens: 32
+reconstruction_eval_samples: 256
+max_seq_len: 512
+batch_size: 1
+
+eval_datasets:
+  - "wikitext2"
+use_fallback_corpus: false
+
+output_dir: "results"
+moe_smoke_test: false          # full 48 layers
+moe_inplace_pruning: true
+device_map: "auto"
+moe_channel_alignment: 16
+moe_same_channel_aggregation: "p95"
+moe_pruning_mode: "packed_same_channel"
+moe_selector: "rmsnorm_bound"
+
+# Per-layer cap: max 10% of d_ff channels removed per layer (aligned to 16)
+# For d_ff=2048 (Qwen3-30B-A3B): cap = floor(0.10 * 2048 / 16) * 16 = 128 channels
+moe_max_layer_channel_prune_frac: 0.10
+
+residual_lambda: 1.0e-2
+residual_tau: 1.0
+min_residual_tokens_per_expert: 16
+solve_residual_on_cpu: true
+
+seed: 42

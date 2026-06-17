@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------
+# Full-48: dry-run selection only — packed_same_channel + p95 + 4%
+# No pruning, no PPL eval. Saves per-layer score stats to CSV/JSON.
+#
+#   python run_experiment.py \
+#       --config configs/moe_full48_selection_packed_p95_4pct.yaml \
+#       --moe-target-pruning
+# ---------------------------------------------------------------
+
+device: "auto"
+scaling_dtype: "auto"
+
+scaling_models:
+  - "Qwen/Qwen3-30B-A3B"
+
+target_pruning_percents:
+  - 4.0
+
+scaling_methods:
+  - "pure_delete"
+
+max_expert_frac: 0.20
+min_expert_tokens: 32
+reconstruction_eval_samples: 64
+max_seq_len: 512
+batch_size: 1
+
+eval_datasets:
+  - "wikitext2"
+use_fallback_corpus: false
+
+output_dir: "results"
+moe_smoke_test: false          # full 48 layers
+moe_inplace_pruning: true
+device_map: "auto"
+moe_channel_alignment: 16
+moe_same_channel_aggregation: "p95"
+moe_pruning_mode: "packed_same_channel"
+moe_selector: "rmsnorm_bound"
+
+# Dry-run: selection only — no weight modification, no PPL eval
+moe_selection_dry_run: true
+
+seed: 42
