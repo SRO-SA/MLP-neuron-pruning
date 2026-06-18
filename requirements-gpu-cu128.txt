@@ -1,0 +1,25 @@
+# ── PyTorch family — CUDA 12.8 stable wheels ─────────────────────────────────
+#
+# IMPORTANT: torch, torchvision, and torchaudio MUST be installed together from
+# the same PyTorch wheel index.  Installing any one of them from a different
+# source (PyPI, conda, system packages) will cause ABI mismatches and
+# "undefined symbol" / "cannot open shared object" errors at runtime.
+#
+# Install with:
+#   pip install -r requirements-gpu-cu128.txt
+#
+# Or let setup_env.sh handle it:
+#   INSTALL_TORCH_CU128=1 bash setup_env.sh
+#
+# Why torchaudio is included:
+#   This project does not directly use torchaudio. However, recent Transformers
+#   versions may indirectly import torchaudio through shared modeling utilities.
+#   If torchaudio is present but was installed from a different source than
+#   torch, Transformers model loading will fail with a .so symbol error.
+#   Installing all three from the same index prevents this.
+#
+--index-url https://download.pytorch.org/whl/cu128
+
+torch>=2.5.0
+torchvision
+torchaudio

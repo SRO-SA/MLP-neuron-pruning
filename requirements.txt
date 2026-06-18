@@ -1,26 +1,36 @@
-# ── Core ML ───────────────────────────────────────────────────────────────────
-# PyTorch: do NOT install from this file — the default PyPI wheel is CPU-only.
-# Run  ./setup.sh  (or scripts/install.sh) to get the correct CUDA build first.
-# After that, all other packages below can be installed with:
-#   pip install -r requirements.txt --ignore-installed torch torchvision torchaudio
-torch>=2.2.0
-torchvision
-# torchaudio is intentionally excluded: not used by this project, and its .so
-# files frequently cause ABI mismatch errors on Docker/cloud images.
+# ── Python dependencies for qwen_swiglu_pruning ──────────────────────────────
+#
+# This file covers only normal Python packages.
+# PyTorch (torch, torchvision, torchaudio) must be installed separately via:
+#
+#   bash setup_env.sh   (recommended — handles CUDA detection and ABI matching)
+#
+# or manually:
+#   pip install -r requirements-gpu-cu128.txt   (stable CUDA 12.8)
+#
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+#
+# Qwen3-30B-A3B (Qwen3MoeForCausalLM) was added in transformers 4.51.0.
+# The upper bound <5.0.0 guards against breaking API changes in a future major.
+#
+transformers>=4.51.0,<5.0.0
+accelerate>=0.34.0,<2.0.0
+datasets>=2.20.0,<4.0.0
+huggingface_hub>=0.24.0,<2.0.0
+safetensors>=0.4.5,<1.0.0
+tokenizers>=0.19.0,<1.0.0
+sentencepiece>=0.1.99,<0.3.0
 
-# ── HuggingFace ───────────────────────────────────────────────────────────────
-transformers>=4.43.0
-datasets>=2.19.0
-accelerate>=0.30.0
-huggingface_hub>=0.23.0
-safetensors>=0.4.3          # required to load .safetensors weight files
-tokenizers>=0.19.0
-sentencepiece>=0.1.99       # required for Qwen / LLaMA tokenizer SentencePiece backend
+# ── Numerics / ML utilities ───────────────────────────────────────────────────
+numpy>=1.26.0,<3.0.0
+scipy>=1.12.0,<2.0.0           # used for ridge regression helpers
+pandas>=2.2.0,<3.0.0
+scikit-learn>=1.4.0,<2.0.0
 
-# ── Numerics / data ───────────────────────────────────────────────────────────
-numpy>=1.24.0
-pandas>=2.0.0
+# ── Visualisation / reporting ─────────────────────────────────────────────────
+matplotlib>=3.9.0,<4.0.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-tqdm>=4.66.0
-pyyaml>=6.0
+# ── System / CLI utilities ────────────────────────────────────────────────────
+tqdm>=4.66.0,<5.0.0
+pyyaml>=6.0,<7.0
+psutil>=5.9.0,<7.0.0

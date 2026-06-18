@@ -102,7 +102,74 @@ qwen_swiglu_pruning/
 
 ---
 
-## Install
+## Fresh pod setup (RunPod / Docker)
+
+> **torchaudio note:** This project does not directly use torchaudio.
+> However, recent Transformers versions may indirectly import torchaudio
+> through shared modeling/loss utilities.  If torchaudio is present but was
+> installed from a different source than torch, Transformers model loading
+> will fail with an `undefined symbol` / `.so` error.
+> **The safest fix is to install torch, torchvision, and torchaudio together
+> from the same PyTorch CUDA wheel index.**  `setup_env.sh` does this for you.
+
+```bash
+cd /root/workspace/MLP-neuron-pruning/qwen_swiglu_pruning
+```
+
+### Option A — keep the torch that came with the container
+
+Use this when the Docker image already has a working, CUDA-capable torch
+(e.g. a RunPod PyTorch template).
+
+```bash
+USE_EXISTING_TORCH=1 bash setup_env.sh
+```
+
+### Option B — install stable CUDA 12.8 torch family
+
+Use this on a fresh system or when you want a reproducible torch version.
+
+```bash
+INSTALL_TORCH_CU128=1 bash setup_env.sh
+```
+
+### Option C — install nightly CUDA 12.8 torch family
+
+Use **only** if stable torch does not support your GPU architecture.
+For example, Blackwell (sm\_120) GPUs may require nightly builds.
+**Nightly = pre-release:** expect occasional API changes.
+
+```bash
+INSTALL_TORCH_NIGHTLY_CU128=1 bash setup_env.sh
+```
+
+### Then run the readiness check
+
+```bash
+bash scripts/ready_check.sh
+```
+
+This will:
+1. Verify all imports and CUDA availability (`scripts/check_env.py`)
+2. Download Qwen2.5-0.5B, Qwen3-30B-A3B, WikiText-2, C4 (skips if cached)
+3. Run a tiny dense smoke test (Qwen2.5-0.5B, n\_eval=8)
+4. Run a tiny MoE smoke test (Qwen3-30B-A3B, 1%, smoke layers, n\_eval=8)
+
+And print `READY TO RUN PAPER BENCHMARKS` if everything passes.
+
+### Manual requirements install (without setup_env.sh)
+
+```bash
+# Python-only deps (no torch):
+pip install -r requirements.txt
+
+# Torch family — must all come from the same index:
+pip install -r requirements-gpu-cu128.txt
+```
+
+---
+
+## Install (original / minimal)
 
 ```bash
 # Python 3.10+, CUDA optional

@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------
+# Tiny dense smoke — Qwen2.5-0.5B, 8 eval samples
+# Used by: scripts/ready_check.sh
+#
+#   python run_experiment.py --config configs/smoke_dense_0.5b.yaml
+# ---------------------------------------------------------------
+
+model_name: "Qwen/Qwen2.5-0.5B"
+model_name_fallback: "Qwen/Qwen2.5-0.5B-Instruct"
+
+device: "auto"
+dtype: "bfloat16"
+
+pruning_ratios:
+  - 0.0
+  - 0.10
+
+pruning_methods:
+  - random
+  - rmsnorm_bound_angle
+
+max_eval_samples: 8
+max_seq_len: 256
+batch_size: 1
+
+eval_dataset: "wikitext2"
+use_fallback_corpus: false
+
+output_dir: "results"
+seed: 42

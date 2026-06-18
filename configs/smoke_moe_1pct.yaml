@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------
+# Tiny MoE smoke — Qwen3-30B-A3B, smoke layers only, 8 eval samples
+# Used by: scripts/ready_check.sh
+#
+#   python run_experiment.py \
+#       --config configs/smoke_moe_1pct.yaml \
+#       --moe-target-pruning
+# ---------------------------------------------------------------
+
+device: "auto"
+scaling_dtype: "auto"
+
+scaling_models:
+  - "Qwen/Qwen3-30B-A3B"
+
+target_pruning_percents:
+  - 1.0
+
+scaling_methods:
+  - "pure_delete"
+
+max_expert_frac: 0.20
+min_expert_tokens: 32
+reconstruction_eval_samples: 8
+max_seq_len: 256
+batch_size: 1
+
+eval_datasets:
+  - "wikitext2"
+use_fallback_corpus: false
+
+output_dir: "results"
+moe_smoke_test: true           # uses first few layers only, not full 48
+moe_inplace_pruning: true
+device_map: "auto"
+moe_channel_alignment: 16
+moe_same_channel_aggregation: "p95"
+moe_pruning_mode: "packed_same_channel"
+moe_selector: "rmsnorm_bound"
+moe_max_layer_channel_prune_frac: 0.10
+
+seed: 42
