@@ -90,7 +90,7 @@ def load_model_and_tokenizer(
 
             logger.info("Loading model: %s  (dtype=%s, device=%s, device_map=%s)",
                         name, dtype_str, device_str, device_map)
-            _load_kw = dict(torch_dtype=torch_dtype, trust_remote_code=True)
+            _load_kw = dict(dtype=torch_dtype, trust_remote_code=True)
             if device_map is not None:
                 _load_kw["device_map"] = device_map
                 if max_memory is not None:

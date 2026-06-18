@@ -7,9 +7,10 @@
 #
 # What this does:
 #   1. Detect CUDA version from nvidia-smi (or nvcc)
-#   2. Install PyTorch + torchvision from the correct wheel index
-#   3. pip install -r requirements.txt  (skips torch/torchvision, already handled)
-#   4. Quick sanity check: python -c "import torch; print(torch.__version__)"
+#   2. Force-reinstall torch + torchvision + torchaudio from the matching wheel index
+#      (this fixes "undefined symbol" ABI mismatches from pre-installed packages)
+#   3. pip install -r requirements.txt for everything else
+#   4. Quick sanity check
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -69,24 +70,32 @@ echo "  Detected build tag: ${CUDA_TAG}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# ── 2. Install PyTorch ───────────────────────────────────────────────────────
+# ── 2. Install PyTorch family from the correct wheel index ──────────────────
+# IMPORTANT: torch, torchvision, and torchaudio must ALL come from the same
+# index and the same build tag.  A version mismatch between any two of them
+# causes "undefined symbol" errors at import time (ABI incompatibility).
+# We force-reinstall all three to clobber any pre-installed mismatched copy.
 if [[ "$CUDA_TAG" == "cpu" ]]; then
     INDEX_URL="https://download.pytorch.org/whl/cpu"
-    echo "[1/3] Installing PyTorch (CPU-only) ..."
+    echo "[1/3] Installing PyTorch (CPU-only) — force-reinstalling to fix ABI ..."
 else
     INDEX_URL="https://download.pytorch.org/whl/${CUDA_TAG}"
-    echo "[1/3] Installing PyTorch + CUDA (${CUDA_TAG}) ..."
+    echo "[1/3] Installing PyTorch + CUDA (${CUDA_TAG}) — force-reinstalling to fix ABI ..."
 fi
 
 $PIP install --upgrade pip --quiet
-$PIP install torch torchvision --index-url "$INDEX_URL"
+
+# Force-reinstall ensures stale/mismatched pre-installed wheels are replaced.
+$PIP install --force-reinstall \
+    torch torchvision torchaudio \
+    --index-url "$INDEX_URL"
 
 # ── 3. Install remaining requirements ───────────────────────────────────────
 echo ""
 echo "[2/3] Installing other requirements ..."
-# torch/torchvision already handled above; pass them so pip doesn't downgrade
+# Exclude the torch family; they were already handled above with the right index.
 $PIP install -r requirements.txt \
-    --ignore-installed torch torchvision \
+    --ignore-installed torch torchvision torchaudio \
     --extra-index-url "$INDEX_URL"
 
 # ── 4. Sanity check ─────────────────────────────────────────────────────────
@@ -99,6 +108,8 @@ import importlib
 ok = True
 checks = [
     ("torch",           "torch"),
+    ("torchvision",     "torchvision"),
+    ("torchaudio",      "torchaudio"),
     ("transformers",    "transformers"),
     ("datasets",        "datasets"),
     ("accelerate",      "accelerate"),
@@ -116,8 +127,8 @@ for mod, pkg in checks:
         m = importlib.import_module(mod)
         ver = getattr(m, "__version__", "?")
         print(f"  ✓  {mod:<22} {ver}")
-    except ImportError:
-        print(f"  ✗  {mod:<22} NOT FOUND  (pip install {pkg})", file=sys.stderr)
+    except ImportError as e:
+        print(f"  ✗  {mod:<22} NOT FOUND  ({e})", file=sys.stderr)
         ok = False
 
 try:

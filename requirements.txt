@@ -5,6 +5,7 @@
 #   pip install -r requirements.txt --ignore-installed torch torchvision torchaudio
 torch>=2.2.0
 torchvision
+torchaudio          # must match torch version exactly — installed via setup.sh
 
 # ── HuggingFace ───────────────────────────────────────────────────────────────
 transformers>=4.43.0
