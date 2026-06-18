@@ -1,8 +1,24 @@
-torch>=2.1.0
-transformers>=4.40.0
-datasets>=2.18.0
-accelerate>=0.27.0
-pyyaml>=6.0
+# ── Core ML ───────────────────────────────────────────────────────────────────
+# PyTorch: do NOT install from this file — the default PyPI wheel is CPU-only.
+# Run  ./setup.sh  (or scripts/install.sh) to get the correct CUDA build first.
+# After that, all other packages below can be installed with:
+#   pip install -r requirements.txt --ignore-installed torch torchvision torchaudio
+torch>=2.2.0
+torchvision
+
+# ── HuggingFace ───────────────────────────────────────────────────────────────
+transformers>=4.43.0
+datasets>=2.19.0
+accelerate>=0.30.0
+huggingface_hub>=0.23.0
+safetensors>=0.4.3          # required to load .safetensors weight files
+tokenizers>=0.19.0
+sentencepiece>=0.1.99       # required for Qwen / LLaMA tokenizer SentencePiece backend
+
+# ── Numerics / data ───────────────────────────────────────────────────────────
 numpy>=1.24.0
 pandas>=2.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 tqdm>=4.66.0
+pyyaml>=6.0
