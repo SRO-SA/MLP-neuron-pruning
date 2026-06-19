@@ -1,0 +1,35 @@
+# env_expected.yaml — locked paper environment fingerprint
+#
+# Generated from the working pod used to produce all benchmark results.
+# check_env.py --strict verifies exact matches for all entries listed here.
+# Model layout entries are verified by a live forward pass (requires GPU).
+
+# ── Python ────────────────────────────────────────────────────────────────────
+python_major_minor: "3.10"
+
+# ── PyTorch stack (installed via requirements-torch-cu128.txt) ────────────────
+torch: "2.7.1+cu128"
+torch_cuda: "12.8"
+torchvision: "0.22.1+cu128"
+torchaudio: "2.7.1+cu128"
+
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+transformers: "4.57.6"
+datasets: "3.6.0"
+accelerate: "1.14.0"
+tokenizers: "0.22.2"
+safetensors: "0.8.0"
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy: "2.2.6"
+scipy: "1.15.3"
+pandas: "2.3.3"
+pyyaml: "6.0.3"
+
+# ── Model layout (Qwen/Qwen3-30B-A3B on this pod) ────────────────────────────
+# The model loads as UNPACKED ModuleList experts on the locked pod.
+# If layout differs from this value, check_env.py --strict will fail.
+expected_expert_layout: "unpacked"
+expected_expert_gate_shape: [768, 2048]
+expected_expert_up_shape: [768, 2048]
+expected_expert_down_shape: [2048, 768]

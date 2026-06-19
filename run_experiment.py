@@ -66,6 +66,86 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Reproducible environment guard
+# ---------------------------------------------------------------------------
+# In paper benchmark mode (ALLOW_UNLOCKED_ENV is not set), warn or fail if
+# the environment does not match the locked paper environment.
+# To bypass: ALLOW_UNLOCKED_ENV=1 python run_experiment.py ...
+# ---------------------------------------------------------------------------
+
+def _check_env_guard() -> None:
+    """Warn (or fail in strict mode) if not running inside the locked venv."""
+    allow = os.environ.get("ALLOW_UNLOCKED_ENV", "").strip()
+    if allow == "1":
+        return  # explicitly bypassed
+
+    locked_venv = "/workspace/venvs/qwen-pruning"
+    venv_active = os.environ.get("VIRTUAL_ENV", "")
+    in_locked_venv = venv_active.startswith(locked_venv)
+
+    # Check key package versions against env_expected.yaml
+    env_yaml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env_expected.yaml")
+    version_ok = True
+    mismatch_msgs: list = []
+
+    if os.path.exists(env_yaml):
+        try:
+            with open(env_yaml) as _f:
+                _exp = yaml.safe_load(_f)
+
+            import torch as _torch
+            import transformers as _tr
+            import numpy as _np
+
+            def _ver_matches(actual: str, expected: str) -> bool:
+                return actual.split("+")[0].strip() == expected.split("+")[0].strip()
+
+            checks = [
+                ("torch",        _torch.__version__,  str(_exp.get("torch", ""))),
+                ("transformers", _tr.__version__,     str(_exp.get("transformers", ""))),
+                ("numpy",        _np.__version__,     str(_exp.get("numpy", ""))),
+            ]
+            for name, actual, expected in checks:
+                if expected and not _ver_matches(actual, expected):
+                    mismatch_msgs.append(f"{name}: got {actual!r}, expected {expected!r}")
+                    version_ok = False
+        except Exception:
+            pass  # best-effort; don't crash on import errors
+
+    issues: list = []
+    if not in_locked_venv:
+        issues.append(
+            f"not running inside locked venv ({locked_venv}). "
+            f"Active venv: {venv_active or 'none'}"
+        )
+    if mismatch_msgs:
+        issues.append("package version mismatches: " + "; ".join(mismatch_msgs))
+
+    if issues:
+        sep = "=" * 70
+        print(f"\n{sep}", file=sys.stderr)
+        print("  ENVIRONMENT WARNING — results may not be reproducible", file=sys.stderr)
+        for issue in issues:
+            print(f"    ⚠  {issue}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  To reproduce paper benchmarks:", file=sys.stderr)
+        print("    RESET_ENV=1 bash setup_repro_env.sh", file=sys.stderr)
+        print("    source /workspace/venvs/qwen-pruning/bin/activate", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  To suppress this warning:", file=sys.stderr)
+        print("    ALLOW_UNLOCKED_ENV=1 python run_experiment.py ...", file=sys.stderr)
+        print(f"{sep}\n", file=sys.stderr)
+
+        # In paper benchmark mode (no explicit override), fail hard
+        paper_mode = os.environ.get("PAPER_BENCHMARK_MODE", "").strip() == "1"
+        if paper_mode:
+            sys.exit(
+                "ERROR: PAPER_BENCHMARK_MODE=1 requires the locked environment. "
+                "Run: RESET_ENV=1 bash setup_repro_env.sh"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Config / device
 # ---------------------------------------------------------------------------
 

@@ -1238,24 +1238,45 @@ def _print_per_layer_distribution(
             )
 
         else:
-            # Unpacked: one line per pruned expert.
-            for ei in range(n_exp):
-                key   = (_li, ei)
-                plist = per_expert_pruned.get(key, [])
-                if not plist:
-                    continue
-                old_i = expert_sizes.get(key, 0)
+            # Unpacked: check for same-channel mode ((li, -1) keys) first.
+            key_sc = (_li, -1)
+            if key_sc in per_expert_pruned:
+                # same_channel_all_experts: one summary line per layer
+                plist = per_expert_pruned[key_sc]
+                old_i = expert_sizes.get(key_sc, 0)
                 n_pr  = len(plist)
-                new_i = old_i - n_pr if not is_mask_only else old_i
-                rem   = n_pr
+                new_i = old_i - n_pr
+                rem   = n_pr * n_exp
                 pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
-                n_rt  = routed_counts.get((_li, ei), 0)
+                cnts  = [routed_counts.get((_li, ej), 0) for ej in range(n_exp)]
+                z     = sum(1 for c in cnts if c == 0)
+                nz    = sorted(c for c in cnts if c > 0) or [0]
+                mn, mx, med = nz[0], nz[-1], nz[len(nz)//2]
                 print(
-                    f"    {_li:>6}  {1:>6}  {old_i:>6}  "
+                    f"    {_li:>6}  {n_exp:>6}  {old_i:>6}  "
                     f"{n_pr:>7}  {new_i:>6}  "
                     f"{rem:>9,}  {pct:>5.2f}%  "
-                    f"{'n/a':>4}  {n_rt:>6}  {n_rt:>6}  {n_rt:>6}"
+                    f"{z:>4}  {mn:>6}  {med:>6}  {mx:>6}"
                 )
+            else:
+                # per-expert unpacked: one line per pruned expert
+                for ei in range(n_exp):
+                    key   = (_li, ei)
+                    plist = per_expert_pruned.get(key, [])
+                    if not plist:
+                        continue
+                    old_i = expert_sizes.get(key, 0)
+                    n_pr  = len(plist)
+                    new_i = old_i - n_pr if not is_mask_only else old_i
+                    rem   = n_pr
+                    pct   = 100.0 * rem / total_expert_neurons if total_expert_neurons else 0.0
+                    n_rt  = routed_counts.get((_li, ei), 0)
+                    print(
+                        f"    {_li:>6}  {1:>6}  {old_i:>6}  "
+                        f"{n_pr:>7}  {new_i:>6}  "
+                        f"{rem:>9,}  {pct:>5.2f}%  "
+                        f"{'n/a':>4}  {n_rt:>6}  {n_rt:>6}  {n_rt:>6}"
+                    )
     print()
 
 
@@ -1508,7 +1529,7 @@ def _count_moe_expert_params(moe_layers_list) -> int:
         else:
             for exp in info.expert_modules:
                 w = get_expert_weights(exp)
-                for k in ("gate_weight", "up_weight", "down_weight"):
+                for k in ("gate_proj", "up_proj", "down_proj"):
                     t = w.get(k)
                     if t is not None:
                         total += t.numel()
@@ -1530,13 +1551,16 @@ def _estimate_moe_active_flops(moe_layers_list) -> float:
             _, two_inter, hidden = ec.gate_up_proj.shape
             intermediate = two_inter // 2
             total += top_k * 6.0 * intermediate * hidden
-        else:
-            for exp in info.expert_modules:
-                w = get_expert_weights(exp)
-                gw = w.get("gate_weight")
+        elif info.expert_modules:
+            # Unpacked: compute once per layer (top_k already accounts for active experts)
+            try:
+                w0 = get_expert_weights(info.expert_modules[0])
+                gw = w0.get("gate_proj")
                 if gw is not None:
                     d_ff, d_model = gw.shape
                     total += top_k * 6.0 * d_ff * d_model
+            except Exception:
+                pass
     return total
 
 
@@ -2720,8 +2744,18 @@ def run_moe_target_pruning_mode(
                             )
 
                     # ── Forward check ─────────────────────────────────────────
-                    # If forward pass fails, record error and skip PPL eval.
-                    fp_ok = verify_forward_pass(model, tokenizer, device) if _prune_valid else False
+                    # Only run forward pass if pruning validation passed.
+                    # Separate status: failed_invalid_physical_pruning vs failed_forward_check
+                    fp_ok = True
+                    if not _prune_valid:
+                        fp_ok = False
+                        _notes_str = "failed_invalid_physical_pruning"
+                        print("    ERROR: pruning validation failed — skipping forward check and PPL eval")
+                    else:
+                        fp_ok = verify_forward_pass(model, tokenizer, device)
+                        if not fp_ok:
+                            _notes_str = "failed_forward_check"
+                            print("    ERROR: forward pass failed — skipping PPL eval")
                     _log_gpu_memory("after forward check")
 
                     _has_packed = any(i.experts_packed for i in moe_layers)
@@ -2744,17 +2778,7 @@ def run_moe_target_pruning_mode(
                         else 0.0
                     )
 
-                    if not _prune_valid:
-                        print("    Marking result as: failed_invalid_physical_pruning")
                     if not fp_ok:
-                        _notes_str = (
-                            "failed_invalid_physical_pruning"
-                            if not _prune_valid
-                            else "forward_pass_failed"
-                        )
-                        print(f"    (status: {_notes_str})")
-                    if not fp_ok:
-                        print("    ERROR: forward pass failed — skipping PPL eval")
                         for _ds in EVAL_DATASETS:
                             err_row = {
                                 "model": model_name,
@@ -2813,7 +2837,7 @@ def run_moe_target_pruning_mode(
                                 "processed_moe_layers": len(moe_layers),
                                 "n_eval": n_eval,
                                 "moe_calib_samples": moe_calib_samples,
-                                "status": "forward_pass_failed",
+                                "status": locals().get("_notes_str", "failed_forward_check"),
                                 "expert_param_reduction_pct": round(_expert_param_red_pct, 4),
                                 "total_model_param_reduction_pct": round(_total_model_param_red_pct, 4),
                                 "estimated_active_expert_flop_reduction_pct": round(_active_flop_red_pct, 4),

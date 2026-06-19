@@ -102,70 +102,81 @@ qwen_swiglu_pruning/
 
 ---
 
-## Fresh pod setup (RunPod / Docker)
+## Fresh pod setup — reproducible locked environment (recommended)
 
-> **torchaudio note:** This project does not directly use torchaudio.
-> However, recent Transformers versions may indirectly import torchaudio
-> through shared modeling/loss utilities.  If torchaudio is present but was
-> installed from a different source than torch, Transformers model loading
-> will fail with an `undefined symbol` / `.so` error.
-> **The safest fix is to install torch, torchvision, and torchaudio together
-> from the same PyTorch CUDA wheel index.**  `setup_env.sh` does this for you.
+The paper benchmarks were produced in an exactly pinned environment.
+`setup_repro_env.sh` creates an isolated venv with those exact versions,
+verifies them with `--strict`, and writes `env_fingerprint.json`.
 
 ```bash
 cd /root/workspace/MLP-neuron-pruning/qwen_swiglu_pruning
+RESET_ENV=1 bash setup_repro_env.sh
+source /workspace/venvs/qwen-pruning/bin/activate
+export PYTHONPATH=$PWD:$PYTHONPATH
+SKIP_DOWNLOAD=1 bash scripts/ready_check.sh
 ```
 
-### Option A — keep the torch that came with the container
+**Locked environment (from `env_expected.yaml`):**
 
-Use this when the Docker image already has a working, CUDA-capable torch
-(e.g. a RunPod PyTorch template).
+| Package | Version |
+|---------|---------|
+| Python | 3.10.12 |
+| torch | 2.7.1+cu128 |
+| torchvision | 0.22.1+cu128 |
+| torchaudio | 2.7.1+cu128 |
+| transformers | 4.57.6 |
+| datasets | 3.6.0 |
+| accelerate | 1.14.0 |
+| numpy | 2.2.6 |
+| scipy | 1.15.3 |
+| pandas | 2.3.3 |
+| pyyaml | 6.0.3 |
+
+**Expected Qwen/Qwen3-30B-A3B model layout on the locked pod:**
+
+```
+expert_layout      : unpacked (nn.ModuleList of 128 independent experts)
+expert[0].gate_proj: [768, 2048]
+expert[0].up_proj  : [768, 2048]
+expert[0].down_proj: [2048, 768]
+```
+
+If the model loads with a different layout (e.g. packed fused tensors),
+`check_env.py --strict` will fail with: *"Model layout differs from the
+locked paper environment."*
+
+### Environment guard in `run_experiment.py`
+
+`run_experiment.py` checks the environment at startup and prints a warning
+if the locked venv is not active or package versions differ.  To bypass:
 
 ```bash
-USE_EXISTING_TORCH=1 bash setup_env.sh
+ALLOW_UNLOCKED_ENV=1 python run_experiment.py --config configs/default.yaml
 ```
 
-### Option B — install stable CUDA 12.8 torch family
-
-Use this on a fresh system or when you want a reproducible torch version.
+For strict paper-benchmark mode (fails hard if env is wrong):
 
 ```bash
-INSTALL_TORCH_CU128=1 bash setup_env.sh
+PAPER_BENCHMARK_MODE=1 python run_experiment.py --config configs/default.yaml
 ```
 
-### Option C — install nightly CUDA 12.8 torch family
-
-Use **only** if stable torch does not support your GPU architecture.
-For example, Blackwell (sm\_120) GPUs may require nightly builds.
-**Nightly = pre-release:** expect occasional API changes.
+### Manual install (without the reproducible setup script)
 
 ```bash
-INSTALL_TORCH_NIGHTLY_CU128=1 bash setup_env.sh
+# Step 1 — PyTorch stack (exact CUDA 12.8 wheels):
+pip install -r requirements-torch-cu128.txt
+
+# Step 2 — all other deps:
+pip install -r requirements-locked.txt
+
+# Step 3 — verify:
+python scripts/check_env.py --strict --skip-model-layout
 ```
 
-### Then run the readiness check
-
-```bash
-bash scripts/ready_check.sh
-```
-
-This will:
-1. Verify all imports and CUDA availability (`scripts/check_env.py`)
-2. Download Qwen2.5-0.5B, Qwen3-30B-A3B, WikiText-2, C4 (skips if cached)
-3. Run a tiny dense smoke test (Qwen2.5-0.5B, n\_eval=8)
-4. Run a tiny MoE smoke test (Qwen3-30B-A3B, 1%, smoke layers, n\_eval=8)
-
-And print `READY TO RUN PAPER BENCHMARKS` if everything passes.
-
-### Manual requirements install (without setup_env.sh)
-
-```bash
-# Python-only deps (no torch):
-pip install -r requirements.txt
-
-# Torch family — must all come from the same index:
-pip install -r requirements-gpu-cu128.txt
-```
+> **torchaudio note:** Install torch, torchvision, and torchaudio together
+> from the same wheel index.  A version mismatch causes `undefined symbol`
+> errors when Transformers loads model weights.  `requirements-torch-cu128.txt`
+> pins all three to the same compatible release.
 
 ---
 
