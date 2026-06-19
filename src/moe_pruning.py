@@ -91,6 +91,10 @@ MOE_SUMMARY_CSV_KEYS = [
     "aggregation_mode",
     "pruning_mode",
     "method",
+    "requested_method",
+    "actual_method",
+    "residual_applied",
+    "residual_fallback_used",
     "eval_dataset",
     "n_eval",
     "moe_calib_samples",
@@ -681,6 +685,123 @@ def apply_packed_residual_for_layer(
 # ---------------------------------------------------------------------------
 # Router-aware calibration
 # ---------------------------------------------------------------------------
+
+def apply_unpacked_residual_for_layer(
+    expert_modules:               list,
+    prune_idx:                    "torch.Tensor",
+    keep_idx:                     "torch.Tensor",
+    expert_activations_for_layer: "Dict[int, Optional[torch.Tensor]]",
+    min_tokens:   int   = 16,
+    ridge_lambda: float = 1e-2,
+    tau:          float = 1.0,
+    solve_on_cpu: bool  = True,
+) -> "Dict":
+    """
+    Ridge-regression residual reconstruction for UNPACKED MoE experts (nn.ModuleList).
+
+    MUST be called BEFORE prune_expert_channels because it updates down_proj
+    in-place at the original (pre-pruning) intermediate size.
+
+    For each expert e with nn.Linear gate_proj / up_proj / down_proj:
+
+        gate_proj.weight : [d_ff, d_model]
+        up_proj.weight   : [d_ff, d_model]
+        down_proj.weight : [d_model, d_ff]   (column removal on prune)
+
+    Computes:
+        A  = SiLU(X_e @ gate^T) * (X_e @ up^T)   # [N, d_ff]  SwiGLU activations
+        A_K = A[:, keep_idx]   A_P = A[:, prune_idx]
+        W_P = down_proj.weight[:, prune_idx]        # [d_model, n_pruned]
+        E   = A_P @ W_P^T                            # [N, d_model]  — contribution of pruned channels
+
+    Dual-form ridge (cheap when N << d_ff):
+        (A_K A_K^T + λI) B = E                       # [N, N] system
+        ΔD = A_K^T B                                  # [n_kept, d_model]
+
+    Update (in-place, before physical pruning):
+        down_proj.weight[:, keep_idx] += τ * ΔD^T    # [d_model, n_kept]
+
+    Returns stats dict (n_stable, n_skipped, n_failed, mean_tokens, ...).
+    """
+    import torch.nn.functional as _F
+
+    n_stable = n_skipped = n_failed = 0
+    n_tokens_list: "List[int]" = []
+
+    for ei, exp in enumerate(expert_modules):
+        X_raw = expert_activations_for_layer.get(ei, None)
+        if X_raw is None or X_raw.shape[0] < min_tokens:
+            n_skipped += 1
+            continue
+
+        N = X_raw.shape[0]
+        try:
+            with torch.no_grad():
+                X      = X_raw.detach().float()
+                gate_w = exp.gate_proj.weight.data.detach().float()   # [d_ff, d_model]
+                up_w   = exp.up_proj.weight.data.detach().float()      # [d_ff, d_model]
+                down_w = exp.down_proj.weight.data.detach().float()    # [d_model, d_ff]
+
+                if solve_on_cpu:
+                    X      = X.cpu()
+                    gate_w = gate_w.cpu()
+                    up_w   = up_w.cpu()
+                    down_w = down_w.cpu()
+
+                # SwiGLU activations [N, d_ff]
+                act_all = _F.silu(X @ gate_w.T) * (X @ up_w.T)
+
+                _prune = prune_idx.to(act_all.device)
+                _keep  = keep_idx.to(act_all.device)
+
+                A_P = act_all[:, _prune]                                  # [N, n_pruned]
+                A_K = act_all[:, _keep]                                   # [N, n_kept]
+                W_P = down_w[:, _prune.to(down_w.device)]                 # [d_model, n_pruned]
+
+                # Residual target: contribution of pruned channels
+                E   = A_P @ W_P.T                                          # [N, d_model]
+
+                # Dual-form ridge solve
+                AAt = A_K @ A_K.T                                          # [N, N]
+                lam = ridge_lambda * float(AAt.diagonal().mean())
+                reg = lam * torch.eye(N, dtype=torch.float32, device=AAt.device)
+
+                B     = torch.linalg.solve(AAt + reg, E)                   # [N, d_model]
+                Delta = A_K.T @ B                                           # [n_kept, d_model]
+
+                W_K     = down_w[:, _keep.to(down_w.device)]               # [d_model, n_kept]
+                W_K_new = W_K + tau * Delta.T                               # [d_model, n_kept]
+
+                # Write back at original dtype and device
+                _keep_dev = _keep.to(exp.down_proj.weight.device)
+                exp.down_proj.weight.data[:, _keep_dev] = W_K_new.to(
+                    device=exp.down_proj.weight.device,
+                    dtype=exp.down_proj.weight.dtype,
+                )
+
+            n_stable += 1
+            n_tokens_list.append(N)
+
+        except Exception as exc:
+            logger.warning(
+                "apply_unpacked_residual: expert %d solve failed: %s", ei, exc
+            )
+            n_failed += 1
+
+    mean_toks   = round(sum(n_tokens_list) / len(n_tokens_list)) if n_tokens_list else 0
+    median_toks = int(sorted(n_tokens_list)[len(n_tokens_list) // 2]) if n_tokens_list else 0
+    min_toks    = min(n_tokens_list) if n_tokens_list else 0
+    max_toks    = max(n_tokens_list) if n_tokens_list else 0
+    return {
+        "n_stable":      n_stable,
+        "n_skipped":     n_skipped,
+        "n_failed":      n_failed,
+        "mean_tokens":   mean_toks,
+        "median_tokens": median_toks,
+        "min_tokens":    min_toks,
+        "max_tokens":    max_toks,
+    }
+
 
 def collect_expert_activations(
     model,
@@ -2276,6 +2397,9 @@ def run_moe_target_pruning_mode(
                     _resid_stable  = 0
                     _resid_skipped = 0
                     _resid_failed  = 0
+                    # Residual tracking (for CSV/JSON audit fields)
+                    _residual_applied      = False   # True if residual was actually run
+                    _residual_fallback_used = False  # True if residual was skipped/fell back
 
                     if pruning_mode == "per_expert_mask":
                         # ── MASK-ONLY: zero weights without changing shapes ────
@@ -2456,8 +2580,9 @@ def run_moe_target_pruning_mode(
                                         _resid_stable  += _rs["n_stable"]
                                         _resid_skipped += _rs["n_skipped"]
                                         _resid_failed  += _rs["n_failed"]
+                                        _residual_applied = True
                                         print(
-                                            f"      [residual_full_moe layer {li}] "
+                                            f"      [residual_full_moe layer {li}] (packed) "
                                             f"stable={_rs['n_stable']}  "
                                             f"skip={_rs['n_skipped']}  "
                                             f"fail={_rs['n_failed']}  "
@@ -2480,12 +2605,43 @@ def run_moe_target_pruning_mode(
                                     # ── UNPACKED SAME-CHANNEL PATH (Layout A) ──
                                     # Apply identical prune_idx to every expert so
                                     # the same channels are removed globally.
-                                    if method == "residual_full_moe":
+
+                                    # Step 1: residual reconstruction (BEFORE pruning)
+                                    if method == "residual_full_moe" and _calib_ref is not None:
+                                        _t_rs = time.perf_counter()
+                                        _layer_acts_u = {
+                                            _ei2: _calib_ref.get((li, _ei2))
+                                            for _ei2 in range(info.num_experts)
+                                        }
+                                        _rs = apply_unpacked_residual_for_layer(
+                                            info.expert_modules,
+                                            prune_idx, _keep_idx_packed,
+                                            _layer_acts_u,
+                                            min_tokens=min_resid_tok,
+                                            ridge_lambda=resid_lambda,
+                                            tau=resid_tau,
+                                            solve_on_cpu=resid_on_cpu,
+                                        )
+                                        t_recon_total += time.perf_counter() - _t_rs
+                                        _resid_stable  += _rs["n_stable"]
+                                        _resid_skipped += _rs["n_skipped"]
+                                        _resid_failed  += _rs["n_failed"]
+                                        _residual_applied = True
+                                        print(
+                                            f"      [residual_full_moe layer {li}] (unpacked) "
+                                            f"stable={_rs['n_stable']}  "
+                                            f"skip={_rs['n_skipped']}  "
+                                            f"fail={_rs['n_failed']}  "
+                                            f"mean_tok={_rs['mean_tokens']}"
+                                        )
+                                    elif method == "residual_full_moe" and _calib_ref is None:
                                         print(
                                             f"      [warn] layer {li}: "
-                                            "residual_full_moe not supported for "
-                                            "unpacked experts — using pure_delete"
+                                            "residual_full_moe skipped — no calibration data"
                                         )
+                                        _residual_fallback_used = True
+
+                                    # Step 2: physical pruning (same prune_idx for all experts)
                                     _unpacked_ok = 0
                                     for ei_u in range(info.num_experts):
                                         expert_u = info.expert_modules[ei_u]
@@ -2846,6 +3002,13 @@ def run_moe_target_pruning_mode(
                                     os.path.relpath(_per_layer_csv_path)
                                     if _per_layer_rows else ""
                                 ),
+                                "requested_method":      method,
+                                "actual_method":         (
+                                    method if _residual_applied or method != "residual_full_moe"
+                                    else "pure_delete"
+                                ),
+                                "residual_applied":      _residual_applied,
+                                "residual_fallback_used": _residual_fallback_used,
                             })
                             all_results.append(err_row)
                             _flush_csv(main_csv_path, [err_row], MOE_SUMMARY_CSV_KEYS)
@@ -2937,6 +3100,13 @@ def run_moe_target_pruning_mode(
                                 os.path.relpath(_per_layer_csv_path)
                                 if _per_layer_rows else ""
                             ),
+                            "requested_method":      method,
+                            "actual_method":         (
+                                method if _residual_applied or method != "residual_full_moe"
+                                else "pure_delete"
+                            ),
+                            "residual_applied":      _residual_applied,
+                            "residual_fallback_used": _residual_fallback_used,
                         })
                         print(
                             f"    [{_ds}] baseline={cur_bppl:.4f}  "
