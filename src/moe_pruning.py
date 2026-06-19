@@ -54,6 +54,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from .moe_residual_methods import (  # noqa: E402
+    RESIDUAL_METHODS,
+    BEST_RESIDUAL_LAM,
+    _empty_residual_stats,
+    make_pruning_plan_path,
+    build_pruning_plan,
+    save_pruning_plan,
+    load_pruning_plan,
+    apply_pruning_plan_to_selection,
+    apply_residual_dispatch_unpacked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +91,13 @@ MOE_MAIN_CSV_KEYS = [
 ]
 
 MOE_SUMMARY_CSV_KEYS = [
+    # ── Identity ──────────────────────────────────────────────────────────────
     "model",
+    "model_revision",
+    "transformers_version",
+    "torch_version",
+    "expert_layout",
+    # ── Experiment config ────────────────────────────────────────────────────
     "total_moe_layers",
     "processed_moe_layers",
     "target_pct",
@@ -93,25 +110,52 @@ MOE_SUMMARY_CSV_KEYS = [
     "method",
     "requested_method",
     "actual_method",
-    "residual_applied",
-    "residual_fallback_used",
+    "residual_variant",
+    "residual_lambda",
     "eval_dataset",
     "n_eval",
     "moe_calib_samples",
+    # ── Pruning plan ──────────────────────────────────────────────────────────
+    "pruning_plan_path",
+    "loaded_pruning_plan",
+    # ── Results ───────────────────────────────────────────────────────────────
     "baseline_ppl",
     "compressed_ppl",
     "delta_ppl",
     "relative_delta_pct",
     "forward_check",
     "status",
+    # ── Parameter / FLOP accounting ───────────────────────────────────────────
     "expert_param_reduction_pct",
     "total_model_param_reduction_pct",
     "estimated_active_expert_flop_reduction_pct",
+    # ── Residual audit (binary flags) ─────────────────────────────────────────
+    "residual_applied",
+    "residual_fallback_used",
+    # ── Residual per-expert counts ────────────────────────────────────────────
+    "residual_total_candidate_experts",
+    "residual_attempted_experts",
+    "residual_applied_experts",
     "residual_stable_experts",
+    "residual_rejected_experts",
     "residual_skipped_experts",
     "residual_failed_experts",
-    "residual_lambda",
+    "residual_coverage_pct",
+    # ── Residual skip reasons ─────────────────────────────────────────────────
+    "residual_skip_too_few_tokens",
+    "residual_skip_ill_conditioned",
+    "residual_skip_non_finite",
+    "residual_skip_update_too_large",
+    "residual_skip_not_improved",
+    # ── Residual quality metrics ──────────────────────────────────────────────
+    "mean_err_delete",
+    "mean_err_resid",
+    "mean_local_improvement_pct",
+    "mean_update_norm",
+    "max_update_norm",
+    # ── Timing / memory ──────────────────────────────────────────────────────
     "residual_time_sec",
+    # ── Paths ────────────────────────────────────────────────────────────────
     "csv_path",
     "json_path",
     "per_layer_csv_path",
@@ -1878,6 +1922,27 @@ def run_moe_target_pruning_mode(
     moe_calib_dataset = str(cfg.get("moe_calib_dataset", "wikitext2"))
     EVAL_DATASETS  = [str(d) for d in (
         eval_datasets_override or cfg.get("eval_datasets", ["wikitext2"]))]
+    # ── Residual extended config ───────────────────────────────────────────────
+    resid_imp_margin   = float(cfg.get("residual_improvement_margin", 1.0))
+    resid_alpha_clip   = float(cfg.get("residual_alpha_clip", 2.0))
+    resid_merge_metric = str(cfg.get("residual_merge_metric", "ls_scalar"))
+    resid_norm_clip    = cfg.get("residual_update_norm_clip", None)
+    resid_max_rel_norm = cfg.get("residual_max_relative_update_norm", None)
+    # ── Pruning plan save/load ────────────────────────────────────────────────
+    save_plan_cfg  = cfg.get("save_pruning_plan", False)
+    load_plan_cfg  = cfg.get("load_pruning_plan", None)
+    # Unified residual config dict passed to apply_residual_dispatch_unpacked
+    residual_cfg = {
+        "residual_lambda":                    resid_lambda,
+        "residual_tau":                       resid_tau,
+        "residual_min_tokens":                min_resid_tok,
+        "solve_residual_on_cpu":              resid_on_cpu,
+        "residual_improvement_margin":        resid_imp_margin,
+        "residual_alpha_clip":                resid_alpha_clip,
+        "residual_merge_metric":              resid_merge_metric,
+        "residual_update_norm_clip":          resid_norm_clip,
+        "residual_max_relative_update_norm":  resid_max_rel_norm,
+    }
 
     print(f"\n{'=' * 90}")
     print("MOE TARGET-PRUNING EXPERIMENT")
@@ -2266,6 +2331,58 @@ def run_moe_target_pruning_mode(
                 print(f"    actual_pct               : {actual_pct:.3f}%  "
                       f"(requested {target_pct:.1f}%)")
 
+                # ── Pruning plan save/load ─────────────────────────────────
+                _plan_path      = ""
+                _loaded_plan    = False
+                if save_plan_cfg and target_pct > 0:
+                    _plan = build_pruning_plan(
+                        model_id=model_name,
+                        target_pct=target_pct,
+                        actual_pct=actual_pct,
+                        selector=moe_selector,
+                        aggr_mode=chan_agg,
+                        pruning_mode=pruning_mode,
+                        chan_align=chan_align,
+                        max_layer_frac=max_layer_frac,
+                        per_expert_pruned=per_expert_pruned,
+                        expert_sizes=expert_sizes,
+                        num_experts_per_layer=(
+                            moe_layers[0].num_experts if moe_layers else 0
+                        ),
+                    )
+                    _plan_path = make_pruning_plan_path(
+                        output_dir, model_name, moe_calib_dataset,
+                        n_eval, moe_calib_samples, moe_selector,
+                        chan_agg, target_pct, chan_align,
+                    )
+                    save_pruning_plan(_plan, _plan_path)
+                    print(f"    [plan] saved  → {_plan_path}")
+
+                if load_plan_cfg:
+                    _lp = load_pruning_plan(load_plan_cfg)
+                    per_expert_pruned = apply_pruning_plan_to_selection(
+                        _lp, per_expert_pruned
+                    )
+                    _plan_path   = load_plan_cfg
+                    _loaded_plan = True
+                    # Recompute actual_pruned from loaded plan
+                    actual_pruned = sum(
+                        len(v) * entry_weight.get((li2, -1), 1)
+                        for (li2, ei2), v in per_expert_pruned.items()
+                        if ei2 == -1
+                    )
+                    actual_pct = 100.0 * actual_pruned / max(total_expert_neurons, 1)
+                    selected_layer_channels = sum(
+                        len(v)
+                        for (li2, ei2), v in per_expert_pruned.items()
+                        if ei2 == -1
+                    )
+                    print(
+                        f"    [plan] loaded ← {load_plan_cfg}  "
+                        f"actual_pruned={actual_pruned:,}  "
+                        f"actual_pct={actual_pct:.3f}%"
+                    )
+
                 # ── Fail-fast: verify packed_same_channel used (li,-1) keys ─
                 if pruning_mode == "packed_same_channel" and target_pct > 0:
                     _n_layer_ch_keys = sum(
@@ -2350,8 +2467,8 @@ def run_moe_target_pruning_mode(
                 # ── Release calibration caches before pruning ─────────────────
                 # pure_delete needs no per-expert activations during pruning;
                 # reconstruction methods do.  Only hold a reference if needed.
-                _first_method = METHODS[0] if METHODS else "pure_delete"
-                _needs_calib  = (_first_method != "pure_delete")
+                # Keep calibration data alive if ANY method needs it.
+                _needs_calib = any(m in RESIDUAL_METHODS for m in METHODS)
                 if _needs_calib:
                     _calib_ref = expert_activations   # keep alive for recon
                 else:
@@ -2393,13 +2510,28 @@ def run_moe_target_pruning_mode(
                         if _any_key:
                             _old_inter_summary = expert_sizes[_any_key]
                             _new_inter_summary = _old_inter_summary
-                    # Residual reconstruction counters
-                    _resid_stable  = 0
-                    _resid_skipped = 0
-                    _resid_failed  = 0
+                    # Residual reconstruction counters (extended)
+                    _resid_stable        = 0
+                    _resid_skipped       = 0
+                    _resid_failed        = 0
+                    _resid_rejected      = 0
+                    _resid_attempted     = 0
+                    _resid_total_cand    = 0
+                    _resid_skip_few_tok  = 0
+                    _resid_skip_ill_cond = 0
+                    _resid_skip_non_fin  = 0
+                    _resid_skip_too_lrg  = 0
+                    _resid_skip_not_imp  = 0
+                    _err_del_wsum        = 0.0
+                    _err_res_wsum        = 0.0
+                    _err_cnt             = 0
+                    _upd_norms_all: list = []
                     # Residual tracking (for CSV/JSON audit fields)
-                    _residual_applied      = False   # True if residual was actually run
-                    _residual_fallback_used = False  # True if residual was skipped/fell back
+                    _residual_applied       = False  # True if residual was run
+                    _residual_fallback_used = False  # True if fell back unexpectedly
+                    _plan_path              = getattr(locals(), "_plan_path", "")
+                    _loaded_plan_flag       = getattr(locals(), "_loaded_plan", False)
+                    _resid_variant          = method  # captured per-method
 
                     if pruning_mode == "per_expert_mask":
                         # ── MASK-ONLY: zero weights without changing shapes ────
@@ -2563,7 +2695,7 @@ def run_moe_target_pruning_mode(
 
                                 if info.experts_packed and ec is not None:
                                     # ── PACKED TENSOR PATH (Layout B) ─────────
-                                    if method == "residual_full_moe" and _calib_ref is not None:
+                                    if method in ("residual_full_moe", "residual_ridge_moe") and _calib_ref is not None:
                                         _t_rs = time.perf_counter()
                                         _layer_acts = {
                                             _ei2: _calib_ref.get((li, _ei2))
@@ -2607,37 +2739,57 @@ def run_moe_target_pruning_mode(
                                     # the same channels are removed globally.
 
                                     # Step 1: residual reconstruction (BEFORE pruning)
-                                    if method == "residual_full_moe" and _calib_ref is not None:
+                                    if method in RESIDUAL_METHODS and method != "residual_mask_moe" and _calib_ref is not None:
                                         _t_rs = time.perf_counter()
                                         _layer_acts_u = {
                                             _ei2: _calib_ref.get((li, _ei2))
                                             for _ei2 in range(info.num_experts)
                                         }
-                                        _rs = apply_unpacked_residual_for_layer(
-                                            info.expert_modules,
-                                            prune_idx, _keep_idx_packed,
-                                            _layer_acts_u,
-                                            min_tokens=min_resid_tok,
-                                            ridge_lambda=resid_lambda,
-                                            tau=resid_tau,
-                                            solve_on_cpu=resid_on_cpu,
-                                        )
-                                        t_recon_total += time.perf_counter() - _t_rs
-                                        _resid_stable  += _rs["n_stable"]
-                                        _resid_skipped += _rs["n_skipped"]
-                                        _resid_failed  += _rs["n_failed"]
-                                        _residual_applied = True
-                                        print(
-                                            f"      [residual_full_moe layer {li}] (unpacked) "
-                                            f"stable={_rs['n_stable']}  "
-                                            f"skip={_rs['n_skipped']}  "
-                                            f"fail={_rs['n_failed']}  "
-                                            f"mean_tok={_rs['mean_tokens']}"
-                                        )
-                                    elif method == "residual_full_moe" and _calib_ref is None:
+                                        try:
+                                            _rs = apply_residual_dispatch_unpacked(
+                                                method,
+                                                info.expert_modules,
+                                                prune_idx, _keep_idx_packed,
+                                                _layer_acts_u,
+                                                residual_cfg,
+                                            )
+                                            t_recon_total      += time.perf_counter() - _t_rs
+                                            _resid_stable      += _rs["n_stable"]
+                                            _resid_skipped     += _rs["n_skipped"]
+                                            _resid_failed      += _rs["n_failed"]
+                                            _resid_rejected    += _rs.get("n_rejected", 0)
+                                            _resid_attempted   += _rs.get("n_attempted", 0)
+                                            _resid_total_cand  += _rs.get("n_total_candidate", 0)
+                                            _resid_skip_few_tok  += _rs.get("skip_too_few_tokens", 0)
+                                            _resid_skip_ill_cond += _rs.get("skip_ill_conditioned", 0)
+                                            _resid_skip_non_fin  += _rs.get("skip_non_finite", 0)
+                                            _resid_skip_too_lrg  += _rs.get("skip_update_too_large", 0)
+                                            _resid_skip_not_imp  += _rs.get("skip_not_improved", 0)
+                                            _ed = _rs.get("mean_err_delete", float("nan"))
+                                            _er = _rs.get("mean_err_resid",  float("nan"))
+                                            if _ed == _ed:  # not nan
+                                                _err_del_wsum += _ed
+                                                _err_res_wsum += _er if _er == _er else 0.0
+                                                _err_cnt      += 1
+                                            if "mean_update_norm" in _rs and _rs["mean_update_norm"] == _rs["mean_update_norm"]:
+                                                _upd_norms_all.append(_rs["mean_update_norm"])
+                                            _residual_applied = True
+                                            print(
+                                                f"      [{method} layer {li}] (unpacked) "
+                                                f"stable={_rs['n_stable']}  "
+                                                f"skip={_rs['n_skipped']}  "
+                                                f"fail={_rs['n_failed']}  "
+                                                f"reject={_rs.get('n_rejected', 0)}  "
+                                                f"mean_tok={_rs['mean_tokens']:.0f}"
+                                            )
+                                        except ValueError as _ve:
+                                            print(f"      [ERROR] layer {li}: {_ve}")
+                                            _notes_str = "failed_method_not_supported"
+                                            _residual_fallback_used = True
+                                    elif method in RESIDUAL_METHODS and method != "residual_mask_moe" and _calib_ref is None:
                                         print(
                                             f"      [warn] layer {li}: "
-                                            "residual_full_moe skipped — no calibration data"
+                                            f"{method} skipped — no calibration data"
                                         )
                                         _residual_fallback_used = True
 
@@ -2987,6 +3139,38 @@ def run_moe_target_pruning_mode(
                                 "csv_path": main_csv_path,
                                 "json_path": json_path,
                             }
+
+                            # ── Compute residual summary stats for CSV ────────────
+                            _cov_pct = (
+                                100.0 * _resid_stable / _resid_total_cand
+                                if _resid_total_cand > 0 else 0.0
+                            )
+                            _mean_e_del = (
+                                _err_del_wsum / _err_cnt
+                                if _err_cnt > 0 else float("nan")
+                            )
+                            _mean_e_res = (
+                                _err_res_wsum / _err_cnt
+                                if _err_cnt > 0 else float("nan")
+                            )
+                            _mean_imp = (
+                                100.0 * (_mean_e_del - _mean_e_res)
+                                / (_mean_e_del + 1e-12)
+                                if _err_cnt > 0 else float("nan")
+                            )
+                            _mean_upd = (
+                                sum(_upd_norms_all) / len(_upd_norms_all)
+                                if _upd_norms_all else float("nan")
+                            )
+                            _max_upd = (
+                                max(_upd_norms_all)
+                                if _upd_norms_all else float("nan")
+                            )
+                            _actual_method = (
+                                method
+                                if (_residual_applied or method == "pure_delete")
+                                else "pure_delete"
+                            )
                             err_row.update({
                                 "target_pct": target_pct,
                                 "actual_pct": round(actual_pct, 4),
@@ -3002,13 +3186,36 @@ def run_moe_target_pruning_mode(
                                     os.path.relpath(_per_layer_csv_path)
                                     if _per_layer_rows else ""
                                 ),
-                                "requested_method":      method,
-                                "actual_method":         (
-                                    method if _residual_applied or method != "residual_full_moe"
-                                    else "pure_delete"
-                                ),
-                                "residual_applied":      _residual_applied,
+                                "requested_method":       method,
+                                "actual_method":          _actual_method,
+                                "residual_applied":       _residual_applied,
                                 "residual_fallback_used": _residual_fallback_used,
+                                "residual_stable_experts":  _resid_stable,
+                                "residual_skipped_experts": _resid_skipped,
+                                "residual_failed_experts":  _resid_failed,
+                                "residual_rejected_experts": _resid_rejected,
+                                "residual_time_sec":      round(t_recon_total, 2),
+                                "expert_layout":          "unpacked",
+                                "model_revision":         "",
+                                "transformers_version":   "",
+                                "torch_version":          torch.__version__,
+                                "pruning_plan_path":      _plan_path,
+                                "loaded_pruning_plan":    _loaded_plan_flag,
+                                "residual_variant":       _resid_variant,
+                                "residual_total_candidate_experts": _resid_total_cand,
+                                "residual_attempted_experts": _resid_attempted,
+                                "residual_applied_experts":   _resid_stable,
+                                "residual_coverage_pct":      round(_cov_pct, 2),
+                                "residual_skip_too_few_tokens":    _resid_skip_few_tok,
+                                "residual_skip_ill_conditioned":   _resid_skip_ill_cond,
+                                "residual_skip_non_finite":        _resid_skip_non_fin,
+                                "residual_skip_update_too_large":  _resid_skip_too_lrg,
+                                "residual_skip_not_improved":      _resid_skip_not_imp,
+                                "mean_err_delete":            _mean_e_del,
+                                "mean_err_resid":             _mean_e_res,
+                                "mean_local_improvement_pct": _mean_imp,
+                                "mean_update_norm":           _mean_upd,
+                                "max_update_norm":            _max_upd,
                             })
                             all_results.append(err_row)
                             _flush_csv(main_csv_path, [err_row], MOE_SUMMARY_CSV_KEYS)
@@ -3091,7 +3298,7 @@ def run_moe_target_pruning_mode(
                             "processed_moe_layers": len(moe_layers),
                             "n_eval": n_eval,
                             "moe_calib_samples": moe_calib_samples,
-                            "status": "",
+                            "status": "ok",
                             "expert_param_reduction_pct": round(_expert_param_red_pct, 4),
                             "total_model_param_reduction_pct": round(_total_model_param_red_pct, 4),
                             "estimated_active_expert_flop_reduction_pct": round(_active_flop_red_pct, 4),
@@ -3100,13 +3307,36 @@ def run_moe_target_pruning_mode(
                                 os.path.relpath(_per_layer_csv_path)
                                 if _per_layer_rows else ""
                             ),
-                            "requested_method":      method,
-                            "actual_method":         (
-                                method if _residual_applied or method != "residual_full_moe"
-                                else "pure_delete"
-                            ),
-                            "residual_applied":      _residual_applied,
+                            "requested_method":       method,
+                            "actual_method":          _actual_method,
+                            "residual_applied":       _residual_applied,
                             "residual_fallback_used": _residual_fallback_used,
+                            "residual_variant":       _resid_variant,
+                            "residual_stable_experts":  _resid_stable,
+                            "residual_skipped_experts": _resid_skipped,
+                            "residual_failed_experts":  _resid_failed,
+                            "residual_rejected_experts": _resid_rejected,
+                            "residual_time_sec":      round(t_recon_total, 2),
+                            "expert_layout":          "unpacked",
+                            "model_revision":         "",
+                            "transformers_version":   "",
+                            "torch_version":          torch.__version__,
+                            "pruning_plan_path":      _plan_path,
+                            "loaded_pruning_plan":    _loaded_plan_flag,
+                            "residual_total_candidate_experts": _resid_total_cand,
+                            "residual_attempted_experts": _resid_attempted,
+                            "residual_applied_experts":   _resid_stable,
+                            "residual_coverage_pct":      round(_cov_pct, 2),
+                            "residual_skip_too_few_tokens":    _resid_skip_few_tok,
+                            "residual_skip_ill_conditioned":   _resid_skip_ill_cond,
+                            "residual_skip_non_finite":        _resid_skip_non_fin,
+                            "residual_skip_update_too_large":  _resid_skip_too_lrg,
+                            "residual_skip_not_improved":      _resid_skip_not_imp,
+                            "mean_err_delete":            _mean_e_del,
+                            "mean_err_resid":             _mean_e_res,
+                            "mean_local_improvement_pct": _mean_imp,
+                            "mean_update_norm":           _mean_upd,
+                            "max_update_norm":            _max_upd,
                         })
                         print(
                             f"    [{_ds}] baseline={cur_bppl:.4f}  "
