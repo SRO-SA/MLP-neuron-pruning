@@ -1451,6 +1451,36 @@ def _log_gpu_memory(label: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Parameter-count extraction helper
+# ---------------------------------------------------------------------------
+# count_parameters(model) returns {"total": int, "mlp": int}.
+# Older call-sites in moe_pruning.py treated the result as a scalar, which
+# causes "TypeError: '>' not supported between instances of 'dict' and 'int'".
+# _extract_total_param_count normalises any return value to a plain int.
+
+def _extract_total_param_count(x) -> int:
+    """Return the total parameter count as a plain int regardless of input type.
+
+    Handles:
+      int / float  → cast to int directly
+      dict         → look for 'total', 'total_params', 'num_params', 'params' keys
+    """
+    if isinstance(x, (int, float)):
+        return int(x)
+    if isinstance(x, dict):
+        for key in ("total", "total_params", "num_params", "params"):
+            if key in x:
+                return int(x[key])
+        raise ValueError(
+            f"_extract_total_param_count: dict has no recognised key. "
+            f"Available keys: {list(x.keys())}"
+        )
+    raise TypeError(
+        f"_extract_total_param_count: unsupported type {type(x).__name__!r}. "
+        f"Value: {x!r}"
+    )
+
+
 # Expert parameter / FLOP helpers  (called before and after physical pruning)
 # ---------------------------------------------------------------------------
 
@@ -1853,8 +1883,19 @@ def run_moe_target_pruning_mode(
                     baseline_ppl_per_ds[_ds] = _bp["perplexity"]
                     print(f"  Baseline PPL ({_ds}): {_bp['perplexity']:.4f}")
 
-            baseline_params = count_parameters(model)
-            _total_model_params_before = baseline_params
+            baseline_params_raw = count_parameters(model)
+            if isinstance(baseline_params_raw, dict):
+                logger.info(
+                    "count_parameters returned dict: keys=%s  value=%s",
+                    list(baseline_params_raw.keys()), baseline_params_raw,
+                )
+            else:
+                logger.info(
+                    "count_parameters returned %s: %s",
+                    type(baseline_params_raw).__name__, baseline_params_raw,
+                )
+            baseline_params = baseline_params_raw   # kept for any legacy references
+            _total_model_params_before = _extract_total_param_count(baseline_params_raw)
             _all_moe_for_count = [_i for _i in layer_infos if _i.is_moe]
             _expert_params_before = _count_moe_expert_params(_all_moe_for_count)
             _active_flops_before  = _estimate_moe_active_flops(_all_moe_for_count)
@@ -2449,7 +2490,9 @@ def run_moe_target_pruning_mode(
                     _log_gpu_memory("after pruning")
 
                     # ── Post-prune param / FLOP accounting ────────────────────
-                    _total_model_params_after  = count_parameters(model)
+                    _total_model_params_after  = _extract_total_param_count(
+                        count_parameters(model)
+                    )
                     _total_model_param_red_pct = (
                         100.0 * (_total_model_params_before - _total_model_params_after)
                         / _total_model_params_before
