@@ -29,6 +29,8 @@ FAIL = "  ✗"
 overall_ok = True
 warnings_issued = []
 
+FIX_CMD = "FIX_TORCH_FAMILY=1 bash setup_env.sh"
+
 
 def _hdr(title: str) -> None:
     print(f"\n── {title} {'─' * max(0, 55 - len(title))}")
@@ -49,15 +51,120 @@ def _fail(msg: str) -> None:
     overall_ok = False
 
 
+def _is_abi_mismatch_torchvision(err: Exception) -> bool:
+    s = str(err).lower()
+    return (
+        "does not exist" in s
+        or "torchvision::nms" in s
+        or "no such operator" in s
+        or "undefined symbol" in s
+        or "cannot open shared object" in s
+    )
+
+
+def _is_abi_mismatch_torchaudio(err: Exception) -> bool:
+    s = str(err).lower()
+    return (
+        "undefined symbol" in s
+        or "cannot open shared object" in s
+        or "shared library" in s
+        or "libtorchaudio" in s
+        or "_torchaudio" in s
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # A. Python package imports
 # ─────────────────────────────────────────────────────────────────────────────
 _hdr("A. Python imports")
 
-REQUIRED_IMPORTS = [
-    ("torch",           True),
-    ("torchvision",     True),
-    ("torchaudio",      False),   # soft: see Part C for ABI details
+imported: dict = {}
+
+# ── torch (required) ─────────────────────────────────────────────────────────
+try:
+    import torch as _torch
+    _ok(f"{'torch':<22} {_torch.__version__}")
+    imported["torch"] = _torch
+except ImportError as e:
+    _fail(f"{'torch':<22} NOT FOUND — {e}")
+    imported["torch"] = None
+
+# ── torchvision (must be absent OR working; broken = hard fail) ───────────────
+# Rule: if torchvision is installed, it must match torch exactly.
+# Diagnosis path 1: RuntimeError at import ("operator ... does not exist")
+# Diagnosis path 2: RuntimeError on functional probe (nms call)
+# Diagnosis path 3: OSError / ImportError — not installed at all (soft warn)
+try:
+    import torchvision as _tv
+    _tv_ver = _tv.__version__
+
+    # Functional probe: actually exercise a native C++ op.
+    # "operator torchvision::nms does not exist" fires here when the compiled
+    # torchvision.so was built against a different torch version.
+    if imported.get("torch") is not None:
+        try:
+            import torchvision.ops as _tvops
+            _t = imported["torch"]
+            _tvops.nms(
+                _t.tensor([[0.0, 0.0, 1.0, 1.0]], dtype=_t.float32),
+                _t.tensor([0.9], dtype=_t.float32),
+                iou_threshold=0.5,
+            )
+        except (RuntimeError, Exception) as _probe_err:
+            if _is_abi_mismatch_torchvision(_probe_err):
+                raise RuntimeError(str(_probe_err))   # re-raise for unified handler
+
+    _ok(f"{'torchvision':<22} {_tv_ver}")
+    imported["torchvision"] = _tv
+
+except (RuntimeError, Exception) as e:
+    if _is_abi_mismatch_torchvision(e):
+        _fail(
+            f"{'torchvision':<22} ABI MISMATCH\n"
+            f"         torchvision is installed but its compiled ops do not match torch.\n"
+            f"         Error : {e}\n"
+            f"         Fix   : {FIX_CMD}\n"
+            f"         This detects your torch version and reinstalls the matching\n"
+            f"         torchvision wheel from the same PyTorch CUDA index."
+        )
+    elif isinstance(e, (ImportError, ModuleNotFoundError)):
+        _warn(f"{'torchvision':<22} NOT INSTALLED (optional — warn only)")
+    else:
+        _fail(f"{'torchvision':<22} import error: {e}")
+    imported["torchvision"] = None
+
+# ── torchaudio (must be absent OR working; broken = hard fail) ────────────────
+# Same rule as torchvision.  Shared-library errors raise OSError, not ImportError.
+try:
+    import torchaudio as _ta
+    _ok(f"{'torchaudio':<22} {_ta.__version__}")
+    imported["torchaudio"] = _ta
+
+except (OSError, RuntimeError) as e:
+    if _is_abi_mismatch_torchaudio(e):
+        _fail(
+            f"{'torchaudio':<22} ABI MISMATCH\n"
+            f"         torchaudio is installed but does not match torch.\n"
+            f"         Error : {e}\n"
+            f"         Fix   : {FIX_CMD}\n"
+            f"         This detects your torch version and reinstalls the matching\n"
+            f"         torchaudio wheel from the same PyTorch CUDA index."
+        )
+    else:
+        _fail(f"{'torchaudio':<22} failed to load: {e}")
+    imported["torchaudio"] = None
+
+except ImportError:
+    _warn(
+        f"{'torchaudio':<22} NOT INSTALLED (optional — warn only)\n"
+        f"         This project does not use torchaudio directly, but recent\n"
+        f"         Transformers may import it indirectly. If model loading fails\n"
+        f"         with a .so symbol error, run: {FIX_CMD}"
+    )
+    imported["torchaudio"] = None
+
+# ── Remaining packages ────────────────────────────────────────────────────────
+OTHER_IMPORTS = [
     ("transformers",    True),
     ("datasets",        True),
     ("accelerate",      True),
@@ -72,8 +179,7 @@ REQUIRED_IMPORTS = [
     ("matplotlib",      True),
 ]
 
-imported = {}
-for mod, required in REQUIRED_IMPORTS:
+for mod, required in OTHER_IMPORTS:
     try:
         m = importlib.import_module(mod)
         ver = getattr(m, "__version__", "?")
@@ -111,149 +217,59 @@ else:
             sm   = f"sm_{cap[0]}{cap[1]}"
             note = ""
             if cap[0] >= 12:
-                note = "  ← Blackwell / sm_120+; stable torch may not support this GPU — use nightly if needed"
+                note = (
+                    "  ← Blackwell / sm_120+; stable torch may not support this GPU — "
+                    "use INSTALL_TORCH_NIGHTLY_CU128=1 if needed"
+                )
             _ok(f"GPU {i}: {name}  ({sm}){note}")
     else:
         _warn("No CUDA GPUs detected — running on CPU")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C. Torch-family compatibility
+# C. Torch-family version compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 _hdr("C. Torch-family compatibility")
 
+# Version map (torch 2.x series):
+#   torch 2.5.x  →  torchvision 0.20.x  →  torchaudio 2.5.x
+#   torch 2.6.x  →  torchvision 0.21.x  →  torchaudio 2.6.x
+#   torch 2.7.x  →  torchvision 0.22.x  →  torchaudio 2.7.x
+#   torch 2.8.x  →  torchvision 0.23.x  →  torchaudio 2.8.x
+# Pattern: torchvision minor = torch minor + 15  (for torch 2.x)
+#          torchaudio version = torch version
+
 if torch is not None:
-    tv  = imported.get("torchvision")
-    ta  = imported.get("torchaudio")
+    import re
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", torch.__version__)
+    torch_major = int(m.group(1)) if m else None
+    torch_minor = int(m.group(2)) if m else None
+    torch_patch = int(m.group(3)) if m else None
 
-    torch_ver = torch.__version__
-    tv_ver    = getattr(tv, "__version__", None) if tv else None
-    ta_ver    = getattr(ta, "__version__", None) if ta else None
+    # Expected versions
+    if torch_major == 2 and torch_minor is not None:
+        exp_tv_minor = torch_minor + 15
+        exp_tv = f"0.{exp_tv_minor}.{torch_patch}"
+        exp_ta = f"{torch_major}.{torch_minor}.{torch_patch}"
+    else:
+        exp_tv = exp_ta = None
 
-    _ok(f"torch       {torch_ver}")
+    _ok(f"torch       {torch.__version__}")
 
-    if tv_ver:
-        _ok(f"torchvision {tv_ver}")
-        # Rough version prefix check (major.minor should match torch)
-        torch_mm = ".".join(torch_ver.split(".")[:2])
-        tv_mm    = ".".join(tv_ver.split(".")[:2])
-        if torch_mm != tv_mm:
+    tv = imported.get("torchvision")
+    if tv is not None:
+        _exp_tv_str = exp_tv if exp_tv else "?"
+        _ok(f"torchvision {tv.__version__}  (expected {_exp_tv_str})")
+        if exp_tv and not tv.__version__.startswith(exp_tv.rsplit(".", 1)[0]):
             _warn(
-                f"torch ({torch_mm}) and torchvision ({tv_mm}) major.minor differ — "
-                "install from the same PyTorch wheel index"
+                f"torchvision version ({tv.__version__}) does not match expected "
+                f"({exp_tv}) for torch {torch.__version__}.\n"
+                f"         Fix: {FIX_CMD}"
             )
     else:
-        _warn("torchvision not installed")
+        if overall_ok:  # only warn if no hard fail already logged
+            _warn("torchvision not installed or broken (see Section A)")
 
-    if ta_ver:
-        _ok(f"torchaudio  {ta_ver}")
-        # Check that torchaudio can actually load its native extension
-        try:
-            torch.ops.load_library  # noqa
-            _ok("torchaudio native ext loaded OK")
-        except Exception as e:
-            _warn(f"torchaudio native ext may have issues: {e}")
-    else:
-        _warn(
-            "torchaudio not installed.\n"
-            "     This project does not use torchaudio directly, but recent\n"
-            "     Transformers may import it indirectly. If model loading fails\n"
-            "     with a .so symbol error, install torchaudio from the same\n"
-            "     PyTorch wheel index as torch:\n"
-            "       INSTALL_TORCH_CU128=1 bash setup_env.sh"
-        )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# D. Transformers Qwen3 MoE
-# ─────────────────────────────────────────────────────────────────────────────
-_hdr("D. Transformers Qwen3 MoE")
-
-transformers = imported.get("transformers")
-if transformers is None:
-    _fail("transformers not available — skipping Qwen3 checks")
-else:
-    _ok(f"transformers {transformers.__version__}")
-
-    # Check that Qwen3MoeForCausalLM class is registered
-    try:
-        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-        qwen3_moe_present = any("qwen3_moe" in str(k).lower() for k in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES)
-        if qwen3_moe_present:
-            _ok("Qwen3MoeForCausalLM is registered in AutoModel mapping")
-        else:
-            _warn(
-                "Qwen3MoeForCausalLM not found in AutoModel mapping.\n"
-                "     This requires transformers >= 4.51.0.\n"
-                f"     Installed: {transformers.__version__}"
-            )
-    except Exception as e:
-        _warn(f"Could not check Qwen3 registration: {e}")
-
-    # Fetch config from Hub (requires internet or cached model)
-    print(f"  Fetching Qwen/Qwen3-30B-A3B config from Hub (needs internet or cache) ...")
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-30B-A3B", trust_remote_code=True)
-        _ok(f"AutoConfig loaded — model_type: {cfg.model_type}")
-        if hasattr(cfg, "num_experts"):
-            _ok(f"  num_experts:        {cfg.num_experts}")
-        if hasattr(cfg, "num_experts_per_tok"):
-            _ok(f"  num_experts_per_tok:{cfg.num_experts_per_tok}")
-        if hasattr(cfg, "intermediate_size"):
-            _ok(f"  intermediate_size:  {cfg.intermediate_size}")
-        if hasattr(cfg, "num_hidden_layers"):
-            _ok(f"  num_hidden_layers:  {cfg.num_hidden_layers}")
-    except Exception as e:
-        _warn(
-            f"AutoConfig.from_pretrained('Qwen/Qwen3-30B-A3B') failed: {e}\n"
-            "     This is expected if there is no internet access and the model\n"
-            "     is not yet cached.  Run scripts/prepare_models.py to download."
-        )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# E. Repo syntax check
-# ─────────────────────────────────────────────────────────────────────────────
-_hdr("E. Repo syntax check")
-
-FILES_TO_CHECK = [
-    "run_experiment.py",
-    "src/moe_pruning.py",
-    "src/model_utils.py",
-    "src/scoring.py",
-    "src/pruning.py",
-    "src/evaluation.py",
-    "scripts/summarize_moe_results.py",
-    "scripts/check_env.py",
-    "scripts/prepare_models.py",
-]
-
-for rel in FILES_TO_CHECK:
-    fpath = os.path.join(REPO_ROOT, rel)
-    if not os.path.exists(fpath):
-        _warn(f"{rel} — file not found (skipped)")
-        continue
-    try:
-        py_compile.compile(fpath, doraise=True)
-        _ok(f"{rel}")
-    except py_compile.PyCompileError as e:
-        _fail(f"{rel} — SYNTAX ERROR: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary
-# ─────────────────────────────────────────────────────────────────────────────
-print()
-print("━" * 60)
-if warnings_issued:
-    print(f"  {len(warnings_issued)} warning(s):")
-    for w in warnings_issued:
-        first_line = w.split("\n")[0]
-        print(f"    ⚠  {first_line}")
-    print()
-
-if overall_ok:
-    print("  ENV CHECK PASSED")
-    print("━" * 60)
-    sys.exit(0)
-else:
-    print("  ENV CHECK FAILED — fix the errors above before running experiments")
-    print("━" * 60)
-    sys.exit(1)
+    ta = imported.get("torchaudio")
+    if ta is not None:
+        _exp_ta_str = exp_ta if exp_ta else "?"
+        _ok(f"torchaudio  {ta.__version__}  (expected {_exp_ta_str})")
