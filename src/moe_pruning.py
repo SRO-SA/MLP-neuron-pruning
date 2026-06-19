@@ -267,22 +267,36 @@ def _detect_experts_layout(experts) -> str:
     "packed_gate_up"    — Layout B: experts has .gate_up_proj [n,2i,h] + .down_proj [n,h,i]
     "unknown"           — neither layout recognised
     """
-    # Layout B check first (more specific)
-    if (hasattr(experts, "gate_up_proj") and
-            hasattr(experts, "down_proj") and
-            isinstance(getattr(experts, "gate_up_proj", None), torch.Tensor)):
-        gu = experts.gate_up_proj
-        if gu.ndim == 3:
-            return "packed_gate_up"
+    _type_name = type(experts).__name__
+    print(f"    [detect] experts type = {_type_name}")
 
-    # Layout A: try iterating
+    _has_gu = hasattr(experts, "gate_up_proj")
+    _has_dp = hasattr(experts, "down_proj")
+    print(f"    [detect] has gate_up_proj={_has_gu}  has down_proj={_has_dp}")
+
+    if _has_gu and _has_dp:
+        _gu_obj    = getattr(experts, "gate_up_proj", None)
+        _is_tensor = isinstance(_gu_obj, torch.Tensor)
+        _gu_type   = type(_gu_obj).__name__ if _gu_obj is not None else "None"
+        print(f"    [detect] gate_up_proj type={_gu_type}  isinstance(Tensor)={_is_tensor}")
+        if _is_tensor:
+            gu = _gu_obj
+            print(f"    [detect] gate_up_proj.shape={list(gu.shape)}  ndim={gu.ndim}")
+            if gu.ndim == 3:
+                print("    [detect] -> packed_gate_up")
+                return "packed_gate_up"
+            else:
+                print(f"    [detect] ndim={gu.ndim} != 3, falling through")
+
     try:
         items = list(experts)
         if items and hasattr(items[0], "gate_proj"):
+            print(f"    [detect] -> unpacked (iterable, {len(items)} experts)")
             return "unpacked"
-    except (TypeError, RuntimeError):
-        pass
+    except (TypeError, RuntimeError) as _det_e:
+        print(f"    [detect] not iterable: {_det_e}")
 
+    print("    [detect] -> unknown layout")
     return "unknown"
 
 
@@ -1578,6 +1592,15 @@ def _build_per_layer_rows(
                 hidden = ec.gate_up_proj.shape[2]
                 ep_bef = num_experts * 3 * old_inter * hidden
                 ep_aft = num_experts * 3 * new_inter * hidden
+            elif old_inter > 0 and info.expert_modules:
+                # Unpacked Layout A: derive hidden_dim from first expert
+                try:
+                    _w0    = get_expert_weights(info.expert_modules[0])
+                    hidden = _w0["d_model"]
+                    ep_bef = num_experts * 3 * old_inter * hidden
+                    ep_aft = num_experts * 3 * new_inter * hidden
+                except Exception:
+                    ep_bef = ep_aft = 0
             else:
                 ep_bef = ep_aft = 0
 
@@ -1930,8 +1953,10 @@ def run_moe_target_pruning_mode(
                 all_expert_scores: List[Tuple[int, int, torch.Tensor]] = []
                 print("  Computing expert scores ...")
                 for info in moe_layers:
-                    if info.experts_packed and pruning_mode == "packed_same_channel":
+                    if pruning_mode == "packed_same_channel":
                         # Aggregate per-expert scores to a single layer-level score.
+                        # Works for both packed (Layout B) and unpacked (Layout A):
+                        # the same channel indices are removed from every expert.
                         # Selection then picks globally across layers using this score.
                         per_exp_s: List[torch.Tensor] = []
                         rt_weights: List[float] = []
@@ -1965,8 +1990,7 @@ def run_moe_target_pruning_mode(
                             agg_s     = _aggregate_expert_scores(stacked_s, chan_agg, rt_t)
                             all_expert_scores.append((info.layer_idx, -1, agg_s))
                     else:
-                        # per_expert_mask mode (packed or unpacked) OR unpacked
-                        # packed_same_channel: use true per-expert scores.
+                        # per_expert_mask mode: score each expert independently.
                         for ei, exp in enumerate(info.expert_modules):
                             try:
                                 _calib_ei = (
@@ -2096,6 +2120,30 @@ def run_moe_target_pruning_mode(
                 print(f"    removed_expert_neurons   : {actual_pruned:,}")
                 print(f"    actual_pct               : {actual_pct:.3f}%  "
                       f"(requested {target_pct:.1f}%)")
+
+                # ── Fail-fast: verify packed_same_channel used (li,-1) keys ─
+                if pruning_mode == "packed_same_channel" and target_pct > 0:
+                    _n_layer_ch_keys = sum(
+                        1 for (_li2, _ei2) in per_expert_pruned
+                        if _ei2 == -1 and per_expert_pruned[(_li2, _ei2)]
+                    )
+                    if _n_layer_ch_keys == 0:
+                        _sample_keys = list(per_expert_pruned.keys())[:5]
+                        raise RuntimeError(
+                            "packed_same_channel scoring produced NO (layer,-1) "
+                            "entries.  per_expert_pruned sample keys: "
+                            f"{_sample_keys}  "
+                            f"selected_layer_channels={selected_layer_channels}  "
+                            f"removed_expert_neurons={actual_pruned}  "
+                            "Scoring took per-expert path. Check [detect] output."
+                        )
+                    print(
+                        f"    [validation] packed_same_channel: "
+                        f"{_n_layer_ch_keys} layers selected  "
+                        f"selected_layer_channels={selected_layer_channels}  "
+                        f"removed_expert_neurons={actual_pruned}"
+                    )
+
                 _print_per_layer_distribution(
                     per_expert_pruned, expert_sizes, moe_layers,
                     routed_counts, total_expert_neurons, chan_align,
@@ -2330,48 +2378,119 @@ def run_moe_target_pruning_mode(
                             prune_idx = torch.tensor(sorted(prune_list), dtype=torch.long)
 
                             if ei == -1:
-                                # Packed layer: global same-channel pruning
+                                # Same-channel pruning across ALL experts in the layer.
+                                # Handles both packed Layout B (tensor slice) and
+                                # unpacked Layout A (loop over individual modules).
                                 ec              = info.experts_container
                                 n_pruned_actual = len(prune_idx)
                                 removed_en      = n_pruned_actual * info.num_experts
 
-                                # keep_idx in old d_ff space (needed for residual)
+                                # keep_idx in old d_ff space (needed for residual path)
                                 _km = torch.ones(d_ff_orig, dtype=torch.bool)
                                 _km[prune_idx] = False
                                 _keep_idx_packed = _km.nonzero(as_tuple=True)[0]
 
-                                # ── residual_full_moe: compensate BEFORE pruning ──
-                                if method == "residual_full_moe" and _calib_ref is not None:
-                                    _t_rs = time.perf_counter()
-                                    _layer_acts = {
-                                        _ei2: _calib_ref.get((li, _ei2))
-                                        for _ei2 in range(info.num_experts)
-                                    }
-                                    _rs = apply_packed_residual_for_layer(
-                                        ec, prune_idx, _keep_idx_packed, _layer_acts,
-                                        min_tokens=min_resid_tok,
-                                        ridge_lambda=resid_lambda,
-                                        tau=resid_tau,
-                                        solve_on_cpu=resid_on_cpu,
-                                    )
-                                    t_recon_total += time.perf_counter() - _t_rs
-                                    _resid_stable  += _rs["n_stable"]
-                                    _resid_skipped += _rs["n_skipped"]
-                                    _resid_failed  += _rs["n_failed"]
+                                # ── Debug: shapes BEFORE pruning ──────────────
+                                if info.experts_packed and ec is not None:
                                     print(
-                                        f"      [residual_full_moe layer {li}] "
-                                        f"stable={_rs['n_stable']}  "
-                                        f"skip={_rs['n_skipped']}  "
-                                        f"fail={_rs['n_failed']}  "
-                                        f"mean_tok={_rs['mean_tokens']}"
+                                        f"      [before] layer {li}: "
+                                        f"gate_up_proj {list(ec.gate_up_proj.shape)}  "
+                                        f"down_proj {list(ec.down_proj.shape)}  "
+                                        f"old_intermediate={d_ff_orig}"
                                     )
+                                else:
+                                    try:
+                                        _e0 = info.expert_modules[0]
+                                        print(
+                                            f"      [before] layer {li} (unpacked): "
+                                            f"gate_proj {list(_e0.gate_proj.weight.shape)}  "
+                                            f"down_proj {list(_e0.down_proj.weight.shape)}  "
+                                            f"old_intermediate={d_ff_orig}"
+                                        )
+                                    except Exception:
+                                        print(
+                                            f"      [before] layer {li}: "
+                                            f"old_intermediate={d_ff_orig}"
+                                        )
 
-                                new_inter = prune_packed_experts_global(
-                                    ec, prune_idx, alignment=chan_align
-                                )
-                                for pv in info.expert_modules:
-                                    if isinstance(pv, PackedExpertView):
-                                        pv.moe_intermediate = new_inter
+                                if info.experts_packed and ec is not None:
+                                    # ── PACKED TENSOR PATH (Layout B) ─────────
+                                    if method == "residual_full_moe" and _calib_ref is not None:
+                                        _t_rs = time.perf_counter()
+                                        _layer_acts = {
+                                            _ei2: _calib_ref.get((li, _ei2))
+                                            for _ei2 in range(info.num_experts)
+                                        }
+                                        _rs = apply_packed_residual_for_layer(
+                                            ec, prune_idx, _keep_idx_packed, _layer_acts,
+                                            min_tokens=min_resid_tok,
+                                            ridge_lambda=resid_lambda,
+                                            tau=resid_tau,
+                                            solve_on_cpu=resid_on_cpu,
+                                        )
+                                        t_recon_total += time.perf_counter() - _t_rs
+                                        _resid_stable  += _rs["n_stable"]
+                                        _resid_skipped += _rs["n_skipped"]
+                                        _resid_failed  += _rs["n_failed"]
+                                        print(
+                                            f"      [residual_full_moe layer {li}] "
+                                            f"stable={_rs['n_stable']}  "
+                                            f"skip={_rs['n_skipped']}  "
+                                            f"fail={_rs['n_failed']}  "
+                                            f"mean_tok={_rs['mean_tokens']}"
+                                        )
+                                    new_inter = prune_packed_experts_global(
+                                        ec, prune_idx, alignment=chan_align
+                                    )
+                                    for pv in info.expert_modules:
+                                        if isinstance(pv, PackedExpertView):
+                                            pv.moe_intermediate = new_inter
+                                    print(
+                                        f"      [after]  layer {li}: "
+                                        f"gate_up_proj {list(ec.gate_up_proj.shape)}  "
+                                        f"down_proj {list(ec.down_proj.shape)}  "
+                                        f"new_intermediate={new_inter}  "
+                                        f"pruned_channels={n_pruned_actual}"
+                                    )
+                                else:
+                                    # ── UNPACKED SAME-CHANNEL PATH (Layout A) ──
+                                    # Apply identical prune_idx to every expert so
+                                    # the same channels are removed globally.
+                                    if method == "residual_full_moe":
+                                        print(
+                                            f"      [warn] layer {li}: "
+                                            "residual_full_moe not supported for "
+                                            "unpacked experts — using pure_delete"
+                                        )
+                                    _unpacked_ok = 0
+                                    for ei_u in range(info.num_experts):
+                                        expert_u = info.expert_modules[ei_u]
+                                        try:
+                                            prune_expert_channels(expert_u, prune_idx)
+                                            _unpacked_ok += 1
+                                        except Exception as _upe:
+                                            logger.warning(
+                                                "unpacked same-ch prune layer=%d ei=%d: %s",
+                                                li, ei_u, _upe,
+                                            )
+                                    new_inter = d_ff_orig - n_pruned_actual
+                                    try:
+                                        _e0n = info.expert_modules[0]
+                                        print(
+                                            f"      [after]  layer {li} (unpacked): "
+                                            f"gate_proj {list(_e0n.gate_proj.weight.shape)}  "
+                                            f"down_proj {list(_e0n.down_proj.weight.shape)}  "
+                                            f"new_intermediate={new_inter}  "
+                                            f"pruned_channels={n_pruned_actual}  "
+                                            f"experts_pruned={_unpacked_ok}/{info.num_experts}"
+                                        )
+                                    except Exception:
+                                        print(
+                                            f"      [after]  layer {li} (unpacked): "
+                                            f"new_intermediate={new_inter}  "
+                                            f"pruned_channels={n_pruned_actual}"
+                                        )
+
                                 experts_pruned += info.num_experts
                                 _old_inter_summary = _old_inter_summary or d_ff_orig
                                 _new_inter_summary = new_inter
@@ -2406,8 +2525,8 @@ def run_moe_target_pruning_mode(
                                 print(
                                     f"      Layer {li}: "
                                     f"pruned {n_pruned_actual} channels from "
-                                    f"{info.num_experts} packed experts "
-                                    f"({d_ff_orig}→{new_inter})  "
+                                    f"{info.num_experts} experts "
+                                    f"({d_ff_orig}->{new_inter})  "
                                     f"new_inter%{chan_align}={new_inter % chan_align}  "
                                     f"removed_expert_neurons={removed_en:,}"
                                 )
@@ -2542,9 +2661,67 @@ def run_moe_target_pruning_mode(
                     print(f"  Total model reduction  : {_total_model_param_red_pct:.3f}%")
                     print(f"  Active expert FLOP red.: {_active_flop_red_pct:.3f}%")
 
+                    # ── Post-pruning validation (packed_same_channel) ─────────
+                    _prune_valid = True
+                    if pruning_mode == "packed_same_channel" and target_pct > 0:
+                        _pruned_pl_check  = [_r for _r in _per_layer_rows
+                                             if _r.get("pruned_channels", 0) > 0]
+                        _shape_chg_check  = any(_r.get("shape_changed", False)
+                                                for _r in _per_layer_rows)
+                        _ep_red_check     = _expert_param_red_pct > 0
+                        _flop_red_check   = _active_flop_red_pct > 0
+                        _chan_check       = selected_layer_channels > 0
+                        _neu_check        = actual_pruned > 0
+                        _fails = []
+                        if not _chan_check:
+                            _fails.append(
+                                f"selected_layer_channels={selected_layer_channels} (expected >0)")
+                        if not _neu_check:
+                            _fails.append(
+                                f"removed_expert_neurons={actual_pruned} (expected >0)")
+                        if not _pruned_pl_check:
+                            _fails.append(
+                                "per-layer CSV has no pruned layers (pruned_channels>0)")
+                        if not _shape_chg_check:
+                            _fails.append(
+                                "no layer has shape_changed=True in per-layer CSV")
+                        if not _ep_red_check:
+                            _fails.append(
+                                f"expert_param_reduction_pct={_expert_param_red_pct:.4f}% (expected >0)")
+                        if not _flop_red_check:
+                            _fails.append(
+                                f"active_expert_flop_reduction_pct={_active_flop_red_pct:.4f}% (expected >0)")
+                        if _fails:
+                            _prune_valid = False
+                            _sep = "=" * 60
+                            print(f"  {_sep}")
+                            print(
+                                f"  PRUNING VALIDATION FAILED "
+                                f"(packed_same_channel target={target_pct}%)"
+                            )
+                            for _fmsg in _fails:
+                                print(f"    FAIL: {_fmsg}")
+                            print(
+                                "  Physical pruning did NOT happen correctly."
+                            )
+                            print(
+                                "  Skipping PPL evaluation."
+                            )
+                            print(
+                                "  Check [detect] / [before] / [after] output above."
+                            )
+                            print(f"  {_sep}")
+                        else:
+                            print(
+                                f"  [validation] packed_same_channel OK: "
+                                f"{len(_pruned_pl_check)} layers pruned  "
+                                f"param_red={_expert_param_red_pct:.3f}%  "
+                                f"flop_red={_active_flop_red_pct:.3f}%"
+                            )
+
                     # ── Forward check ─────────────────────────────────────────
                     # If forward pass fails, record error and skip PPL eval.
-                    fp_ok = verify_forward_pass(model, tokenizer, device)
+                    fp_ok = verify_forward_pass(model, tokenizer, device) if _prune_valid else False
                     _log_gpu_memory("after forward check")
 
                     _has_packed = any(i.experts_packed for i in moe_layers)
@@ -2567,6 +2744,15 @@ def run_moe_target_pruning_mode(
                         else 0.0
                     )
 
+                    if not _prune_valid:
+                        print("    Marking result as: failed_invalid_physical_pruning")
+                    if not fp_ok:
+                        _notes_str = (
+                            "failed_invalid_physical_pruning"
+                            if not _prune_valid
+                            else "forward_pass_failed"
+                        )
+                        print(f"    (status: {_notes_str})")
                     if not fp_ok:
                         print("    ERROR: forward pass failed — skipping PPL eval")
                         for _ds in EVAL_DATASETS:
@@ -2617,7 +2803,7 @@ def run_moe_target_pruning_mode(
                                 "gpu1_peak_mb":  round(_gpu1_peak, 1),
                                 "time_sec":      round(_t_end - _t_start, 1),
                                 "dtype": dtype_str,
-                                "notes": "forward_pass_failed",
+                                "notes": locals().get("_notes_str", "forward_pass_failed"),
                                 "csv_path": main_csv_path,
                                 "json_path": json_path,
                             }
