@@ -62,7 +62,6 @@ echo "[sweep] Generating configs in ${CONFIG_DIR}/ ..."
 python3 scripts/generate_moe_residual_sweep_configs.py --out-dir "${CONFIG_DIR}"
 
 # ── Validate a YAML config (required keys for --moe-target-pruning mode) ─────
-# Uses Python inline so we get clear error messages before launching GPU jobs.
 validate_config() {
     local cfg_path="$1"
     python3 - "${cfg_path}" << 'PYEOF'
@@ -87,8 +86,8 @@ PYEOF
 }
 
 # ── Collect configs in correct order ──────────────────────────────────────────
-# Targets match what the generator uses: 2 4 6 8
-# pure_delete must run first per target (it saves the pruning plan).
+# Targets match generator: 2 4 6 8
+# pure_delete runs first per target (saves the pruning plan for others to load).
 declare -a ALL_CONFIGS=()
 for target in 2 4 6 8; do
     pd="${CONFIG_DIR}/qwen3_30b_a3b_wikitext2_n64_target${target}_pure_delete.yaml"
@@ -106,27 +105,25 @@ TOTAL_FOUND=${#ALL_CONFIGS[@]}
 echo "[sweep] Found ${TOTAL_FOUND} config(s)."
 
 if [ ${TOTAL_FOUND} -eq 0 ]; then
-    echo "[sweep] ERROR: No config files found in ${CONFIG_DIR}/. Aborting."
+    echo "[sweep] ERROR: No configs found in ${CONFIG_DIR}/. Aborting."
     exit 1
 fi
 
-# Assert full matrix for non-smoke runs
+# Assert full 4×10 matrix for non-smoke runs
 if [ "${SMOKE}" != "1" ] && [ ${TOTAL_FOUND} -ne 40 ]; then
     echo "[sweep] ERROR: Expected 40 configs (4 targets × 10 methods), found ${TOTAL_FOUND}."
-    echo "[sweep]   CONFIG_DIR=${CONFIG_DIR}"
-    echo "[sweep]   Regenerate with: python3 scripts/generate_moe_residual_sweep_configs.py"
+    echo "[sweep]   Regenerate: python3 scripts/generate_moe_residual_sweep_configs.py"
     exit 1
 fi
 
-# ── Validate all configs before starting any GPU work ─────────────────────────
+# ── Validate all configs before any GPU work ──────────────────────────────────
 echo "[sweep] Validating all ${TOTAL_FOUND} configs..."
 for cfg_path in "${ALL_CONFIGS[@]}"; do
     validate_config "${cfg_path}" || exit 1
 done
 echo "[sweep] All configs valid."
 
-# ── SMOKE mode: select 4 representative configs ───────────────────────────────
-# Always from target2: pure_delete + ridge_lam1e-2 + ridge_oii_lam1e-2 + nearest_merge
+# ── SMOKE mode: select 4 representative configs from target2 ─────────────────
 if [ "${SMOKE}" = "1" ]; then
     echo "[sweep] SMOKE=1: selecting 4 representative configs from target2."
     SMOKE_PATTERNS=(
@@ -151,7 +148,7 @@ if [ "${SMOKE}" = "1" ]; then
             echo "[sweep]   WARNING: no config matched pattern '${pattern}'"
         fi
     done
-    echo "[sweep] ${#ALL_CONFIGS[@]} configs generated; running ${#RUN_CONFIGS[@]} (smoke)."
+    echo "[sweep] ${TOTAL_FOUND} configs generated; running ${#RUN_CONFIGS[@]} (smoke)."
 else
     RUN_CONFIGS=("${ALL_CONFIGS[@]}")
 fi
@@ -159,33 +156,33 @@ fi
 N_RUNS=${#RUN_CONFIGS[@]}
 echo "[sweep] Will run ${N_RUNS} config(s)."
 
-# ── Write initial manifest ─────────────────────────────────────────────────────
+# ── Write initial manifest ────────────────────────────────────────────────────
 python3 - "${MANIFEST}" "${SWEEP_ID}" "${SMOKE}" "${N_RUNS}" << 'PYEOF'
 import json, sys, datetime
-manifest_path, sweep_id, smoke, n_runs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+manifest_path, sweep_id, smoke, n_runs = sys.argv[1:5]
 manifest = {
     "sweep_id": sweep_id,
     "smoke": smoke == "1",
     "n_planned": int(n_runs),
     "started_at": datetime.datetime.now().isoformat(),
-    "runs": []
+    "runs": [],
+    "csv_files": [],
 }
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 PYEOF
 
-# ── Helper: find new CSV/JSON files written since a snapshot ─────────────────
-snapshot_results() {
-    # Print list of moe_target_pruning_*.csv and *.json in RESULTS_DIR
-    find "${RESULTS_DIR}" -maxdepth 1 \
-        \( -name "moe_target_pruning_*.csv" -o -name "moe_target_pruning_*.json" \) \
-        -newer /proc/self/exe 2>/dev/null || true
+# ── Helper: check log file for error indicators ───────────────────────────────
+log_has_error() {
+    local logfile="$1"
+    grep -qE '(\*\*\* ERROR|ERROR Failed|UnboundLocalError|KeyError|AttributeError|Traceback \(most recent)' \
+        "${logfile}" 2>/dev/null
 }
 
-# ── Run each config ────────────────────────────────────────────────────────────
+# ── Run each config ───────────────────────────────────────────────────────────
 FAILED=0
 SUCCEEDED=0
-declare -a MANIFEST_RUNS=()
+declare -a MANIFEST_CSV_FILES=()
 
 for cfg_path in "${RUN_CONFIGS[@]}"; do
     cfg_name="$(basename "${cfg_path}" .yaml)"
@@ -197,9 +194,10 @@ for cfg_path in "${RUN_CONFIGS[@]}"; do
     echo "[sweep] Log:    ${run_log}"
     echo "════════════════════════════════════════════════════════════════"
 
-    # Snapshot existing files before the run
-    BEFORE_CSV=( $(ls "${RESULTS_DIR}"/moe_target_pruning_*.csv 2>/dev/null || true) )
-    BEFORE_JSON=( $(ls "${RESULTS_DIR}"/moe_target_pruning_*.json 2>/dev/null || true) )
+    # Snapshot existing MAIN CSV/JSON files (exclude per_layer)
+    BEFORE_MAIN_CSV=( $(ls "${RESULTS_DIR}"/moe_target_pruning_[0-9]*.csv 2>/dev/null | \
+                         grep -v '_per_layer' || true) )
+    BEFORE_MAIN_JSON=( $(ls "${RESULTS_DIR}"/moe_target_pruning_[0-9]*.json 2>/dev/null || true) )
 
     t_start=$(date +%s)
 
@@ -214,40 +212,62 @@ for cfg_path in "${RUN_CONFIGS[@]}"; do
     t_end=$(date +%s)
     elapsed=$(( t_end - t_start ))
 
-    # Find new CSV/JSON files written by this run
-    declare -a NEW_CSVS=()
-    declare -a NEW_JSONS=()
-    for f in $(ls "${RESULTS_DIR}"/moe_target_pruning_*.csv 2>/dev/null || true); do
-        if [[ ! " ${BEFORE_CSV[*]} " =~ " ${f} " ]]; then
-            NEW_CSVS+=("$f")
+    # Find new MAIN CSV/JSON files (exclude per_layer)
+    declare -a NEW_MAIN_CSVS=()
+    declare -a NEW_MAIN_JSONS=()
+    for f in $(ls "${RESULTS_DIR}"/moe_target_pruning_[0-9]*.csv 2>/dev/null | \
+               grep -v '_per_layer' || true); do
+        if [[ ! " ${BEFORE_MAIN_CSV[*]:-} " =~ " ${f} " ]]; then
+            NEW_MAIN_CSVS+=("$f")
         fi
     done
-    for f in $(ls "${RESULTS_DIR}"/moe_target_pruning_*.json 2>/dev/null || true); do
-        if [[ ! " ${BEFORE_JSON[*]} " =~ " ${f} " ]]; then
-            NEW_JSONS+=("$f")
+    for f in $(ls "${RESULTS_DIR}"/moe_target_pruning_[0-9]*.json 2>/dev/null || true); do
+        if [[ ! " ${BEFORE_MAIN_JSON[*]:-} " =~ " ${f} " ]]; then
+            NEW_MAIN_JSONS+=("$f")
         fi
     done
 
-    if [ ${exit_code} -eq 0 ]; then
-        echo "[sweep] ✓ ${cfg_name} done in ${elapsed}s"
+    # Determine true success:
+    #   1. exit code must be 0
+    #   2. log must not contain error indicators
+    #   3. at least one new MAIN CSV must have been created
+    run_ok=1
+    if [ ${exit_code} -ne 0 ]; then
+        echo "[sweep] ✗ exit code ${exit_code}"
+        run_ok=0
+    fi
+    if log_has_error "${run_log}"; then
+        echo "[sweep] ✗ error indicators found in log"
+        run_ok=0
+    fi
+    if [ ${#NEW_MAIN_CSVS[@]} -eq 0 ]; then
+        echo "[sweep] ✗ no main CSV created (only per-layer CSVs do not count)"
+        run_ok=0
+    fi
+
+    if [ ${run_ok} -eq 1 ]; then
+        echo "[sweep] ✓ ${cfg_name} done in ${elapsed}s  (main CSVs: ${#NEW_MAIN_CSVS[@]})"
         SUCCEEDED=$(( SUCCEEDED + 1 ))
 
-        # Copy outputs to run dir
-        for f in "${NEW_CSVS[@]:-}"; do
-            [ -z "${f}" ] && continue
+        # Copy MAIN CSVs and JSONs to run dir
+        for f in "${NEW_MAIN_CSVS[@]}"; do
             cp "${f}" "${RUN_CSV_DIR}/"
+            MANIFEST_CSV_FILES+=("${RUN_CSV_DIR}/$(basename "${f}")")
             echo "[sweep]   copied: $(basename "${f}")"
         done
-        for f in "${NEW_JSONS[@]:-}"; do
-            [ -z "${f}" ] && continue
+        for f in "${NEW_MAIN_JSONS[@]}"; do
             cp "${f}" "${RUN_CSV_DIR}/"
         done
-
-        MANIFEST_RUNS+=("{\"config\":\"${cfg_name}\",\"status\":\"ok\",\"elapsed\":${elapsed}}")
+        # Also copy per_layer CSVs separately (for reference, not for summarizer)
+        for f in $(ls "${RESULTS_DIR}"/moe_target_pruning_*_per_layer.csv 2>/dev/null || true); do
+            fname="$(basename "${f}")"
+            if [ ! -f "${RUN_CSV_DIR}/${fname}" ]; then
+                cp "${f}" "${RUN_CSV_DIR}/"
+            fi
+        done
     else
-        echo "[sweep] ✗ ${cfg_name} FAILED (exit ${exit_code}) after ${elapsed}s"
+        echo "[sweep] ✗ ${cfg_name} FAILED after ${elapsed}s"
         FAILED=$(( FAILED + 1 ))
-        MANIFEST_RUNS+=("{\"config\":\"${cfg_name}\",\"status\":\"failed\",\"elapsed\":${elapsed}}")
 
         if [ "${CONTINUE_ON_FAIL}" != "1" ]; then
             echo "[sweep] Aborting. Set CONTINUE_ON_FAIL=1 to continue past failures."
@@ -256,22 +276,42 @@ for cfg_path in "${RUN_CONFIGS[@]}"; do
     fi
 done
 
-# ── Update final manifest ──────────────────────────────────────────────────────
-python3 - "${MANIFEST}" "${SWEEP_ID}" "${SUCCEEDED}" "${FAILED}" "${RUN_CSV_DIR}" << 'PYEOF'
-import json, sys, glob, datetime
-manifest_path, sweep_id, succeeded, failed, csv_dir = sys.argv[1:6]
+# ── Update final manifest with list of main CSVs ──────────────────────────────
+python3 - "${MANIFEST}" "${SWEEP_ID}" "${SUCCEEDED}" "${FAILED}" << PYEOF
+import json, sys, datetime
+manifest_path, sweep_id, succeeded, failed = sys.argv[1:5]
 with open(manifest_path) as f:
     manifest = json.load(f)
 manifest["succeeded"] = int(succeeded)
 manifest["failed"] = int(failed)
 manifest["finished_at"] = datetime.datetime.now().isoformat()
-# List all CSVs in the run dir (exclude per_layer and summary)
-manifest["csv_files"] = sorted(
-    f for f in glob.glob(f"{csv_dir}/moe_target_pruning_*.csv")
-)
+# csv_files: only MAIN CSVs (no per_layer), listed in env var MANIFEST_CSV_LIST
+import os
+csv_list = os.environ.get("MANIFEST_CSV_LIST", "").split("|")
+manifest["csv_files"] = [p for p in csv_list if p.endswith(".csv") and "_per_layer" not in p]
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print(f"[sweep] Manifest: {manifest_path}")
+PYEOF
+
+# Export for the python subprocess above
+export MANIFEST_CSV_LIST
+MANIFEST_CSV_LIST="$(IFS='|'; echo "${MANIFEST_CSV_FILES[*]:-}")"
+# Re-run manifest update now that env var is set
+python3 - "${MANIFEST}" "${SWEEP_ID}" "${SUCCEEDED}" "${FAILED}" << PYEOF
+import json, sys, os, datetime
+manifest_path, sweep_id, succeeded, failed = sys.argv[1:5]
+with open(manifest_path) as f:
+    manifest = json.load(f)
+manifest["succeeded"] = int(succeeded)
+manifest["failed"] = int(failed)
+manifest["finished_at"] = datetime.datetime.now().isoformat()
+csv_list = os.environ.get("MANIFEST_CSV_LIST", "").split("|")
+manifest["csv_files"] = [p for p in csv_list if p and p.endswith(".csv") and "_per_layer" not in p]
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 print(f"[sweep] Manifest updated: {manifest_path}")
+print(f"[sweep]   csv_files ({len(manifest['csv_files'])}): {manifest['csv_files']}")
 PYEOF
 
 # ── Final summary ──────────────────────────────────────────────────────────────
@@ -294,7 +334,7 @@ elif [ -f "scripts/summarize_moe_residual_sweep.py" ]; then
 fi
 
 if [ "${FAILED}" -gt 0 ]; then
-    echo "[sweep] WARNING: ${FAILED} run(s) failed. Check ${RUN_LOG_DIR}/ for details."
+    echo "[sweep] WARNING: ${FAILED} run(s) failed. Logs: ${RUN_LOG_DIR}/"
     exit 1
 fi
 exit 0

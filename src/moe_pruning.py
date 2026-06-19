@@ -3086,6 +3086,50 @@ def run_moe_target_pruning_mode(
                         else 0.0
                     )
 
+                    # ── Residual summary stats — computed once, used by err_row and summary ──
+                    _VARIANT_MAP = {
+                        "pure_delete":                                          "none",
+                        "residual_full_moe":                                    "full",
+                        "residual_ridge_moe":                                   "ridge",
+                        "residual_ridge_only_if_improves_moe":                  "ridge_only_if_improves",
+                        "residual_nearest_channel_merge_moe":                   "nearest_channel_merge",
+                        "residual_nearest_channel_merge_only_if_improves_moe":  "nearest_channel_merge_only_if_improves",
+                        "residual_mask_moe":                                    "mask",
+                        "residual_diag_moe":                                    "diag",
+                    }
+                    _cov_pct = (
+                        100.0 * _resid_stable / _resid_total_cand
+                        if _resid_total_cand > 0 else 0.0
+                    )
+                    _mean_e_del = (
+                        _err_del_wsum / _err_cnt
+                        if _err_cnt > 0 else float("nan")
+                    )
+                    _mean_e_res = (
+                        _err_res_wsum / _err_cnt
+                        if _err_cnt > 0 else float("nan")
+                    )
+                    _mean_imp = (
+                        100.0 * (_mean_e_del - _mean_e_res)
+                        / (_mean_e_del + 1e-12)
+                        if _err_cnt > 0 else float("nan")
+                    )
+                    _mean_upd = (
+                        sum(_upd_norms_all) / len(_upd_norms_all)
+                        if _upd_norms_all else float("nan")
+                    )
+                    _max_upd = (
+                        max(_upd_norms_all)
+                        if _upd_norms_all else float("nan")
+                    )
+                    _actual_method = (
+                        method
+                        if (_residual_applied or method == "pure_delete")
+                        else "pure_delete"
+                    )
+                    # Override _resid_variant with a readable slug
+                    _resid_variant = _VARIANT_MAP.get(method, method)
+
                     if not fp_ok:
                         for _ds in EVAL_DATASETS:
                             err_row = {
@@ -3140,37 +3184,6 @@ def run_moe_target_pruning_mode(
                                 "json_path": json_path,
                             }
 
-                            # ── Compute residual summary stats for CSV ────────────
-                            _cov_pct = (
-                                100.0 * _resid_stable / _resid_total_cand
-                                if _resid_total_cand > 0 else 0.0
-                            )
-                            _mean_e_del = (
-                                _err_del_wsum / _err_cnt
-                                if _err_cnt > 0 else float("nan")
-                            )
-                            _mean_e_res = (
-                                _err_res_wsum / _err_cnt
-                                if _err_cnt > 0 else float("nan")
-                            )
-                            _mean_imp = (
-                                100.0 * (_mean_e_del - _mean_e_res)
-                                / (_mean_e_del + 1e-12)
-                                if _err_cnt > 0 else float("nan")
-                            )
-                            _mean_upd = (
-                                sum(_upd_norms_all) / len(_upd_norms_all)
-                                if _upd_norms_all else float("nan")
-                            )
-                            _max_upd = (
-                                max(_upd_norms_all)
-                                if _upd_norms_all else float("nan")
-                            )
-                            _actual_method = (
-                                method
-                                if (_residual_applied or method == "pure_delete")
-                                else "pure_delete"
-                            )
                             err_row.update({
                                 "target_pct": target_pct,
                                 "actual_pct": round(actual_pct, 4),
