@@ -51,6 +51,8 @@ NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
 SKIP_MMLU="${SKIP_MMLU:-1}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 SMOKE_LIMIT="${SMOKE_LIMIT:-50}"
+CHECK_LOGITS_DIFF="${CHECK_LOGITS_DIFF:-0}"
+DOWNSTREAM_METHOD="${DOWNSTREAM_METHOD:-unknown}"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -87,6 +89,7 @@ echo "[eval] Model:  ${MODEL}"
 echo "[eval] Tasks:  ${TASKS}"
 if [ "${SMOKE}" = "1" ]; then
     echo "[eval] SMOKE=1: using --limit ${SMOKE_LIMIT}"
+    echo "[eval] SMOKE=1 uses --limit ${SMOKE_LIMIT} for plumbing verification only; do not interpret these as real downstream metrics."
 fi
 
 # ── Activate virtualenv ───────────────────────────────────────────────────────
@@ -201,13 +204,32 @@ fi
 declare -a SETTINGS=()
 SETTINGS+=("baseline_no_pruning|NONE|baseline|none|none|0.0")
 
+# Helper: compute actual pruned pct from a plan JSON (returns "NA" if plan missing/unreadable)
+_plan_actual_pct() {
+    local pf="$1"
+    [ -f "${pf}" ] || { echo "NA"; return; }
+    python - "${pf}" << 'PYSMALL'
+import json, sys
+try:
+    with open(sys.argv[1]) as f: d = json.load(f)
+    t = sum(l.get("old_intermediate", 0) for l in d.get("layers", []))
+    p = sum(len(l.get("prune_idx", [])) for l in d.get("layers", []))
+    print(f"{100.*p/max(t,1):.1f}" if t else "NA")
+except Exception: print("NA")
+PYSMALL
+}
+
 if [ "${SMOKE}" = "1" ]; then
     plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_2.0pct_align${ALIGN}.json"
-    SETTINGS+=("${SELECTOR}_wikitext2_target2pct|${plan}|unknown|${SELECTOR}|wikitext2|2.0")
+    _apct="$(_plan_actual_pct "${plan}")"
+    label="${DOWNSTREAM_METHOD}__${SELECTOR}__wikitext2__target2pct__actual${_apct}pct"
+    SETTINGS+=("${label}|${plan}|${DOWNSTREAM_METHOD}|${SELECTOR}|wikitext2|2.0")
 else
     for target in 2 4 8; do
         plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
-        SETTINGS+=("${SELECTOR}_wikitext2_target${target}pct|${plan}|unknown|${SELECTOR}|wikitext2|${target}.0")
+        _apct="$(_plan_actual_pct "${plan}")"
+        label="${DOWNSTREAM_METHOD}__${SELECTOR}__wikitext2__target${target}pct__actual${_apct}pct"
+        SETTINGS+=("${label}|${plan}|${DOWNSTREAM_METHOD}|${SELECTOR}|wikitext2|${target}.0")
     done
 fi
 
@@ -371,15 +393,22 @@ else:
     print(f"[apply_plan] new uniform moe_intermediate_size={new_size}")
     model.config.moe_intermediate_size = new_size
 
-    # Print a sample expert shape for verification
+    # Print sample expert weight shapes for verification (all three projections)
     for layer in layer_list:
         mlp     = getattr(layer, "mlp", None)
         experts = getattr(mlp, "experts", None) if mlp else None
         if experts:
-            down = getattr(experts[0], "down_proj", None)
+            exp0 = experts[0]
+            gate = getattr(exp0, "gate_proj", None)
+            up   = getattr(exp0, "up_proj",   None)
+            down = getattr(exp0, "down_proj",  None)
+            if gate is not None:
+                print(f"[apply_plan] sample gate_proj shape ={list(gate.weight.shape)}")
+            if up is not None:
+                print(f"[apply_plan] sample up_proj shape   ={list(up.weight.shape)}")
             if down is not None:
-                print(f"[apply_plan] sample down_proj shape={list(down.weight.shape)}")
-                break
+                print(f"[apply_plan] sample down_proj shape ={list(down.weight.shape)}")
+            break
     print("[apply_plan] forward_check=True")
 
 # Save
@@ -389,7 +418,7 @@ tokenizer.save_pretrained(save_dir)
 print("[apply_plan] Save complete.")
 
 # Config sanity check: read back config.json and verify the stored size
-import pathlib
+import pathlib, glob as _glob
 cfg_path = pathlib.Path(save_dir) / "config.json"
 if cfg_path.exists():
     import json as _json
@@ -399,9 +428,26 @@ if cfg_path.exists():
     print(f"[apply_plan] saved moe_intermediate_size={saved_moe}")
     if new_size is not None and saved_moe != new_size:
         sys.exit(f"ERROR: config sanity failed: saved={saved_moe}, expected={new_size}")
-    print("[apply_plan] Config sanity: OK")
+    print("[apply_plan] Config sanity OK")
 else:
     print("[apply_plan] WARNING: config.json not found after save")
+
+# Count checkpoint shards
+shard_files = (
+    _glob.glob(str(pathlib.Path(save_dir) / "model*.safetensors")) +
+    _glob.glob(str(pathlib.Path(save_dir) / "pytorch_model*.bin"))
+)
+print(f"[apply_plan] checkpoint shards: {len(shard_files)}")
+
+# AutoConfig reload verification
+from transformers import AutoConfig as _AutoCfg
+print("[apply_plan] Verifying with AutoConfig.from_pretrained ...")
+loaded_cfg = _AutoCfg.from_pretrained(save_dir, trust_remote_code=True)
+loaded_moe = getattr(loaded_cfg, "moe_intermediate_size", None)
+print(f"[apply_plan] AutoConfig moe_intermediate_size={loaded_moe}")
+if new_size is not None and loaded_moe != new_size:
+    sys.exit(f"ERROR: AutoConfig mismatch: loaded={loaded_moe}, expected={new_size}")
+print("[apply_plan] AutoConfig reload: OK")
 
 print("[apply_plan] Done.")
 PYEOF
@@ -453,6 +499,68 @@ for setting in "${SETTINGS[@]}"; do
         fi
         eval_model="${PRUNED_MODEL_DIR}"
         echo "[eval] Pruned model saved to: ${eval_model}"
+    fi
+
+    # ── Optional logits-difference sanity check ───────────────────────────────
+    if [ "${plan}" != "NONE" ] && [ "${CHECK_LOGITS_DIFF}" = "1" ]; then
+        echo "[eval] CHECK_LOGITS_DIFF=1: comparing baseline vs pruned logits ..."
+        set +e
+        python - "${MODEL}" "${eval_model}" "${DTYPE}" << 'PYLOGITS'
+import sys, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+base_name, pruned_dir, dtype_str = sys.argv[1:4]
+# Use float32 for clean numeric diff comparison regardless of model dtype
+dtype = torch.float32
+PROMPT = "Question: What is the capital of France?\nAnswer:"
+
+print(f"[logits_diff] Prompt: {repr(PROMPT)}")
+tok = AutoTokenizer.from_pretrained(base_name, trust_remote_code=True)
+inputs = tok(PROMPT, return_tensors="pt")
+
+print("[logits_diff] Loading baseline model (CPU, float32) ...")
+base_m = AutoModelForCausalLM.from_pretrained(
+    base_name, torch_dtype=dtype, device_map="cpu", trust_remote_code=True
+)
+base_m.eval()
+with torch.no_grad():
+    base_logits = base_m(**inputs).logits[0, -1, :].clone()
+del base_m
+
+print(f"[logits_diff] Loading pruned model from {pruned_dir} (CPU, float32) ...")
+pruned_m = AutoModelForCausalLM.from_pretrained(
+    pruned_dir, torch_dtype=dtype, device_map="cpu", trust_remote_code=True
+)
+pruned_m.eval()
+with torch.no_grad():
+    pruned_logits = pruned_m(**inputs).logits[0, -1, :].clone()
+del pruned_m
+
+n = min(base_logits.shape[0], pruned_logits.shape[0])
+diff = (base_logits[:n] - pruned_logits[:n]).abs()
+mean_diff     = diff.mean().item()
+max_diff      = diff.max().item()
+exactly_equal = bool((base_logits[:n] == pruned_logits[:n]).all())
+
+print(f"[logits_diff] mean_abs_diff : {mean_diff:.6f}")
+print(f"[logits_diff] max_abs_diff  : {max_diff:.6f}")
+print(f"[logits_diff] exactly_equal : {exactly_equal}")
+
+if exactly_equal:
+    sys.exit(
+        "ERROR: baseline and pruned logits are EXACTLY EQUAL -- "
+        "the pruned model is likely not being applied correctly."
+    )
+print("[logits_diff] OK: logits differ between baseline and pruned model.")
+PYLOGITS
+        _logits_exit="${PIPESTATUS[0]}"
+        set -e
+        if [ "${_logits_exit}" -ne 0 ]; then
+            echo "[eval] ERROR: logits-diff check failed for ${label}"
+            FAILED=$(( FAILED + 1 ))
+            continue
+        fi
+        echo "[eval] Logits-diff check: PASSED"
     fi
 
     lm_out="${OUT_DIR}/${label}_lm_eval"
@@ -564,11 +672,18 @@ if rows:
         csv.DictWriter(fh, fieldnames=fields).writerows(rows)
     print(f"[eval] Appended {len(rows)} rows to {summary_csv}")
     for r in rows:
-        print(f"[eval]   {r['task']}  {r['metric']}={r['value']:.4f}"
-              + (f"  stderr={r['stderr']:.4f}" if isinstance(r.get('stderr'), float) else ""))
+        task_v   = r["task"]
+        metric_v = r["metric"]
+        value_v  = r["value"]
+        stderr_v = r.get("stderr")
+        line = f"[eval]   {task_v}  {metric_v}={value_v:.4f}"
+        if isinstance(stderr_v, float):
+            line += f"  stderr={stderr_v:.4f}"
+        print(line)
 else:
+    result_files_str = str(result_files)
     print(f"[eval] WARNING: no results parsed from {results_dir}")
-    print(f"[eval]   Files searched: {result_files}")
+    print(f"[eval]   Files searched: {result_files_str}")
     sys.exit(1)
 PYEOF
 
@@ -588,7 +703,7 @@ PYEOF
     fi
 done
 
-# ── Final summary ─────────────────────────────────────────────────────────────
+# -- Final summary -----------------------------------------------------------
 echo ""
 echo "================================================================"
 echo "[eval] EVAL COMPLETE  (id=${SWEEP_ID})"
@@ -597,6 +712,12 @@ echo "[eval]   Failed:    ${FAILED} / ${#SETTINGS[@]}"
 echo "[eval]   Summary:   ${SUMMARY_CSV}"
 echo "[eval]   Full logs: ${OUT_DIR}/"
 echo "================================================================"
+
+if [ "${SMOKE}" = "1" ]; then
+    echo ""
+    echo "[eval] NOTE: identical accuracy on ${SMOKE_LIMIT}-example smoke is possible;"
+    echo "[eval]   use full (no-limit) eval for real downstream metrics."
+fi
 
 if [ "${FAILED}" -gt 0 ]; then
     echo "[eval] ERROR: ${FAILED} setting(s) failed."
