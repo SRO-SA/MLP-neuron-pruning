@@ -42,6 +42,7 @@ cd "${REPO_ROOT}"
 # ── Config ────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
+AUTO_GENERATE_PLAN="${AUTO_GENERATE_PLAN:-0}"
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B}"
 DTYPE="${DTYPE:-bfloat16}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
@@ -58,6 +59,9 @@ CALIB_N="512"
 D_FF="768"   # Qwen3-30B-A3B MoE intermediate size
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
+# Config prefix = model name without org prefix, lowercased, dashes→underscores
+# e.g. "Qwen/Qwen3-30B-A3B" → "qwen3_30b_a3b"  (matches generate_moe_selector_baseline_configs.py)
+CONFIG_PREFIX="$(echo "${MODEL}" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
 
 # ── Sweep ID ──────────────────────────────────────────────────────────────────
@@ -178,12 +182,74 @@ for setting in "${SETTINGS[@]}"; do
         echo "[speed]   plan: ${plan_path}"
     fi
 
-    # Skip missing plans (except baseline)
+    # Handle missing plans (except baseline)
     if [ "${plan_path}" != "NONE" ] && [ ! -f "${plan_path}" ]; then
-        echo "[speed] WARNING: plan not found — skipping."
-        echo "[speed]   Generate plans with: bash scripts/run_moe_residual_selected_full_benchmark.sh"
-        SKIPPED=$(( SKIPPED + 1 ))
-        continue
+        if [ "${AUTO_GENERATE_PLAN}" = "1" ]; then
+            # Generate ONLY the specific plan needed — not the full 24-run benchmark.
+            # Derive the matching selector-baseline config for this (selector, dataset, target).
+            local_target_int="${target_pct%.*}"   # strip .0 → e.g. "4"
+            # Config names use CONFIG_PREFIX (lowercase, no org), not MODEL_SLUG
+            local_cfg="configs/moe_selector_baseline/${CONFIG_PREFIX}_${dataset}_n${N_EVAL}_target${local_target_int}_sel_${selector}.yaml"
+            echo "[speed] AUTO_GENERATE_PLAN=1: plan missing — will generate it now."
+            echo "[speed]   Config : ${local_cfg}"
+            echo "[speed]   Plan   : ${plan_path}"
+
+            # Ensure selector-baseline configs exist
+            if [ ! -f "${local_cfg}" ]; then
+                echo "[speed]   Generating selector-baseline configs first ..."
+                python3 scripts/generate_moe_selector_baseline_configs.py || {
+                    echo "[speed] ERROR: failed to generate selector-baseline configs."
+                    FAILED=$(( FAILED + 1 ))
+                    continue
+                }
+            fi
+
+            if [ ! -f "${local_cfg}" ]; then
+                echo "[speed] ERROR: config still missing after generation: ${local_cfg}"
+                echo "[speed]   Selector '${selector}' may not match any generated config."
+                FAILED=$(( FAILED + 1 ))
+                continue
+            fi
+
+            echo "[speed]   Running: python3 run_experiment.py --config ${local_cfg} --moe-target-pruning"
+            set +e
+            python3 run_experiment.py \
+                --config "${local_cfg}" \
+                --moe-target-pruning \
+                2>&1 | tee "${LOG_DIR}/${label}_plan_gen.log"
+            gen_exit="${PIPESTATUS[0]}"
+            set -e
+
+            if [ "${gen_exit}" -ne 0 ]; then
+                echo "[speed] ERROR: plan generation failed (exit ${gen_exit}). Aborting this setting."
+                FAILED=$(( FAILED + 1 ))
+                continue
+            fi
+
+            if [ ! -f "${plan_path}" ]; then
+                echo "[speed] ERROR: plan still missing after generation: ${plan_path}"
+                echo "[speed]   Check that save_pruning_plan: true is set in ${local_cfg}"
+                FAILED=$(( FAILED + 1 ))
+                continue
+            fi
+
+            echo "[speed] Plan generated: ${plan_path}"
+        else
+            # No AUTO_GENERATE_PLAN — fail clearly rather than silently skip.
+            echo "[speed] ERROR: required plan not found."
+            echo "[speed]   Missing: ${plan_path}"
+            echo "[speed]"
+            echo "[speed]   To generate it, run one of:"
+            echo "[speed]     AUTO_GENERATE_PLAN=1 SMOKE=1 bash scripts/run_moe_speed_memory_benchmark.sh"
+            echo "[speed]     bash scripts/run_moe_residual_selected_full_benchmark.sh"
+            echo "[speed]"
+            echo "[speed]   Or to run just this setting's plan:"
+            local_target_int="${target_pct%.*}"
+            echo "[speed]     python3 scripts/generate_moe_selector_baseline_configs.py"
+            echo "[speed]     python3 run_experiment.py --config configs/moe_selector_baseline/${CONFIG_PREFIX}_${dataset}_n${N_EVAL}_target${local_target_int}_sel_${selector}.yaml --moe-target-pruning"
+            FAILED=$(( FAILED + 1 ))
+            continue
+        fi
     fi
 
     # Build Python args as an array (handles paths with spaces safely)
@@ -261,7 +327,7 @@ for jf in sorted(glob.glob(os.path.join(json_dir, "*.json"))):
         print(f"[speed] WARNING: cannot parse {jf}: {e}")
 
 if not rows:
-    print("[speed] WARNING: no JSON results found — CSV not written.")
+    print("[speed] WARNING: no JSON results found.")
     sys.exit(0)
 
 os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
@@ -271,23 +337,21 @@ with open(out_csv, "w", newline="") as fh:
     writer.writerows(rows)
 print(f"[speed] CSV written: {out_csv}  ({len(rows)} rows)")
 
-# Summary table
 W = 68
-print(f"\n[speed] ── Summary {'─' * (W - 15)}")
-hdr = f"  {'Label':<{W}}  {'Param↓%':>8}  {'Prefill ms':>10}  {'Tok/s':>7}  {'Peak MiB':>9}"
-print(hdr)
-print("  " + "─" * (len(hdr) - 2))
+print("\n[speed] Summary")
+hdr = f"  {'Label':<{W}}  {'Param%':>7}  {'Prefill ms':>10}  {'Tok/s':>7}  {'PeakMiB':>8}"
+print(hdr); print("  " + "-" * (len(hdr) - 2))
 for r in rows:
-    label = r.get("label", "?")[:W]
-    st    = r.get("status", "?")
-    if st not in ("ok",):
-        print(f"  {label:<{W}}  {st}")
+    lbl = r.get("label", "?")[:W]
+    st  = r.get("status", "?")
+    if st != "ok":
+        print(f"  {lbl:<{W}}  {st}")
         continue
     pct = r.get("total_model_param_reduction_pct", 0.0) or 0.0
     pre = r.get("prefill_latency_ms_mean", float("nan"))
     tps = r.get("tokens_per_sec_mean", float("nan"))
     mem = r.get("peak_allocated_mib_total", float("nan"))
-    print(f"  {label:<{W}}  {pct:>8.2f}  {pre:>10.1f}  {tps:>7.1f}  {mem:>9.0f}")
+    print(f"  {lbl:<{W}}  {pct:>7.2f}  {pre:>10.1f}  {tps:>7.1f}  {mem:>8.0f}")
 print()
 PYEOF
 
@@ -301,9 +365,9 @@ echo "[speed]   Failed    : ${FAILED}"
 echo "[speed]   CSV       : ${OUT_CSV}"
 echo "[speed]   Logs      : ${LOG_DIR}/"
 echo "[speed]   Memory    : each setting ran in a separate Python process."
-echo "════════════════════════════════════════════════════════════════════════"
+echo "══════════════════════════════════════════════════════════════════════════════"
 
-if [ "${FAILED}" -gt 0 ]; then
+if [ "${FAILED}" -gt 0 ] || [ "${SKIPPED}" -gt 0 ]; then
     exit 1
 fi
 exit 0

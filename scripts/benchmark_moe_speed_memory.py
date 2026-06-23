@@ -63,9 +63,18 @@ def _n_gpus() -> int:
 
 
 def reset_all_peak_memory() -> None:
-    """Reset peak memory stats on every visible GPU."""
-    for i in range(_n_gpus()):
-        torch.cuda.reset_peak_memory_stats(i)
+    """Reset peak memory stats on every visible GPU using device-context API."""
+    if not torch.cuda.is_available():
+        return
+    for i in range(torch.cuda.device_count()):
+        try:
+            with torch.cuda.device(i):
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                if hasattr(torch.cuda, "reset_accumulated_memory_stats"):
+                    torch.cuda.reset_accumulated_memory_stats()
+        except RuntimeError as e:
+            print(f"[bench] WARNING: could not reset CUDA memory stats for cuda:{i}: {e}")
 
 
 def current_total_allocated_mib() -> float:
@@ -73,7 +82,14 @@ def current_total_allocated_mib() -> float:
     n = _n_gpus()
     if n == 0:
         return float("nan")
-    return sum(torch.cuda.memory_allocated(i) for i in range(n)) / (1024 ** 2)
+    total = 0.0
+    for i in range(n):
+        try:
+            with torch.cuda.device(i):
+                total += torch.cuda.memory_allocated() / (1024 ** 2)
+        except RuntimeError as e:
+            print(f"[bench] WARNING: cannot read allocated memory for cuda:{i}: {e}")
+    return total
 
 
 def peak_memory_snapshot() -> Dict[str, float]:
@@ -97,12 +113,16 @@ def peak_memory_snapshot() -> Dict[str, float]:
     tot_alloc = 0.0
     tot_res   = 0.0
     for i in range(n):
-        alloc = torch.cuda.max_memory_allocated(i) / (1024 ** 2)
-        res   = torch.cuda.max_memory_reserved(i)  / (1024 ** 2)
-        result[f"peak_allocated_mib_gpu{i}"] = round(alloc, 1)
-        result[f"peak_reserved_mib_gpu{i}"]  = round(res,   1)
-        tot_alloc += alloc
-        tot_res   += res
+        try:
+            with torch.cuda.device(i):
+                alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                res   = torch.cuda.max_memory_reserved()  / (1024 ** 2)
+            result[f"peak_allocated_mib_gpu{i}"] = round(alloc, 1)
+            result[f"peak_reserved_mib_gpu{i}"]  = round(res,   1)
+            tot_alloc += alloc
+            tot_res   += res
+        except RuntimeError as e:
+            print(f"[bench] WARNING: cannot read peak memory stats for cuda:{i}: {e}")
     result["peak_allocated_mib_total"] = round(tot_alloc, 1)
     result["peak_reserved_mib_total"]  = round(tot_res,   1)
     return result
