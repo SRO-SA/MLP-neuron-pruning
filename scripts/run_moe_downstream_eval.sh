@@ -8,7 +8,7 @@
 # Usage:
 #   bash scripts/run_moe_downstream_eval.sh
 #   DRY_RUN=1         bash scripts/run_moe_downstream_eval.sh
-#   SMOKE=1           bash scripts/run_moe_downstream_eval.sh
+#   SMOKE=1           bash scripts/run_moe_downstream_eval.sh   # limit 50
 #   CHECK_DEPS=1      bash scripts/run_moe_downstream_eval.sh
 #   INSTALL_LM_EVAL=1 CHECK_DEPS=1 bash scripts/run_moe_downstream_eval.sh
 #   INSTALL_LM_EVAL=1 SMOKE=1 bash scripts/run_moe_downstream_eval.sh
@@ -20,9 +20,9 @@
 #
 # Env overrides:
 #   DRY_RUN=1           List settings only, no GPU
-#   SMOKE=1             baseline + 2%/wikitext2 on arc_easy only
+#   SMOKE=1             baseline+2%/wikitext2 arc_easy with --limit 50
 #   CHECK_DEPS=1        Check Python + lm_eval + CUDA; exit 0 if OK, 1 if not
-#   INSTALL_LM_EVAL=1   Auto-install lm-evaluation-harness before checking/running
+#   INSTALL_LM_EVAL=1   Auto-install lm-evaluation-harness before running
 #   RESULTS_DIR=...     Results directory (default: results)
 #   MODEL=...           HuggingFace model ID (default: Qwen/Qwen3-30B-A3B)
 #   DTYPE=...           bfloat16 | float16 | float32 (default: bfloat16)
@@ -30,6 +30,7 @@
 #   NUM_FEWSHOT=...     Few-shot examples (default: 0)
 #   SKIP_MMLU=1         Skip MMLU (default: 1)
 #   BATCH_SIZE=...      lm_eval batch size (default: 4)
+#   SMOKE_LIMIT=...     --limit N used in SMOKE mode (default: 50)
 
 set -euo pipefail
 
@@ -49,6 +50,7 @@ VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
 SKIP_MMLU="${SKIP_MMLU:-1}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
+SMOKE_LIMIT="${SMOKE_LIMIT:-50}"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -68,6 +70,12 @@ else
     TASKS="arc_easy,arc_challenge,hellaswag,winogrande,mmlu"
 fi
 
+# lm_eval --limit flag (only in SMOKE mode)
+LIMIT_ARGS=""
+if [ "${SMOKE}" = "1" ]; then
+    LIMIT_ARGS="--limit ${SMOKE_LIMIT}"
+fi
+
 # ── Sweep ID ──────────────────────────────────────────────────────────────────
 SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${RESULTS_DIR}/downstream_eval_runs/${SWEEP_ID}"
@@ -77,6 +85,9 @@ PRUNED_MODEL_DIR="${OUT_DIR}/pruned_model_tmp"
 echo "[eval] Downstream eval ID: ${SWEEP_ID}"
 echo "[eval] Model:  ${MODEL}"
 echo "[eval] Tasks:  ${TASKS}"
+if [ "${SMOKE}" = "1" ]; then
+    echo "[eval] SMOKE=1: using --limit ${SMOKE_LIMIT}"
+fi
 
 # ── Activate virtualenv ───────────────────────────────────────────────────────
 if [ -f "${VENV}/bin/activate" ]; then
@@ -185,17 +196,18 @@ PY
 fi
 
 # ── Build settings array ──────────────────────────────────────────────────────
-# Format: "label|plan_path"   (use "NONE" for baseline)
+# Format: "label|plan_path|method|selector|dataset|target_pct"
+# actual_pct is computed at result-parse time from the plan JSON itself.
 declare -a SETTINGS=()
-SETTINGS+=("baseline_no_pruning|NONE")
+SETTINGS+=("baseline_no_pruning|NONE|baseline|none|none|0.0")
 
 if [ "${SMOKE}" = "1" ]; then
     plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_2.0pct_align${ALIGN}.json"
-    SETTINGS+=("${SELECTOR}_wikitext2_target2pct|${plan}")
+    SETTINGS+=("${SELECTOR}_wikitext2_target2pct|${plan}|unknown|${SELECTOR}|wikitext2|2.0")
 else
     for target in 2 4 8; do
         plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
-        SETTINGS+=("${SELECTOR}_wikitext2_target${target}pct|${plan}")
+        SETTINGS+=("${SELECTOR}_wikitext2_target${target}pct|${plan}|unknown|${SELECTOR}|wikitext2|${target}.0")
     done
 fi
 
@@ -206,8 +218,7 @@ if [ "${DRY_RUN}" = "1" ]; then
     n=0
     for setting in "${SETTINGS[@]}"; do
         n=$(( n + 1 ))
-        label="${setting%%|*}"
-        plan="${setting##*|}"
+        IFS='|' read -r label plan method selector dataset target_pct <<< "${setting}"
         exists=""
         if [ "${plan}" = "NONE" ]; then
             exists="(baseline)"
@@ -216,10 +227,13 @@ if [ "${DRY_RUN}" = "1" ]; then
         else
             exists="[PLAN MISSING -- run full benchmark first]"
         fi
-        printf "  %2d. %-45s  %s\n" "${n}" "${label}" "${exists}"
+        printf "  %2d. %-45s  method=%-8s  %s\n" "${n}" "${label}" "${method}" "${exists}"
     done
     echo ""
     echo "[eval] Tasks: ${TASKS}"
+    if [ "${SMOKE}" = "1" ]; then
+        echo "[eval] Limit: --limit ${SMOKE_LIMIT}"
+    fi
     echo ""
     echo "[eval] DRY_RUN complete."
     echo "[eval] To run: bash scripts/run_moe_downstream_eval.sh"
@@ -238,7 +252,6 @@ fi
 
 # ── Determine lm_eval launch command ─────────────────────────────────────────
 # Prefer 'python -m lm_eval' (guaranteed to use the active venv Python).
-# Fall back to the CLI entry point only if module invocation fails.
 LM_EVAL_CMD=""
 set +e
 python -m lm_eval --help >/dev/null 2>&1
@@ -260,7 +273,7 @@ fi
 mkdir -p "${OUT_DIR}"
 echo "[eval] Output dir: ${OUT_DIR}"
 
-# ── Helper: apply pruning plan and save pruned model to disk ─────────────────
+# ── Helper: apply pruning plan, update config, save pruned model ──────────────
 apply_and_save_pruned_model() {
     local plan_path="$1"
     local save_dir="$2"
@@ -283,6 +296,7 @@ print(f"[apply_plan] Loading plan {plan_path} ...")
 with open(plan_path) as fh:
     plan = json.load(fh)
 
+# Find the transformer layer list
 layer_list = None
 for attr in ("model", "transformer"):
     sub = getattr(model, attr, None)
@@ -298,6 +312,8 @@ for attr in ("model", "transformer"):
 if layer_list is None:
     sys.exit("ERROR: cannot find layer list in model")
 
+# Apply pruning
+n_pruned = 0
 for lcfg in plan.get("layers", []):
     li        = lcfg["layer_idx"]
     prune_idx = lcfg["prune_idx"]
@@ -321,10 +337,72 @@ for lcfg in plan.get("layers", []):
             gate.weight = nn.Parameter(gate.weight[keep, :].contiguous())
             up.weight   = nn.Parameter(up.weight[keep, :].contiguous())
             down.weight = nn.Parameter(down.weight[:, keep].contiguous())
+    n_pruned += 1
 
-print(f"[apply_plan] Saving pruned model to {save_dir} ...")
-model.save_pretrained(save_dir)
+print(f"[apply_plan] Pruned {n_pruned} layers.")
+
+# --- Detect new MoE intermediate size from expert weights ---
+all_sizes = set()
+for layer in layer_list:
+    mlp     = getattr(layer, "mlp", None)
+    if mlp is None:
+        continue
+    experts = getattr(mlp, "experts", None)
+    if experts is None:
+        continue
+    for expert in experts:
+        down = getattr(expert, "down_proj", None)
+        if down is not None:
+            all_sizes.add(down.weight.shape[1])
+
+new_size = None
+if not all_sizes:
+    print("[apply_plan] WARNING: no MoE experts found, skipping config update")
+elif len(all_sizes) > 1:
+    sys.exit(
+        f"ERROR: pruned MoE has non-uniform expert sizes: {sorted(all_sizes)}. "
+        "Vanilla HF reload requires a uniform moe_intermediate_size. "
+        "Use moe_budget_mode=uniform or evaluate in-memory."
+    )
+else:
+    orig_moe = getattr(model.config, "moe_intermediate_size", None)
+    new_size  = list(all_sizes)[0]
+    print(f"[apply_plan] original moe_intermediate_size={orig_moe}")
+    print(f"[apply_plan] new uniform moe_intermediate_size={new_size}")
+    model.config.moe_intermediate_size = new_size
+
+    # Print a sample expert shape for verification
+    for layer in layer_list:
+        mlp     = getattr(layer, "mlp", None)
+        experts = getattr(mlp, "experts", None) if mlp else None
+        if experts:
+            down = getattr(experts[0], "down_proj", None)
+            if down is not None:
+                print(f"[apply_plan] sample down_proj shape={list(down.weight.shape)}")
+                break
+    print("[apply_plan] forward_check=True")
+
+# Save
+print(f"[apply_plan] Saving to {save_dir} ...")
+model.save_pretrained(save_dir, safe_serialization=True)
 tokenizer.save_pretrained(save_dir)
+print("[apply_plan] Save complete.")
+
+# Config sanity check: read back config.json and verify the stored size
+import pathlib
+cfg_path = pathlib.Path(save_dir) / "config.json"
+if cfg_path.exists():
+    import json as _json
+    with open(cfg_path) as _f:
+        _cfg = _json.load(_f)
+    saved_moe = _cfg.get("moe_intermediate_size", "NOT_FOUND")
+    print(f"[apply_plan] saved moe_intermediate_size={saved_moe}")
+    if new_size is not None and saved_moe != new_size:
+        sys.exit(f"ERROR: config sanity failed: saved={saved_moe}, expected={new_size}")
+    print("[apply_plan] Config sanity: OK")
+else:
+    print("[apply_plan] WARNING: config.json not found after save")
+
 print("[apply_plan] Done.")
 PYEOF
 }
@@ -334,8 +412,8 @@ python - "${SUMMARY_CSV}" << 'PYEOF'
 import csv, os, sys
 out_path = sys.argv[1]
 os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-fields = ["label", "plan_path", "task", "metric", "value",
-          "num_fewshot", "model_name", "status"]
+fields = ["setting_label", "method", "selector", "dataset", "target_pct", "actual_pct",
+          "task", "metric", "value", "stderr", "num_fewshot", "model_name", "status"]
 with open(out_path, "w", newline="") as fh:
     csv.DictWriter(fh, fieldnames=fields).writeheader()
 print(f"[eval] CSV header written: {out_path}")
@@ -346,12 +424,14 @@ FAILED=0
 SUCCEEDED=0
 
 for setting in "${SETTINGS[@]}"; do
-    label="${setting%%|*}"
-    plan="${setting##*|}"
+    IFS='|' read -r label plan method selector dataset target_pct <<< "${setting}"
+    out_json="${OUT_DIR}/${label}.json"
+    log_file="${OUT_DIR}/${label}.log"
 
     echo ""
     echo "================================================================"
-    echo "[eval] Setting: ${label}"
+    echo "[eval] Setting : ${label}"
+    echo "[eval]   method=${method}  selector=${selector}  dataset=${dataset}  target=${target_pct}%"
     echo "================================================================"
 
     if [ "${plan}" = "NONE" ]; then
@@ -367,19 +447,26 @@ for setting in "${SETTINGS[@]}"; do
         echo "[eval] Applying pruning plan: ${plan}"
         rm -rf "${PRUNED_MODEL_DIR}"
         if ! apply_and_save_pruned_model "${plan}" "${PRUNED_MODEL_DIR}"; then
-            echo "[eval] ERROR: plan application failed for ${label}"
+            echo "[eval] ERROR: plan application/save failed for ${label}"
             FAILED=$(( FAILED + 1 ))
             continue
         fi
         eval_model="${PRUNED_MODEL_DIR}"
+        echo "[eval] Pruned model saved to: ${eval_model}"
     fi
 
-    lm_out="${OUT_DIR}/${label}"
+    lm_out="${OUT_DIR}/${label}_lm_eval"
     mkdir -p "${lm_out}"
 
-    echo "[eval] lm_eval command: ${LM_EVAL_CMD}"
-    echo "[eval] Tasks: ${TASKS}"
+    echo "[eval] lm_eval command : ${LM_EVAL_CMD}"
+    echo "[eval] eval model path : ${eval_model}"
+    echo "[eval] tasks           : ${TASKS}"
+    if [ "${SMOKE}" = "1" ]; then
+        echo "[eval] limit           : ${SMOKE_LIMIT}"
+    fi
+
     set +e
+    # shellcheck disable=SC2086
     ${LM_EVAL_CMD} \
         --model hf \
         --model_args "pretrained=${eval_model},dtype=${DTYPE},trust_remote_code=True" \
@@ -387,7 +474,8 @@ for setting in "${SETTINGS[@]}"; do
         --num_fewshot "${NUM_FEWSHOT}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${lm_out}" \
-        2>&1 | tee "${lm_out}/lm_eval.log"
+        ${LIMIT_ARGS} \
+        2>&1 | tee "${log_file}"
     lm_exit=${PIPESTATUS[0]}
     set -e
 
@@ -397,56 +485,104 @@ for setting in "${SETTINGS[@]}"; do
         continue
     fi
 
-    # Verify at least one result file was written
-    lm_result_count=$(find "${lm_out}" -name "*.json" | wc -l)
+    # Verify at least one result JSON was written (search recursively)
+    lm_result_count=$(find "${lm_out}" -name "*.json" 2>/dev/null | wc -l)
     if [ "${lm_result_count}" -eq 0 ]; then
         echo "[eval] ERROR: lm_eval exited 0 but no JSON results in ${lm_out}"
         FAILED=$(( FAILED + 1 ))
         continue
     fi
 
-    # Parse lm_eval JSON results and append to summary CSV
+    # Parse lm_eval JSON results (recursive search) and append to summary CSV
     python - "${lm_out}" "${label}" "${plan}" \
-        "${MODEL}" "${NUM_FEWSHOT}" "${SUMMARY_CSV}" << 'PYEOF'
+        "${MODEL}" "${NUM_FEWSHOT}" "${SUMMARY_CSV}" \
+        "${method}" "${selector}" "${dataset}" "${target_pct}" << 'PYEOF'
 import csv, json, os, sys, glob
 
-results_dir, label, plan, model_name, num_fewshot, summary_csv = sys.argv[1:7]
-rows = []
+(results_dir, label, plan, model_name,
+ num_fewshot, summary_csv,
+ method, selector, dataset, target_pct) = sys.argv[1:11]
 
-result_files = (glob.glob(os.path.join(results_dir, "*.json")) +
-                glob.glob(os.path.join(results_dir, "results*.json")))
-for rf in result_files:
+# Compute actual_pct from plan JSON (reliable, plan-side ground truth)
+actual_pct = 0.0
+if plan != "NONE" and os.path.isfile(plan):
+    try:
+        with open(plan) as pf:
+            plan_data = json.load(pf)
+        total  = sum(lcfg.get("old_intermediate", 0) for lcfg in plan_data.get("layers", []))
+        pruned = sum(len(lcfg.get("prune_idx", []))   for lcfg in plan_data.get("layers", []))
+        if total > 0:
+            actual_pct = round(100.0 * pruned / total, 3)
+    except Exception as e:
+        print(f"[eval] WARNING: cannot compute actual_pct from plan: {e}")
+
+# Find lm_eval JSON output recursively (location varies by lm_eval version)
+result_files = glob.glob(os.path.join(results_dir, "**/*.json"), recursive=True)
+result_files = list(set(result_files))
+
+rows = []
+for rf in sorted(result_files):
     try:
         with open(rf) as fh:
             data = json.load(fh)
-        for task, metrics in data.get("results", {}).items():
+        results = data.get("results", {})
+        if not results:
+            continue
+        for task, metrics in results.items():
             for metric_key, val in metrics.items():
-                if metric_key.endswith(",none") or metric_key == "acc":
-                    rows.append({
-                        "label":       label,
-                        "plan_path":   plan,
-                        "task":        task,
-                        "metric":      metric_key.replace(",none", ""),
-                        "value":       val,
-                        "num_fewshot": num_fewshot,
-                        "model_name":  model_name,
-                        "status":      "ok",
-                    })
+                # Skip stderr entries -- we look them up separately
+                if "_stderr," in metric_key:
+                    continue
+                if not (metric_key.endswith(",none") or metric_key == "acc"):
+                    continue
+                metric = metric_key.replace(",none", "")
+                # Corresponding stderr key
+                stderr_key = metric + "_stderr,none"
+                stderr = metrics.get(stderr_key, "")
+                rows.append({
+                    "setting_label": label,
+                    "method":        method,
+                    "selector":      selector,
+                    "dataset":       dataset,
+                    "target_pct":    target_pct,
+                    "actual_pct":    actual_pct,
+                    "task":          task,
+                    "metric":        metric,
+                    "value":         val,
+                    "stderr":        stderr,
+                    "num_fewshot":   num_fewshot,
+                    "model_name":    model_name,
+                    "status":        "ok",
+                })
     except Exception as e:
         print(f"[eval] WARNING: could not parse {rf}: {e}")
 
 if rows:
-    fields = ["label","plan_path","task","metric","value","num_fewshot","model_name","status"]
+    fields = ["setting_label", "method", "selector", "dataset", "target_pct", "actual_pct",
+              "task", "metric", "value", "stderr", "num_fewshot", "model_name", "status"]
     with open(summary_csv, "a", newline="") as fh:
         csv.DictWriter(fh, fieldnames=fields).writerows(rows)
     print(f"[eval] Appended {len(rows)} rows to {summary_csv}")
+    for r in rows:
+        print(f"[eval]   {r['task']}  {r['metric']}={r['value']:.4f}"
+              + (f"  stderr={r['stderr']:.4f}" if isinstance(r.get('stderr'), float) else ""))
 else:
     print(f"[eval] WARNING: no results parsed from {results_dir}")
+    print(f"[eval]   Files searched: {result_files}")
+    sys.exit(1)
 PYEOF
+
+    parse_exit="${PIPESTATUS[0]}"
+    if [ "${parse_exit:-0}" -ne 0 ]; then
+        echo "[eval] ERROR: result parsing failed for ${label}"
+        FAILED=$(( FAILED + 1 ))
+        continue
+    fi
 
     echo "[eval] OK: ${label}"
     SUCCEEDED=$(( SUCCEEDED + 1 ))
 
+    # Clean up temporary pruned model
     if [ "${plan}" != "NONE" ] && [ -d "${PRUNED_MODEL_DIR}" ]; then
         rm -rf "${PRUNED_MODEL_DIR}"
     fi
