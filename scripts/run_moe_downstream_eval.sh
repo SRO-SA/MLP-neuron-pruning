@@ -1,48 +1,35 @@
 #!/usr/bin/env bash
 # run_moe_downstream_eval.sh
 #
-# Run lm-evaluation-harness (lm_eval) on baseline and pruned models.
+# Run lm-evaluation-harness (lm_eval) on baseline and pruned MoE models.
 #
-# Evaluates on:
-#   - arc_easy        (ARC Easy — multiple-choice)
-#   - arc_challenge   (ARC Challenge)
-#   - hellaswag       (sentence completion)
-#   - winogrande      (pronoun resolution)
-#   - mmlu            (Massive Multitask Language Understanding — optional, slow)
-#
-# For each pruning setting, the script:
-#   1. Loads the original model weights
-#   2. Applies the pruning plan JSON (physically removes channels)
-#   3. Saves a temporary pruned model to disk
-#   4. Runs lm_eval on the temporary model
-#   5. Collects JSON results into results/downstream_eval_runs/<id>/
-#
-# Graceful dependency handling:
-#   - If lm_eval is not installed, prints clear instructions and exits 0
-#     (does not abort an outer pipeline).
-#   - If a specific task fails, logs the error and continues.
-#
-# Settings:
-#   1. Baseline (no pruning)
-#   2. rmsnorm_bound, wikitext2, 2%
-#   3. rmsnorm_bound, wikitext2, 4%
-#   4. rmsnorm_bound, wikitext2, 8%
+# Evaluates on: arc_easy, arc_challenge, hellaswag, winogrande, mmlu (opt.)
 #
 # Usage:
 #   bash scripts/run_moe_downstream_eval.sh
-#   DRY_RUN=1 bash scripts/run_moe_downstream_eval.sh   # list settings, no GPU
-#   SMOKE=1   bash scripts/run_moe_downstream_eval.sh   # baseline + 2% on arc_easy only
+#   DRY_RUN=1         bash scripts/run_moe_downstream_eval.sh
+#   SMOKE=1           bash scripts/run_moe_downstream_eval.sh
+#   CHECK_DEPS=1      bash scripts/run_moe_downstream_eval.sh
+#   INSTALL_LM_EVAL=1 CHECK_DEPS=1 bash scripts/run_moe_downstream_eval.sh
+#   INSTALL_LM_EVAL=1 SMOKE=1 bash scripts/run_moe_downstream_eval.sh
+#
+# Exit codes:
+#   0   success (or CHECK_DEPS passed)
+#   1   evaluation failure (plan missing / lm_eval error / no results)
+#   2   dependency missing (lm_eval not installed)
 #
 # Env overrides:
-#   DRY_RUN=1         List settings only, no GPU
-#   SMOKE=1           1 setting (baseline) + 1 task (arc_easy)
-#   RESULTS_DIR=...   Results directory (default: results)
-#   MODEL=...         HuggingFace model ID (default: Qwen/Qwen3-30B-A3B)
-#   DTYPE=...         bfloat16 | float16 | float32 (default: bfloat16)
-#   VENV=...          Virtualenv path (default: /workspace/venvs/qwen-pruning)
-#   NUM_FEWSHOT=...   Few-shot examples (default: 0)
-#   SKIP_MMLU=1       Skip MMLU (very slow; default: 1)
-#   BATCH_SIZE=...    lm_eval batch size (default: 4)
+#   DRY_RUN=1           List settings only, no GPU
+#   SMOKE=1             baseline + 2%/wikitext2 on arc_easy only
+#   CHECK_DEPS=1        Check Python + lm_eval + CUDA; exit 0 if OK, 1 if not
+#   INSTALL_LM_EVAL=1   Auto-install lm-evaluation-harness before checking/running
+#   RESULTS_DIR=...     Results directory (default: results)
+#   MODEL=...           HuggingFace model ID (default: Qwen/Qwen3-30B-A3B)
+#   DTYPE=...           bfloat16 | float16 | float32 (default: bfloat16)
+#   VENV=...            Virtualenv path (default: /workspace/venvs/qwen-pruning)
+#   NUM_FEWSHOT=...     Few-shot examples (default: 0)
+#   SKIP_MMLU=1         Skip MMLU (default: 1)
+#   BATCH_SIZE=...      lm_eval batch size (default: 4)
 
 set -euo pipefail
 
@@ -53,6 +40,8 @@ cd "${REPO_ROOT}"
 # ── Config ────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
+CHECK_DEPS="${CHECK_DEPS:-0}"
+INSTALL_LM_EVAL="${INSTALL_LM_EVAL:-0}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -64,7 +53,13 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
 
-# Tasks to evaluate (space-separated)
+SELECTOR="rmsnorm_bound"
+AGG_MODE="p95"
+ALIGN="16"
+N_EVAL="512"
+CALIB_N="512"
+
+# Tasks (comma-separated for lm_eval)
 if [ "${SMOKE}" = "1" ]; then
     TASKS="arc_easy"
 elif [ "${SKIP_MMLU}" = "1" ]; then
@@ -89,39 +84,112 @@ if [ -f "${VENV}/bin/activate" ]; then
     # shellcheck source=/dev/null
     source "${VENV}/bin/activate"
 else
-    echo "[eval] No virtualenv at ${VENV}, using system Python"
+    echo "[eval] WARNING: No virtualenv at ${VENV}, using system Python"
 fi
 
-# ── Check lm_eval is installed — graceful exit if missing ────────────────────
-check_lm_eval() {
-    python3 -c "import lm_eval" 2>/dev/null && return 0
-    echo ""
-    echo "[eval] ─────────────────────────────────────────────────────────────"
-    echo "[eval] lm-evaluation-harness is NOT installed."
-    echo "[eval]"
-    echo "[eval] To install:"
-    echo "[eval]   pip install lm-eval --break-system-packages"
-    echo "[eval]   # or: pip install lm-eval[vllm] --break-system-packages"
-    echo "[eval]"
-    echo "[eval] GitHub: https://github.com/EleutherAI/lm-evaluation-harness"
-    echo "[eval] ─────────────────────────────────────────────────────────────"
-    echo ""
-    return 1
+# Print Python/pip diagnostic paths (reflects activated venv)
+echo "[eval] Python/pip paths:"
+echo "[eval]   which python   : $(which python  2>/dev/null || echo 'NOT FOUND')"
+echo "[eval]   python -V      : $(python -V 2>&1 || echo 'NOT FOUND')"
+echo "[eval]   sys.executable : $(python -c 'import sys; print(sys.executable)' 2>/dev/null || echo 'NOT FOUND')"
+echo "[eval]   python -m pip  : $(python -m pip -V 2>&1 || echo 'NOT FOUND')"
+
+# ── Helper: check lm_eval by Python import (not just CLI presence) ────────────
+_check_lm_eval_import() {
+    python - << 'PY'
+import importlib.util, sys
+spec = importlib.util.find_spec("lm_eval")
+if spec is None:
+    sys.exit(1)
+print("lm_eval found:", spec.origin)
+PY
 }
 
-# ── Settings list ─────────────────────────────────────────────────────────────
-# Format: "label|plan_path"   (use "NONE" for baseline)
-SELECTOR="rmsnorm_bound"
-AGG_MODE="p95"
-ALIGN="16"
-N_EVAL="512"
-CALIB_N="512"
+# ── Helper: print debug info when lm_eval is missing ─────────────────────────
+_debug_lm_eval_missing() {
+    echo "[eval] -------------------------------------------------------------------"
+    echo "[eval] lm-evaluation-harness is NOT installed in the active Python."
+    echo "[eval]"
+    echo "[eval] pip show results:"
+    python -m pip show lm-eval               2>/dev/null || true
+    python -m pip show lm_eval               2>/dev/null || true
+    python -m pip show lm-evaluation-harness 2>/dev/null || true
+    echo "[eval]"
+    echo "[eval] To install manually:"
+    echo "[eval]   source ${VENV}/bin/activate"
+    echo "[eval]   python -m pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git"
+    echo "[eval]"
+    echo "[eval] Or re-run with auto-install:"
+    echo "[eval]   INSTALL_LM_EVAL=1 SMOKE=1 bash scripts/run_moe_downstream_eval.sh"
+    echo "[eval] -------------------------------------------------------------------"
+}
 
+# ── Optional auto-install ─────────────────────────────────────────────────────
+if [ "${INSTALL_LM_EVAL}" = "1" ]; then
+    echo "[eval] INSTALL_LM_EVAL=1: installing lm-evaluation-harness ..."
+    python -m pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git
+    echo "[eval] Install complete. Re-running import check ..."
+fi
+
+# ── CHECK_DEPS mode ───────────────────────────────────────────────────────────
+if [ "${CHECK_DEPS}" = "1" ]; then
+    echo "[eval] CHECK_DEPS=1: checking all dependencies ..."
+    _deps_ok=1
+
+    echo ""
+    echo "[eval] --- lm_eval import ---"
+    if _check_lm_eval_import; then
+        echo "[eval]   lm_eval: OK"
+    else
+        echo "[eval]   lm_eval: MISSING"
+        _debug_lm_eval_missing
+        _deps_ok=0
+    fi
+
+    echo ""
+    echo "[eval] --- torch + CUDA ---"
+    set +e
+    python - << 'PY'
+import sys
+try:
+    import torch
+    avail = torch.cuda.is_available()
+    ndev  = torch.cuda.device_count()
+    print(f"[eval]   torch         : {torch.__version__}")
+    print(f"[eval]   cuda_available: {avail}")
+    print(f"[eval]   device_count  : {ndev}")
+    sys.exit(0 if avail else 2)
+except ImportError as e:
+    print(f"[eval]   torch: NOT INSTALLED ({e})")
+    sys.exit(1)
+PY
+    _cuda_exit=$?
+    set -e
+    if [ "${_cuda_exit}" -ne 0 ]; then
+        if [ "${_cuda_exit}" -eq 2 ]; then
+            echo "[eval]   CUDA not available (CPU-only environment)"
+        else
+            echo "[eval]   torch: MISSING"
+        fi
+        _deps_ok=0
+    fi
+
+    echo ""
+    if [ "${_deps_ok}" = "1" ]; then
+        echo "[eval] CHECK_DEPS: all dependencies OK."
+        exit 0
+    else
+        echo "[eval] CHECK_DEPS: one or more dependencies missing or unavailable."
+        exit 1
+    fi
+fi
+
+# ── Build settings array ──────────────────────────────────────────────────────
+# Format: "label|plan_path"   (use "NONE" for baseline)
 declare -a SETTINGS=()
 SETTINGS+=("baseline_no_pruning|NONE")
 
 if [ "${SMOKE}" = "1" ]; then
-    # Smoke: only baseline + 2%/wikitext2
     plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_2.0pct_align${ALIGN}.json"
     SETTINGS+=("${SELECTOR}_wikitext2_target2pct|${plan}")
 else
@@ -146,7 +214,7 @@ if [ "${DRY_RUN}" = "1" ]; then
         elif [ -f "${plan}" ]; then
             exists="[plan exists]"
         else
-            exists="[PLAN MISSING — run full benchmark first]"
+            exists="[PLAN MISSING -- run full benchmark first]"
         fi
         printf "  %2d. %-45s  %s\n" "${n}" "${label}" "${exists}"
     done
@@ -159,26 +227,48 @@ if [ "${DRY_RUN}" = "1" ]; then
     exit 0
 fi
 
-# ── Require lm_eval ──────────────────────────────────────────────────────────
-if ! check_lm_eval; then
-    echo "[eval] Skipping evaluation (lm_eval missing). Exiting with code 0."
-    exit 0
+# ── Require lm_eval -- exit 2 if missing ─────────────────────────────────────
+echo "[eval] Checking lm_eval import ..."
+if ! _check_lm_eval_import; then
+    _debug_lm_eval_missing
+    echo "[eval] ERROR: lm_eval not installed. Cannot run evaluation."
+    echo "[eval] Exiting with code 2 (dependency missing)."
+    exit 2
 fi
 
-mkdir -p "${OUT_DIR}"
+# ── Determine lm_eval launch command ─────────────────────────────────────────
+# Prefer 'python -m lm_eval' (guaranteed to use the active venv Python).
+# Fall back to the CLI entry point only if module invocation fails.
+LM_EVAL_CMD=""
+set +e
+python -m lm_eval --help >/dev/null 2>&1
+_mlm_exit=$?
+set -e
 
+if [ "${_mlm_exit}" -eq 0 ]; then
+    LM_EVAL_CMD="python -m lm_eval"
+    echo "[eval] lm_eval command: python -m lm_eval  (module, active venv)"
+elif command -v lm_eval >/dev/null 2>&1; then
+    LM_EVAL_CMD="$(command -v lm_eval)"
+    echo "[eval] lm_eval command: ${LM_EVAL_CMD}  (CLI entry point)"
+else
+    echo "[eval] ERROR: lm_eval import passed but module and CLI both unreachable."
+    exit 2
+fi
+
+# ── Create output dirs ────────────────────────────────────────────────────────
+mkdir -p "${OUT_DIR}"
 echo "[eval] Output dir: ${OUT_DIR}"
 
-# ── Helper: apply pruning plan and save pruned model ─────────────────────────
+# ── Helper: apply pruning plan and save pruned model to disk ─────────────────
 apply_and_save_pruned_model() {
     local plan_path="$1"
     local save_dir="$2"
-    python3 - "${MODEL}" "${plan_path}" "${save_dir}" "${DTYPE}" << 'PYEOF'
-import sys, json, torch
+    python - "${MODEL}" "${plan_path}" "${save_dir}" "${DTYPE}" << 'PYEOF'
+import sys, json, torch, torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_name, plan_path, save_dir, dtype_str = sys.argv[1:5]
-
 dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 dtype = dtype_map.get(dtype_str, torch.bfloat16)
 
@@ -192,8 +282,6 @@ model.eval()
 print(f"[apply_plan] Loading plan {plan_path} ...")
 with open(plan_path) as fh:
     plan = json.load(fh)
-
-import torch.nn as nn
 
 layer_list = None
 for attr in ("model", "transformer"):
@@ -237,18 +325,17 @@ for lcfg in plan.get("layers", []):
 print(f"[apply_plan] Saving pruned model to {save_dir} ...")
 model.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
-print(f"[apply_plan] Done.")
+print("[apply_plan] Done.")
 PYEOF
 }
 
 # ── Write CSV header ──────────────────────────────────────────────────────────
-python3 - "${SUMMARY_CSV}" << 'PYEOF'
-import csv, sys
+python - "${SUMMARY_CSV}" << 'PYEOF'
+import csv, os, sys
 out_path = sys.argv[1]
-fields = [
-    "label", "plan_path", "task", "metric", "value",
-    "num_fewshot", "model_name", "status",
-]
+os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+fields = ["label", "plan_path", "task", "metric", "value",
+          "num_fewshot", "model_name", "status"]
 with open(out_path, "w", newline="") as fh:
     csv.DictWriter(fh, fieldnames=fields).writeheader()
 print(f"[eval] CSV header written: {out_path}")
@@ -263,38 +350,37 @@ for setting in "${SETTINGS[@]}"; do
     plan="${setting##*|}"
 
     echo ""
-    echo "════════════════════════════════════════════════════════════════"
+    echo "================================================================"
     echo "[eval] Setting: ${label}"
-    echo "════════════════════════════════════════════════════════════════"
+    echo "================================================================"
 
-    # Determine model path to pass to lm_eval
     if [ "${plan}" = "NONE" ]; then
         eval_model="${MODEL}"
         echo "[eval] Using baseline model (no pruning)."
     else
         if [ ! -f "${plan}" ]; then
-            echo "[eval] WARNING: plan not found: ${plan}"
-            echo "[eval]   Skipping this setting."
+            echo "[eval] ERROR: plan not found: ${plan}"
+            echo "[eval]   Generate plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
             FAILED=$(( FAILED + 1 ))
             continue
         fi
         echo "[eval] Applying pruning plan: ${plan}"
         rm -rf "${PRUNED_MODEL_DIR}"
-        apply_and_save_pruned_model "${plan}" "${PRUNED_MODEL_DIR}" || {
-            echo "[eval] ERROR: failed to apply plan for ${label}"
+        if ! apply_and_save_pruned_model "${plan}" "${PRUNED_MODEL_DIR}"; then
+            echo "[eval] ERROR: plan application failed for ${label}"
             FAILED=$(( FAILED + 1 ))
             continue
-        }
+        fi
         eval_model="${PRUNED_MODEL_DIR}"
     fi
 
-    # lm_eval output for this setting
     lm_out="${OUT_DIR}/${label}"
     mkdir -p "${lm_out}"
 
-    echo "[eval] Running lm_eval on tasks: ${TASKS}"
+    echo "[eval] lm_eval command: ${LM_EVAL_CMD}"
+    echo "[eval] Tasks: ${TASKS}"
     set +e
-    python3 -m lm_eval \
+    ${LM_EVAL_CMD} \
         --model hf \
         --model_args "pretrained=${eval_model},dtype=${DTYPE},trust_remote_code=True" \
         --tasks "${TASKS}" \
@@ -306,37 +392,41 @@ for setting in "${SETTINGS[@]}"; do
     set -e
 
     if [ ${lm_exit} -ne 0 ]; then
-        echo "[eval] ✗ lm_eval failed for ${label} (exit ${lm_exit})"
+        echo "[eval] ERROR: lm_eval exited ${lm_exit} for ${label}"
+        FAILED=$(( FAILED + 1 ))
+        continue
+    fi
+
+    # Verify at least one result file was written
+    lm_result_count=$(find "${lm_out}" -name "*.json" | wc -l)
+    if [ "${lm_result_count}" -eq 0 ]; then
+        echo "[eval] ERROR: lm_eval exited 0 but no JSON results in ${lm_out}"
         FAILED=$(( FAILED + 1 ))
         continue
     fi
 
     # Parse lm_eval JSON results and append to summary CSV
-    python3 - "${lm_out}" "${label}" "${plan}" \
+    python - "${lm_out}" "${label}" "${plan}" \
         "${MODEL}" "${NUM_FEWSHOT}" "${SUMMARY_CSV}" << 'PYEOF'
 import csv, json, os, sys, glob
 
 results_dir, label, plan, model_name, num_fewshot, summary_csv = sys.argv[1:7]
 rows = []
 
-# lm_eval writes results/<timestamp>/*.json or results.json
-result_files = glob.glob(os.path.join(results_dir, "*.json")) + \
-               glob.glob(os.path.join(results_dir, "results*.json"))
+result_files = (glob.glob(os.path.join(results_dir, "*.json")) +
+                glob.glob(os.path.join(results_dir, "results*.json")))
 for rf in result_files:
     try:
         with open(rf) as fh:
             data = json.load(fh)
-        # lm_eval v0.4+ format: {"results": {"task": {"metric,none": value, ...}}}
-        results = data.get("results", {})
-        for task, metrics in results.items():
+        for task, metrics in data.get("results", {}).items():
             for metric_key, val in metrics.items():
                 if metric_key.endswith(",none") or metric_key == "acc":
-                    metric = metric_key.replace(",none", "")
                     rows.append({
                         "label":       label,
                         "plan_path":   plan,
                         "task":        task,
-                        "metric":      metric,
+                        "metric":      metric_key.replace(",none", ""),
                         "value":       val,
                         "num_fewshot": num_fewshot,
                         "model_name":  model_name,
@@ -348,17 +438,15 @@ for rf in result_files:
 if rows:
     fields = ["label","plan_path","task","metric","value","num_fewshot","model_name","status"]
     with open(summary_csv, "a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writerows(rows)
+        csv.DictWriter(fh, fieldnames=fields).writerows(rows)
     print(f"[eval] Appended {len(rows)} rows to {summary_csv}")
 else:
     print(f"[eval] WARNING: no results parsed from {results_dir}")
 PYEOF
 
-    echo "[eval] ✓ ${label} complete."
+    echo "[eval] OK: ${label}"
     SUCCEEDED=$(( SUCCEEDED + 1 ))
 
-    # Clean up temporary pruned model to save disk space
     if [ "${plan}" != "NONE" ] && [ -d "${PRUNED_MODEL_DIR}" ]; then
         rm -rf "${PRUNED_MODEL_DIR}"
     fi
@@ -366,16 +454,20 @@ done
 
 # ── Final summary ─────────────────────────────────────────────────────────────
 echo ""
-echo "════════════════════════════════════════════════════════════════"
+echo "================================================================"
 echo "[eval] EVAL COMPLETE  (id=${SWEEP_ID})"
 echo "[eval]   Succeeded: ${SUCCEEDED} / ${#SETTINGS[@]}"
 echo "[eval]   Failed:    ${FAILED} / ${#SETTINGS[@]}"
 echo "[eval]   Summary:   ${SUMMARY_CSV}"
 echo "[eval]   Full logs: ${OUT_DIR}/"
-echo "════════════════════════════════════════════════════════════════"
+echo "================================================================"
 
 if [ "${FAILED}" -gt 0 ]; then
-    echo "[eval] WARNING: ${FAILED} setting(s) failed."
+    echo "[eval] ERROR: ${FAILED} setting(s) failed."
+    exit 1
+fi
+if [ "${SUCCEEDED}" -eq 0 ]; then
+    echo "[eval] ERROR: no settings completed successfully."
     exit 1
 fi
 exit 0
