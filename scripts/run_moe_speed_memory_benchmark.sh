@@ -7,23 +7,23 @@
 # This ensures GPU memory stats are fully isolated — no carryover between
 # settings, no doubled peak-memory from two models loaded simultaneously.
 #
-# SMOKE mode (2 settings):
+# SMOKE mode (3 settings):
 #   1. baseline_no_pruning
-#   2. residual_nearest_channel_merge_moe at 4%, wikitext2
-#      label: residual_nearest_channel_merge_moe__rmsnorm_bound__wikitext2__target4pct__actual4.2pct
+#   2. pure_delete__rmsnorm_bound__wikitext2__target4pct__actual...
+#   3. residual_nearest_channel_merge_moe__rmsnorm_bound__wikitext2__target4pct__actual...
 #
 # Full mode: baseline + 6 pruned settings
-#   rmsnorm_bound × {wikitext2, c4} × {4%, 8%} (residual_nearest)
-#   + pure_delete × wikitext2 × 8% (for direct comparison)
+#   pure_delete                     × wikitext2 × {4%, 6%, 8%}
+#   residual_nearest_channel_merge_moe × wikitext2 × {4%, 6%, 8%}
 #
 # Usage:
-#   SMOKE=1   bash scripts/run_moe_speed_memory_benchmark.sh   # 2 settings
+#   SMOKE=1   bash scripts/run_moe_speed_memory_benchmark.sh   # 3 settings
 #   DRY_RUN=1 bash scripts/run_moe_speed_memory_benchmark.sh   # list, no GPU
 #   bash scripts/run_moe_speed_memory_benchmark.sh              # full benchmark
 #
 # Env overrides:
 #   DRY_RUN=1         List settings, do not run
-#   SMOKE=1           2 settings only (baseline + residual_nearest 4%/wikitext2)
+#   SMOKE=1           3 settings only (baseline + pure_delete 4% + residual_nearest 4%/wikitext2)
 #   MODEL=...         HuggingFace model ID (default: Qwen/Qwen3-30B-A3B)
 #   DTYPE=...         bfloat16|float16|float32 (default: bfloat16)
 #   RESULTS_DIR=...   Results dir (default: results)
@@ -115,16 +115,19 @@ _add_setting() {
 }
 
 if [ "${SMOKE}" = "1" ]; then
+    _add_setting "pure_delete"                          "wikitext2" "4"
     _add_setting "residual_nearest_channel_merge_moe" "wikitext2" "4"
-    echo "[speed] SMOKE=1: 2 settings (baseline + residual_nearest_channel_merge_moe 4% wikitext2)"
+    echo "[speed] SMOKE=1: 3 settings (baseline + pure_delete 4% + residual_nearest_channel_merge_moe 4% wikitext2)"
 else
     # Full: baseline + 6 pruned settings
-    for dataset in wikitext2 c4; do
-        for target in 4 8; do
-            _add_setting "residual_nearest_channel_merge_moe" "${dataset}" "${target}"
-        done
+    #   pure_delete × wikitext2 × {4%, 6%, 8%}
+    #   residual_nearest_channel_merge_moe × wikitext2 × {4%, 6%, 8%}
+    for target in 4 6 8; do
+        _add_setting "pure_delete"                          "wikitext2" "${target}"
     done
-    _add_setting "pure_delete" "wikitext2" "8"
+    for target in 4 6 8; do
+        _add_setting "residual_nearest_channel_merge_moe" "wikitext2" "${target}"
+    done
 fi
 
 # ── DRY_RUN: list and exit ────────────────────────────────────────────────────
@@ -337,27 +340,42 @@ with open(out_csv, "w", newline="") as fh:
     writer.writerows(rows)
 print(f"[speed] CSV written: {out_csv}  ({len(rows)} rows)")
 
-W = 68
-print("\n[speed] Summary")
-hdr = f"  {'Label':<{W}}  {'Param%':>7}  {'Prefill ms':>10}  {'Tok/s':>7}  {'PeakMiB':>8}"
+W_M = 34; W_S = 13; W_D = 9
+print("\n[speed] Summary  (PeakTotalMiB = sum across all GPUs)")
+hdr = (
+    f"  {'Method':<{W_M}}  {'Selector':<{W_S}}  {'Dataset':<{W_D}}"
+    f"  {'Tgt%':>5}  {'Act%':>5}  {'Prm%':>6}"
+    f"  {'Pre_ms':>8}  {'Tok/s':>7}"
+    f"  {'PkTotMiB':>9}  {'PkGPU0':>7}  {'PkGPU1':>7}"
+)
 print(hdr); print("  " + "-" * (len(hdr) - 2))
 for r in rows:
-    lbl = r.get("label", "?")[:W]
-    st  = r.get("status", "?")
+    method = r.get("method", "?")[:W_M]
+    st     = r.get("status", "?")
     if st != "ok":
-        print(f"  {lbl:<{W}}  {st}")
+        print(f"  {method:<{W_M}}  {st}")
         continue
-    pct = r.get("total_model_param_reduction_pct", 0.0) or 0.0
-    pre = r.get("prefill_latency_ms_mean", float("nan"))
-    tps = r.get("tokens_per_sec_mean", float("nan"))
-    mem = r.get("peak_allocated_mib_total", float("nan"))
-    print(f"  {lbl:<{W}}  {pct:>7.2f}  {pre:>10.1f}  {tps:>7.1f}  {mem:>8.0f}")
+    selctr = r.get("selector", "?")[:W_S]
+    ds     = r.get("dataset",  "?")[:W_D]
+    tgt    = r.get("target_pct", 0.0) or 0.0
+    act    = r.get("actual_pct", 0.0) or 0.0
+    pct    = r.get("total_model_param_reduction_pct", 0.0) or 0.0
+    pre    = r.get("prefill_latency_ms_mean",  float("nan"))
+    tps    = r.get("tokens_per_sec_mean",       float("nan"))
+    pk_tot = r.get("peak_allocated_mib_total",  float("nan"))
+    pk_g0  = r.get("peak_allocated_mib_gpu0",   float("nan"))
+    pk_g1  = r.get("peak_allocated_mib_gpu1",   float("nan"))
+    print(
+        f"  {method:<{W_M}}  {selctr:<{W_S}}  {ds:<{W_D}}"
+        f"  {tgt:>5.1f}  {act:>5.1f}  {pct:>6.2f}"
+        f"  {pre:>8.1f}  {tps:>7.1f}"
+        f"  {pk_tot:>9.0f}  {pk_g0:>7.0f}  {pk_g1:>7.0f}"
+    )
 print()
 PYEOF
 
-# ── Final report ──────────────────────────────────────────────────────────────
+# ── Final report ─────────────────────────────────────────────────────────────
 echo ""
-echo "════════════════════════════════════════════════════════════════════════"
 echo "[speed] BENCHMARK COMPLETE  (id=${SWEEP_ID})"
 echo "[speed]   Succeeded : ${SUCCEEDED}"
 echo "[speed]   Skipped   : ${SKIPPED}  (missing plans)"
@@ -365,7 +383,7 @@ echo "[speed]   Failed    : ${FAILED}"
 echo "[speed]   CSV       : ${OUT_CSV}"
 echo "[speed]   Logs      : ${LOG_DIR}/"
 echo "[speed]   Memory    : each setting ran in a separate Python process."
-echo "══════════════════════════════════════════════════════════════════════════════"
+echo ""
 
 if [ "${FAILED}" -gt 0 ] || [ "${SKIPPED}" -gt 0 ]; then
     exit 1
