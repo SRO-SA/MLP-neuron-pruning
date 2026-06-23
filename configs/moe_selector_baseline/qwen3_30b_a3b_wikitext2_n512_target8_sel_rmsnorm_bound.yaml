@@ -14,6 +14,7 @@ moe_channel_alignment: 16
 moe_max_layer_channel_prune_frac: 0.1
 max_expert_frac: 0.1
 min_expert_tokens: 32
+moe_budget_mode: uniform
 eval_datasets:
 - wikitext2
 moe_calib_dataset: wikitext2

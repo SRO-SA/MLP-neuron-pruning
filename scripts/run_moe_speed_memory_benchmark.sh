@@ -1,35 +1,37 @@
 #!/usr/bin/env bash
 # run_moe_speed_memory_benchmark.sh
 #
-# Timing and GPU-memory benchmark for Qwen3-30B-A3B before and after pruning.
+# Speed/memory benchmark for Qwen3-30B-A3B before and after MoE pruning.
 #
-# 7 settings:
-#   1. Baseline (no pruning)
-#   2. rmsnorm_bound, wikitext2, 2%
-#   3. rmsnorm_bound, wikitext2, 4%
-#   4. rmsnorm_bound, wikitext2, 8%
-#   5. rmsnorm_bound, c4,        2%
-#   6. rmsnorm_bound, c4,        4%
-#   7. rmsnorm_bound, c4,        8%
+# KEY DESIGN: each setting runs in a SEPARATE Python subprocess.
+# This ensures GPU memory stats are fully isolated — no carryover between
+# settings, no doubled peak-memory from two models loaded simultaneously.
 #
-# Pruning plans are loaded from results/pruning_plans/.  They must have been
-# produced by a prior run of run_moe_residual_selected_full_benchmark.sh
-# (which saves pure_delete plans with save_pruning_plan: true).
+# SMOKE mode (2 settings):
+#   1. baseline_no_pruning
+#   2. residual_nearest_channel_merge_moe at 4%, wikitext2
+#      label: residual_nearest_channel_merge_moe__rmsnorm_bound__wikitext2__target4pct__actual4.2pct
+#
+# Full mode: baseline + 6 pruned settings
+#   rmsnorm_bound × {wikitext2, c4} × {4%, 8%} (residual_nearest)
+#   + pure_delete × wikitext2 × 8% (for direct comparison)
 #
 # Usage:
-#   bash scripts/run_moe_speed_memory_benchmark.sh           # full benchmark
-#   DRY_RUN=1 bash scripts/run_moe_speed_memory_benchmark.sh # list settings, no GPU
-#   SMOKE=1   bash scripts/run_moe_speed_memory_benchmark.sh # baseline + 1 pruned
+#   SMOKE=1   bash scripts/run_moe_speed_memory_benchmark.sh   # 2 settings
+#   DRY_RUN=1 bash scripts/run_moe_speed_memory_benchmark.sh   # list, no GPU
+#   bash scripts/run_moe_speed_memory_benchmark.sh              # full benchmark
 #
 # Env overrides:
-#   DRY_RUN=1         List settings only, no model loading
-#   SMOKE=1           2 settings only (baseline + 2%/wikitext2)
-#   RESULTS_DIR=...   Results directory (default: results)
+#   DRY_RUN=1         List settings, do not run
+#   SMOKE=1           2 settings only (baseline + residual_nearest 4%/wikitext2)
 #   MODEL=...         HuggingFace model ID (default: Qwen/Qwen3-30B-A3B)
-#   DTYPE=...         bfloat16 | float16 | float32 (default: bfloat16)
-#   VENV=...          Virtualenv path (default: /workspace/venvs/qwen-pruning)
+#   DTYPE=...         bfloat16|float16|float32 (default: bfloat16)
+#   RESULTS_DIR=...   Results dir (default: results)
+#   VENV=...          Virtualenv (default: /workspace/venvs/qwen-pruning)
 #   N_WARMUP=...      Warm-up iterations (default: 2)
 #   N_BENCH=...       Measured iterations (default: 5)
+#   BATCH_SIZE=...    Batch size (default: 1)
+#   SELECTOR=...      Selector used for plan files (default: rmsnorm_bound)
 
 set -euo pipefail
 
@@ -40,12 +42,20 @@ cd "${REPO_ROOT}"
 # ── Config ────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
-RESULTS_DIR="${RESULTS_DIR:-results}"
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B}"
 DTYPE="${DTYPE:-bfloat16}"
+RESULTS_DIR="${RESULTS_DIR:-results}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 N_WARMUP="${N_WARMUP:-2}"
 N_BENCH="${N_BENCH:-5}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+MAX_NEW_TOKENS="32"
+SELECTOR="${SELECTOR:-rmsnorm_bound}"
+AGG_MODE="p95"
+ALIGN="16"
+N_EVAL="512"
+CALIB_N="512"
+D_FF="768"   # Qwen3-30B-A3B MoE intermediate size
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -53,15 +63,17 @@ PLAN_DIR="${RESULTS_DIR}/pruning_plans"
 # ── Sweep ID ──────────────────────────────────────────────────────────────────
 SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${RESULTS_DIR}/speed_memory_runs/${SWEEP_ID}"
+JSON_DIR="${OUT_DIR}/jsons"
+LOG_DIR="${OUT_DIR}/logs"
 OUT_CSV="${OUT_DIR}/speed_memory_results.csv"
-MANIFEST="${OUT_DIR}/plans_manifest.json"
 
 echo "[speed] Speed/memory benchmark ID: ${SWEEP_ID}"
 echo "[speed] Model:  ${MODEL}"
 echo "[speed] Dtype:  ${DTYPE}"
-echo "[speed] Output: ${OUT_CSV}"
+echo "[speed] Memory isolation: one Python subprocess per setting."
+echo "[speed] Out:    ${OUT_CSV}"
 
-# ── Activate virtualenv ───────────────────────────────────────────────────────
+# ── Virtualenv ────────────────────────────────────────────────────────────────
 if [ -f "${VENV}/bin/activate" ]; then
     echo "[speed] Activating virtualenv: ${VENV}"
     # shellcheck source=/dev/null
@@ -70,132 +82,228 @@ else
     echo "[speed] No virtualenv at ${VENV}, using system Python"
 fi
 
-# ── Build list of 7 settings ──────────────────────────────────────────────────
-# Selector used when generating the plans from run_moe_residual_selected_full_benchmark.sh:
-SELECTOR="rmsnorm_bound"
-AGG_MODE="p95"
-ALIGN="16"
-N_EVAL="512"
-CALIB_N="512"
+# ── Helper: compute actual_pct for uniform budget ─────────────────────────────
+# Uses round() matching moe_budget_mode=uniform in moe_pruning.py:
+#   n = round(d_ff * target / 100.0 / align) * align
+#   actual_pct = 100.0 * n / d_ff
+_actual_pct() {
+    local t="$1"
+    python3 -c "
+d_ff=${D_FF}; align=${ALIGN}; t=${t}
+n = int(round(d_ff * t / 100.0 / align)) * align
+print(f'{100.0 * n / d_ff:.1f}')
+" 2>/dev/null || echo "0.0"
+}
 
-# All targets to benchmark (must match existing plan files)
-TARGETS="2 4 8"
-DATASETS="wikitext2 c4"
+# ── Build settings array ──────────────────────────────────────────────────────
+# Format: "label|plan_path_or_NONE|method|selector|dataset|target_pct|actual_pct"
+declare -a SETTINGS=()
+SETTINGS+=("baseline_no_pruning|NONE|baseline|none|none|0.0|0.0")
 
-# ── DRY_RUN: list settings and exit ──────────────────────────────────────────
-if [ "${DRY_RUN}" = "1" ]; then
-    echo ""
-    echo "[speed] Planned settings (7 total):"
-    echo "   1. baseline_no_pruning                   (no plan)"
-    n=1
-    for dataset in ${DATASETS}; do
-        for target in ${TARGETS}; do
-            n=$(( n + 1 ))
-            plan_file="${PLAN_DIR}/${MODEL_SLUG}_${dataset}_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
-            label="${SELECTOR}_${dataset}_target${target}pct"
-            exists=""
-            [ -f "${plan_file}" ] && exists="[plan exists]" || exists="[PLAN MISSING - run full benchmark first]"
-            printf "  %2d. %-45s  %s\n" "${n}" "${label}" "${exists}"
+_add_setting() {
+    local method="$1" dataset="$2" target_pct="$3"
+    local actual_pct
+    actual_pct="$(_actual_pct "${target_pct}")"
+    local plan_file="${MODEL_SLUG}_${dataset}_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target_pct}.0pct_align${ALIGN}.json"
+    local plan_path="${PLAN_DIR}/${plan_file}"
+    local label="${method}__${SELECTOR}__${dataset}__target${target_pct}pct__actual${actual_pct}pct"
+    SETTINGS+=("${label}|${plan_path}|${method}|${SELECTOR}|${dataset}|${target_pct}|${actual_pct}")
+}
+
+if [ "${SMOKE}" = "1" ]; then
+    _add_setting "residual_nearest_channel_merge_moe" "wikitext2" "4"
+    echo "[speed] SMOKE=1: 2 settings (baseline + residual_nearest_channel_merge_moe 4% wikitext2)"
+else
+    # Full: baseline + 6 pruned settings
+    for dataset in wikitext2 c4; do
+        for target in 4 8; do
+            _add_setting "residual_nearest_channel_merge_moe" "${dataset}" "${target}"
         done
     done
+    _add_setting "pure_delete" "wikitext2" "8"
+fi
+
+# ── DRY_RUN: list and exit ────────────────────────────────────────────────────
+if [ "${DRY_RUN}" = "1" ]; then
     echo ""
-    echo "[speed] DRY_RUN complete. Plans must exist in ${PLAN_DIR}/"
-    echo "[speed] To generate plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
-    echo "[speed] To run:            bash scripts/run_moe_speed_memory_benchmark.sh"
+    echo "[speed] Planned settings (${#SETTINGS[@]} total):"
+    n=0
+    for setting in "${SETTINGS[@]}"; do
+        n=$(( n + 1 ))
+        IFS='|' read -r label plan_path method selector dataset target_pct actual_pct <<< "${setting}"
+        exists_str=""
+        if [ "${plan_path}" = "NONE" ]; then
+            exists_str="(baseline)"
+        elif [ -f "${plan_path}" ]; then
+            exists_str="[plan exists]"
+        else
+            exists_str="[PLAN MISSING — run full benchmark first]"
+        fi
+        printf "  %2d. %-68s  %s\n" "${n}" "${label}" "${exists_str}"
+    done
+    echo ""
+    echo "[speed] Plans are generated by: bash scripts/run_moe_residual_selected_full_benchmark.sh"
+    echo "[speed] Each setting will run in a SEPARATE Python process (memory isolation)."
+    if [ "${SMOKE}" = "1" ]; then
+        echo "[speed] DRY_RUN complete. To run: SMOKE=1 bash scripts/run_moe_speed_memory_benchmark.sh"
+    else
+        echo "[speed] DRY_RUN complete. To run: bash scripts/run_moe_speed_memory_benchmark.sh"
+    fi
     exit 0
 fi
 
-mkdir -p "${OUT_DIR}"
+# ── Create output dirs ────────────────────────────────────────────────────────
+mkdir -p "${JSON_DIR}" "${LOG_DIR}"
+echo "[speed] Output dir: ${OUT_DIR}"
+echo "[speed] Running ${#SETTINGS[@]} settings ..."
 
-# ── Check that at least one plan exists ──────────────────────────────────────
-found_plans=0
-for dataset in ${DATASETS}; do
-    for target in ${TARGETS}; do
-        plan_file="${PLAN_DIR}/${MODEL_SLUG}_${dataset}_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
-        [ -f "${plan_file}" ] && found_plans=$(( found_plans + 1 ))
-    done
+# ── Run each setting in a separate Python subprocess ─────────────────────────
+SUCCEEDED=0
+FAILED=0
+SKIPPED=0
+
+for setting in "${SETTINGS[@]}"; do
+    IFS='|' read -r label plan_path method selector dataset target_pct actual_pct <<< "${setting}"
+    out_json="${JSON_DIR}/${label}.json"
+    log_file="${LOG_DIR}/${label}.log"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────────────────"
+    echo "[speed] Setting: ${label}"
+    echo "[speed]   method=${method}  selector=${selector}  dataset=${dataset}"
+    echo "[speed]   target=${target_pct}%  actual=${actual_pct}%"
+    if [ "${plan_path}" = "NONE" ]; then
+        echo "[speed]   plan: (none — baseline)"
+    else
+        echo "[speed]   plan: ${plan_path}"
+    fi
+
+    # Skip missing plans (except baseline)
+    if [ "${plan_path}" != "NONE" ] && [ ! -f "${plan_path}" ]; then
+        echo "[speed] WARNING: plan not found — skipping."
+        echo "[speed]   Generate plans with: bash scripts/run_moe_residual_selected_full_benchmark.sh"
+        SKIPPED=$(( SKIPPED + 1 ))
+        continue
+    fi
+
+    # Build Python args as an array (handles paths with spaces safely)
+    py_args=(
+        --model          "${MODEL}"
+        --label          "${label}"
+        --method         "${method}"
+        --selector       "${selector}"
+        --dataset        "${dataset}"
+        --target-pct     "${target_pct}"
+        --actual-pct     "${actual_pct}"
+        --out-json       "${out_json}"
+        --dtype          "${DTYPE}"
+        --n-warmup       "${N_WARMUP}"
+        --n-bench        "${N_BENCH}"
+        --batch-size     "${BATCH_SIZE}"
+        --max-new-tokens "${MAX_NEW_TOKENS}"
+    )
+    if [ "${plan_path}" != "NONE" ]; then
+        py_args+=(--plan "${plan_path}")
+    fi
+
+    echo "[speed] Launching subprocess: python3 scripts/benchmark_moe_speed_memory.py ..."
+    set +e
+    # Each subprocess is a fresh Python process: isolated CUDA context + memory stats
+    python3 scripts/benchmark_moe_speed_memory.py "${py_args[@]}" \
+        2>&1 | tee "${log_file}"
+    py_exit="${PIPESTATUS[0]}"
+    set -e
+
+    if [ "${py_exit}" -ne 0 ]; then
+        echo "[speed] ✗ FAILED: ${label} (exit ${py_exit})"
+        FAILED=$(( FAILED + 1 ))
+    elif [ -f "${out_json}" ]; then
+        echo "[speed] ✓ OK: ${label}"
+        SUCCEEDED=$(( SUCCEEDED + 1 ))
+    else
+        echo "[speed] ✗ FAILED: ${label} (no JSON written)"
+        FAILED=$(( FAILED + 1 ))
+    fi
 done
 
-if [ ${found_plans} -eq 0 ]; then
-    echo "[speed] ERROR: No pruning plans found in ${PLAN_DIR}/"
-    echo "[speed]   Run: bash scripts/run_moe_residual_selected_full_benchmark.sh"
-    echo "[speed]   (Plans are saved when save_pruning_plan: true in config)"
-    exit 1
-fi
+# ── Aggregate JSON → CSV ──────────────────────────────────────────────────────
+echo ""
+echo "[speed] Aggregating results → ${OUT_CSV}"
 
-echo "[speed] Found ${found_plans} plan file(s) in ${PLAN_DIR}/"
+python3 - "${JSON_DIR}" "${OUT_CSV}" << 'PYEOF'
+import csv, json, os, sys, glob
 
-# ── Build plans manifest JSON ─────────────────────────────────────────────────
-python3 - "${MANIFEST}" "${MODEL_SLUG}" "${PLAN_DIR}" \
-    "${SELECTOR}" "${AGG_MODE}" "${ALIGN}" "${N_EVAL}" "${CALIB_N}" \
-    "${SMOKE}" "${TARGETS}" "${DATASETS}" << 'PYEOF'
-import json, os, sys
+json_dir = sys.argv[1]
+out_csv  = sys.argv[2]
 
-manifest_path = sys.argv[1]
-model_slug    = sys.argv[2]
-plan_dir      = sys.argv[3]
-selector      = sys.argv[4]
-agg_mode      = sys.argv[5]
-align         = sys.argv[6]
-n_eval        = sys.argv[7]
-calib_n       = sys.argv[8]
-smoke         = sys.argv[9] == "1"
-targets       = sys.argv[10].split()
-datasets      = sys.argv[11].split()
+CSV_FIELDS = [
+    "label", "method", "selector", "dataset", "target_pct", "actual_pct",
+    "expert_param_reduction_pct", "total_model_param_reduction_pct",
+    "active_expert_flop_reduction_pct",
+    "prompt_len", "generated_tokens", "batch_size",
+    "prefill_latency_ms_mean", "decode_latency_ms_mean",
+    "end_to_end_latency_ms_mean", "tokens_per_sec_mean",
+    "peak_allocated_mib_total", "peak_reserved_mib_total",
+    "peak_allocated_mib_gpu0", "peak_allocated_mib_gpu1",
+    "memory_after_load_mib_total", "memory_after_pruning_mib_total",
+    "memory_after_benchmark_mib_total",
+    "n_layers_pruned", "params_before", "params_after",
+    "load_sec", "n_warmup", "n_bench",
+    "model_name", "plan_path", "status",
+]
 
-settings = []
-for dataset in datasets:
-    for target in targets:
-        fname = (
-            f"{model_slug}_{dataset}_n{n_eval}_calib{calib_n}"
-            f"_{selector}_{agg_mode}_{target}.0pct_align{align}.json"
-        )
-        fpath = os.path.join(plan_dir, fname)
-        label = f"{selector}_{dataset}_target{target}pct"
-        if os.path.isfile(fpath):
-            settings.append({"label": label, "plan": fpath})
-            if smoke:
-                # SMOKE: only the first match (2% wikitext2)
-                break
-    if smoke and settings:
-        break
+rows = []
+for jf in sorted(glob.glob(os.path.join(json_dir, "*.json"))):
+    try:
+        with open(jf) as fh:
+            rows.append(json.load(fh))
+    except Exception as e:
+        print(f"[speed] WARNING: cannot parse {jf}: {e}")
 
-manifest = {"settings": settings}
-with open(manifest_path, "w") as fh:
-    json.dump(manifest, fh, indent=2)
-print(f"[speed] Plans manifest: {manifest_path}  ({len(settings)} pruned settings)")
+if not rows:
+    print("[speed] WARNING: no JSON results found — CSV not written.")
+    sys.exit(0)
+
+os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
+with open(out_csv, "w", newline="") as fh:
+    writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+print(f"[speed] CSV written: {out_csv}  ({len(rows)} rows)")
+
+# Summary table
+W = 68
+print(f"\n[speed] ── Summary {'─' * (W - 15)}")
+hdr = f"  {'Label':<{W}}  {'Param↓%':>8}  {'Prefill ms':>10}  {'Tok/s':>7}  {'Peak MiB':>9}"
+print(hdr)
+print("  " + "─" * (len(hdr) - 2))
+for r in rows:
+    label = r.get("label", "?")[:W]
+    st    = r.get("status", "?")
+    if st not in ("ok",):
+        print(f"  {label:<{W}}  {st}")
+        continue
+    pct = r.get("total_model_param_reduction_pct", 0.0) or 0.0
+    pre = r.get("prefill_latency_ms_mean", float("nan"))
+    tps = r.get("tokens_per_sec_mean", float("nan"))
+    mem = r.get("peak_allocated_mib_total", float("nan"))
+    print(f"  {label:<{W}}  {pct:>8.2f}  {pre:>10.1f}  {tps:>7.1f}  {mem:>9.0f}")
+print()
 PYEOF
 
-# ── Environment check ─────────────────────────────────────────────────────────
-if [ -f "scripts/check_env.py" ]; then
-    echo "[speed] Running environment check..."
-    python3 scripts/check_env.py --strict || {
-        echo "[speed] ERROR: environment check failed. Aborting."
-        exit 1
-    }
-fi
-
-# ── SMOKE mode: 2 settings only (baseline + first pruned plan) ────────────────
-EXTRA_ARGS=""
-if [ "${SMOKE}" = "1" ]; then
-    echo "[speed] SMOKE=1: running baseline + first pruned plan only."
-fi
-
-# ── Run benchmark ─────────────────────────────────────────────────────────────
-echo "[speed] Starting benchmark..."
-python3 scripts/benchmark_moe_speed_memory.py \
-    --model    "${MODEL}" \
-    --plans    "${MANIFEST}" \
-    --out      "${OUT_CSV}" \
-    --dtype    "${DTYPE}" \
-    --n-warmup "${N_WARMUP}" \
-    --n-bench  "${N_BENCH}" \
-    ${EXTRA_ARGS}
-
+# ── Final report ──────────────────────────────────────────────────────────────
 echo ""
-echo "════════════════════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════════════════════"
 echo "[speed] BENCHMARK COMPLETE  (id=${SWEEP_ID})"
-echo "[speed]   Results: ${OUT_CSV}"
-echo "[speed]   Plans:   ${MANIFEST}"
-echo "════════════════════════════════════════════════════════════════"
+echo "[speed]   Succeeded : ${SUCCEEDED}"
+echo "[speed]   Skipped   : ${SKIPPED}  (missing plans)"
+echo "[speed]   Failed    : ${FAILED}"
+echo "[speed]   CSV       : ${OUT_CSV}"
+echo "[speed]   Logs      : ${LOG_DIR}/"
+echo "[speed]   Memory    : each setting ran in a separate Python process."
+echo "════════════════════════════════════════════════════════════════════════"
+
+if [ "${FAILED}" -gt 0 ]; then
+    exit 1
+fi
 exit 0

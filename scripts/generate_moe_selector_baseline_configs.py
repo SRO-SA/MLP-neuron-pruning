@@ -4,15 +4,16 @@ generate_moe_selector_baseline_configs.py
 ==========================================
 Generate YAML configs for the MoE selector baseline comparison.
 
-Matrix: 4 selectors × 4 targets × 2 datasets = 32 configs.
+Matrix: 4 selectors x 4 targets x 2 datasets = 32 configs.
 
-All configs use the ``pure_delete`` pruning method.  Each selector saves its
-own pruning plan because the channel-selection order differs between selectors.
+All configs use pure_delete pruning.  moe_budget_mode=uniform ensures every
+selector prunes the exact same number of channels per layer, making actual_pct
+selector-independent (fair comparison).
 
 Selectors:
-  - rmsnorm_bound    : weight-only RMSNorm-bounded SwiGLU score (baseline)
-  - down_norm        : L2 norm of each down_proj column (simple)
-  - activation_score : activation × down-column-norm (needs calibration data)
+  - rmsnorm_bound    : weight-only RMSNorm-bounded SwiGLU score (proposed)
+  - down_norm        : L2 norm of each down_proj column (simple baseline)
+  - activation_score : activation x down-column-norm (needs calibration data)
   - random           : uniform random (random baseline; seed fixed)
 
 Targets:  2%, 4%, 6%, 8%
@@ -35,7 +36,7 @@ REPO_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR  = os.path.join(REPO_ROOT, "configs", "moe_selector_baseline")
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 
-# ── Benchmark dimensions ─────────────────────────────────────────────────────
+# Benchmark dimensions
 TARGETS   = [2, 4, 6, 8]
 DATASETS  = ["wikitext2", "c4"]
 N_EVAL    = 512
@@ -45,7 +46,7 @@ ALIGN     = 16
 MAX_LAYER = 0.10
 MIN_TOK   = 32
 
-# selector name → (label_for_filename, needs_calib_data)
+# selector name -> (label_for_filename, needs_calib_data)
 SELECTORS = [
     ("rmsnorm_bound",    "rmsnorm_bound",    False),
     ("down_norm",        "down_norm",        False),
@@ -58,15 +59,11 @@ METHOD = "pure_delete"  # all configs use pure_delete; only the selector varies
 MODEL_ID   = "Qwen/Qwen3-30B-A3B"
 MODEL_SLUG = MODEL_ID.replace("/", "_").replace("-", "_")
 
-EXPECTED_TOTAL = len(SELECTORS) * len(TARGETS) * len(DATASETS)  # 4×4×2 = 32
+EXPECTED_TOTAL = len(SELECTORS) * len(TARGETS) * len(DATASETS)  # 4x4x2 = 32
 
 
 def plan_path(target_pct: int, dataset: str, selector: str) -> str:
-    """
-    Canonical pruning plan path — mirrors make_pruning_plan_path() in
-    src/moe_residual_methods.py.  Selector is included in the filename so
-    each selector's plan is stored separately.
-    """
+    """Canonical pruning plan path (selector in filename so plans stay separate)."""
     fname = (
         f"{MODEL_SLUG}_{dataset}_n{N_EVAL}_calib{CALIB_N}"
         f"_{selector}_{AGG_MODE}_{float(target_pct):.1f}pct_align{ALIGN}.json"
@@ -78,13 +75,8 @@ def config_name(target_pct: int, dataset: str, selector_label: str) -> str:
     return f"qwen3_30b_a3b_{dataset}_n{N_EVAL}_target{target_pct}_sel_{selector_label}.yaml"
 
 
-def build_config(
-    target_pct:   int,
-    dataset:      str,
-    selector:     str,
-    needs_calib:  bool,
-) -> dict:
-    cfg = {
+def build_config(target_pct: int, dataset: str, selector: str, needs_calib: bool) -> dict:
+    return {
         # Model
         "scaling_models":              [MODEL_ID],
         "scaling_dtype":               "auto",
@@ -100,6 +92,9 @@ def build_config(
         "moe_max_layer_channel_prune_frac": MAX_LAYER,
         "max_expert_frac":             MAX_LAYER,
         "min_expert_tokens":           MIN_TOK,
+        # Budget mode: "uniform" enforces identical per-layer channel budget for all
+        # selectors so actual_pct is selector-independent (fair apples-to-apples comparison).
+        "moe_budget_mode":             "uniform",
         # Evaluation
         "eval_datasets":               [dataset],
         "moe_calib_dataset":           dataset,
@@ -112,13 +107,12 @@ def build_config(
         "moe_inplace_pruning":         True,
         "moe_smoke_test":              False,
         "seed":                        42,
-        # activation_score selector: enable calibration-data collection
+        # activation_score: enable calibration-data collection
         "moe_selector_needs_calib":    needs_calib,
-        # Pruning plan: every config saves its own plan (selector → different channels)
-        "save_pruning_plan": True,
-        "load_pruning_plan": None,
+        # Pruning plan: every config saves its own plan (selector -> different channels)
+        "save_pruning_plan":           True,
+        "load_pruning_plan":           None,
     }
-    return cfg
 
 
 def main() -> None:

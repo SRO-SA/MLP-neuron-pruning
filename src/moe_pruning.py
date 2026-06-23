@@ -1924,6 +1924,9 @@ def run_moe_target_pruning_mode(
     moe_selector   = str(cfg.get("moe_selector", "rmsnorm_bound"))
     dry_run        = bool(cfg.get("moe_selection_dry_run", False))
     max_layer_frac = float(cfg.get("moe_max_layer_channel_prune_frac", 1.0))
+    # "uniform" = per-layer budget fixed from architecture+target_pct (selector-independent);
+    # "global"  = global greedy across all layers (original behaviour, may vary per selector).
+    moe_budget_mode = str(cfg.get("moe_budget_mode", "global"))
     resid_lambda   = float(cfg.get("residual_lambda", 1e-2))
     resid_tau      = float(cfg.get("residual_tau", 1.0))
     min_resid_tok  = int(cfg.get("min_residual_tokens_per_expert", 16))
@@ -1967,6 +1970,7 @@ def run_moe_target_pruning_mode(
     print(f"  aggregation    : {chan_agg}")
     print(f"  pruning_mode   : {pruning_mode}")
     print(f"  moe_selector   : {moe_selector}")
+    print(f"  moe_budget_mode: {moe_budget_mode}")
     if dry_run:
         print("  DRY-RUN MODE   : selection only — no pruning, no PPL eval")
     if max_layer_frac < 1.0:
@@ -2257,8 +2261,6 @@ def run_moe_target_pruning_mode(
                     np.arange(len(s), dtype=np.int32)
                     for _, _, s in all_expert_scores
                 ])
-                order = np.argsort(flat_scores, kind="stable")
-
                 expert_sizes = {(li, ei): int(len(s))
                                 for li, ei, s in all_expert_scores}
                 # Cap = max layer-channels per entry (not per expert-neuron)
@@ -2270,66 +2272,114 @@ def run_moe_target_pruning_mode(
 
                 removed_expert_neurons = 0
                 selected_layer_channels = 0
-                for oi in order:
-                    if removed_expert_neurons >= target_n:
-                        break
-                    li  = int(flat_layer[oi])
-                    ei  = int(flat_expert[oi])
-                    ni  = int(flat_neuron[oi])
-                    key = (li, ei)
-                    if len(per_expert_pruned[key]) >= expert_caps[key]:
-                        continue
-                    # Per-layer cap for packed same-channel
-                    if ei == -1 and max_layer_frac < 1.0:
-                        _d_ff_l = expert_sizes[key]
-                        _layer_cap = (int(_d_ff_l * max_layer_frac) // chan_align) * chan_align
-                        if _layer_cap > 0 and len(per_expert_pruned[key]) >= _layer_cap:
-                            continue
-                    per_expert_pruned[key].append(ni)
-                    wt = entry_weight[key]
-                    removed_expert_neurons  += wt
-                    selected_layer_channels += 1  # counts channel-slots, not expert-neurons
 
-                # ── Alignment adjustment for packed layers ────────────────────
-                # After selection, new_inter = old_inter - k_selected may not
-                # be divisible by chan_align.  Round new_inter DOWN to the
-                # nearest multiple of chan_align by pruning the next-lowest-
-                # scoring channels (using the stored averaged score vector).
-                for key, prune_list in per_expert_pruned.items():
-                    _li, _ei = key
-                    if _ei != -1:
-                        continue  # unpacked: no alignment needed
-                    old_inter = expert_sizes[key]
-                    k = len(prune_list)
-                    new_inter_raw = old_inter - k
-                    new_inter_aligned = (new_inter_raw // chan_align) * chan_align
-                    extra = new_inter_raw - new_inter_aligned  # channels to add
-                    if extra == 0:
-                        continue
-                    if new_inter_aligned <= 0:
-                        print(f"    WARNING: alignment={chan_align} would reduce "
-                              f"layer {_li} to 0 channels — skipping alignment")
-                        continue
-                    # Cap extra by max_layer_frac to avoid exceeding per-layer limit
-                    if max_layer_frac < 1.0:
-                        _layer_cap = (int(old_inter * max_layer_frac) // chan_align) * chan_align
-                        extra = min(extra, max(0, _layer_cap - k))
-                    if extra == 0:
-                        continue
-                    # Find extra lowest-scoring channels NOT already in prune_list
-                    pruned_set = set(prune_list)
-                    avg_s = layer_avg_scores[_li]  # [old_inter]
-                    # Sort remaining indices by score (ascending = lowest first)
-                    remaining = [
-                        (float(avg_s[ch]), ch)
-                        for ch in range(old_inter)
-                        if ch not in pruned_set
-                    ]
-                    remaining.sort()
-                    for _, ch in remaining[:extra]:
-                        prune_list.append(ch)
-                        removed_expert_neurons += entry_weight[key]
-                        selected_layer_channels += 1
+                if moe_budget_mode == "uniform":
+                    # ── Uniform-budget mode ──────────────────────────────────
+                    # Per-layer budget is determined solely from architecture +
+                    # target_pct, so actual_pct is identical across all selectors
+                    # (the selector only determines WHICH channels are pruned,
+                    # not HOW MANY per layer).
+                    #
+                    #   n_prune_l = round(d_ff_l * target_pct/100 / align) * align
+                    #   n_prune_l = min(n_prune_l, floor(d_ff_l * max_layer_frac / align) * align)
+                    #
+                    # Note: round() (not floor()) so that target=2% on d_ff=768, align=16
+                    # snaps to 16 ch (2.083%) instead of flooring to 0.
+                    #
+                    # Uses layer_avg_scores (already computed above) for ranking.
+                    # No global greedy pass; no alignment-adjustment needed.
+                    for key, prune_list in per_expert_pruned.items():
+                        _li, _ei = key
+                        if _ei != -1:
+                            continue  # uniform mode only applies to packed same-channel
+                        d_ff_l  = expert_sizes[key]
+                        # Fixed budget for this layer (aligned, capped).
+                        # Use round() not floor() so small targets (e.g. 2% on d_ff=768, align=16)
+                        # snap to the nearest aligned non-zero count (16 ch = 2.08%) instead of
+                        # flooring to 0.  All selectors get the exact same n_prune_l, making
+                        # actual_pct selector-independent.
+                        n_prune_l = int(round(d_ff_l * target_pct / 100.0 / chan_align)) * chan_align
+                        if max_layer_frac < 1.0:
+                            _cap = (int(d_ff_l * max_layer_frac) // chan_align) * chan_align
+                            n_prune_l = min(n_prune_l, _cap)
+                        n_prune_l = min(n_prune_l, d_ff_l)  # can't prune more than exists
+                        if n_prune_l <= 0:
+                            continue
+                        # Select lowest-scoring n_prune_l channels (ascending sort)
+                        avg_s  = layer_avg_scores[_li]  # [d_ff_l] aggregated layer score
+                        sorted_ch = np.argsort(avg_s.numpy(), kind="stable")
+                        for ch in sorted_ch[:n_prune_l]:
+                            prune_list.append(int(ch))
+                        wt = entry_weight[key]
+                        removed_expert_neurons  += n_prune_l * wt
+                        selected_layer_channels += n_prune_l
+                else:
+                    # ── Global greedy mode (default) ─────────────────────────
+                    # Select channels globally across layers in ascending score
+                    # order until the target expert-neuron count is reached.
+                    # Budget distribution varies by score — different selectors
+                    # may produce different actual_pct values.
+                    order = np.argsort(flat_scores, kind="stable")
+                    for oi in order:
+                        if removed_expert_neurons >= target_n:
+                            break
+                        li  = int(flat_layer[oi])
+                        ei  = int(flat_expert[oi])
+                        ni  = int(flat_neuron[oi])
+                        key = (li, ei)
+                        if len(per_expert_pruned[key]) >= expert_caps[key]:
+                            continue
+                        # Per-layer cap for packed same-channel
+                        if ei == -1 and max_layer_frac < 1.0:
+                            _d_ff_l = expert_sizes[key]
+                            _layer_cap = (int(_d_ff_l * max_layer_frac) // chan_align) * chan_align
+                            if _layer_cap > 0 and len(per_expert_pruned[key]) >= _layer_cap:
+                                continue
+                        per_expert_pruned[key].append(ni)
+                        wt = entry_weight[key]
+                        removed_expert_neurons  += wt
+                        selected_layer_channels += 1  # counts channel-slots, not expert-neurons
+
+                    # ── Alignment adjustment for packed layers ───────────────
+                    # After selection, new_inter = old_inter - k_selected may not
+                    # be divisible by chan_align.  Round new_inter DOWN to the
+                    # nearest multiple of chan_align by pruning the next-lowest-
+                    # scoring channels (using the stored averaged score vector).
+                    for key, prune_list in per_expert_pruned.items():
+                        _li, _ei = key
+                        if _ei != -1:
+                            continue  # unpacked: no alignment needed
+                        old_inter = expert_sizes[key]
+                        k = len(prune_list)
+                        new_inter_raw = old_inter - k
+                        new_inter_aligned = (new_inter_raw // chan_align) * chan_align
+                        extra = new_inter_raw - new_inter_aligned  # channels to add
+                        if extra == 0:
+                            continue
+                        if new_inter_aligned <= 0:
+                            print(f"    WARNING: alignment={chan_align} would reduce "
+                                  f"layer {_li} to 0 channels — skipping alignment")
+                            continue
+                        # Cap extra by max_layer_frac to avoid exceeding per-layer limit
+                        if max_layer_frac < 1.0:
+                            _layer_cap = (int(old_inter * max_layer_frac) // chan_align) * chan_align
+                            extra = min(extra, max(0, _layer_cap - k))
+                        if extra == 0:
+                            continue
+                        # Find extra lowest-scoring channels NOT already in prune_list
+                        pruned_set = set(prune_list)
+                        avg_s = layer_avg_scores[_li]  # [old_inter]
+                        # Sort remaining indices by score (ascending = lowest first)
+                        remaining = [
+                            (float(avg_s[ch]), ch)
+                            for ch in range(old_inter)
+                            if ch not in pruned_set
+                        ]
+                        remaining.sort()
+                        for _, ch in remaining[:extra]:
+                            prune_list.append(ch)
+                            removed_expert_neurons += entry_weight[key]
+                            selected_layer_channels += 1
 
                 actual_pruned = removed_expert_neurons
                 actual_pct    = 100.0 * actual_pruned / total_expert_neurons

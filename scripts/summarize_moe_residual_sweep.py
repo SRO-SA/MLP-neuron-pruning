@@ -2,16 +2,28 @@
 """
 summarize_moe_residual_sweep.py
 
-Reads result CSVs for a specific sweep run (via manifest) and prints
-a comparison table grouped by target_pct.
+Reads result CSVs for a specific sweep run (via manifest or run-dir) and prints
+a comparison table.
+
+Two auto-detected summary modes:
+  selector-baseline : multiple distinct selectors, one method
+                      -> groups by (target_pct, dataset, selector)
+                      -> shows selector/aggregation_mode/selected_layer_channels/
+                         removed_expert_neurons/pruning_plan_path columns
+                      -> winner is "Best selector: <selector>"
+                      -> warns if actual_pct differs across selectors (budget_mismatch)
+  residual-method   : multiple distinct methods (or single selector)
+                      -> groups by (target_pct, dataset)
+                      -> shows method/residual columns
+                      -> winner is "Best: <method>"
 
 Outputs:
   <out_dir>/summary.csv
   <out_dir>/summary.md
 
 Usage:
-  python3 scripts/summarize_moe_residual_sweep.py --manifest results/moe_residual_sweep_runs/<id>/sweep_manifest.json
-  python3 scripts/summarize_moe_residual_sweep.py --run-dir  results/moe_residual_sweep_runs/<id>/
+  python3 scripts/summarize_moe_residual_sweep.py --manifest results/.../sweep_manifest.json
+  python3 scripts/summarize_moe_residual_sweep.py --run-dir  results/.../<id>/
   python3 scripts/summarize_moe_residual_sweep.py --manifest ... --quiet
 """
 
@@ -27,9 +39,27 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ── Display columns (in order) ─────────────────────────────────────────────────
-DISPLAY_COLS = [
-    "eval_dataset",            # dataset used for calibration and evaluation
+# ── Display columns by mode ───────────────────────────────────────────────────
+DISPLAY_COLS_SELECTOR = [
+    "eval_dataset",
+    "selector",
+    "aggregation_mode",
+    "selected_layer_channels",
+    "removed_expert_neurons",
+    "expert_param_reduction_pct",
+    "actual_pct",
+    "target_pct",
+    "compressed_ppl",
+    "baseline_ppl",
+    "delta_ppl",
+    "relative_delta_pct",
+    "forward_check",
+    "status",
+    "pruning_plan_path",
+]
+
+DISPLAY_COLS_RESIDUAL = [
+    "eval_dataset",
     "moe_pruning_method",
     "requested_method",
     "actual_method",
@@ -49,15 +79,18 @@ DISPLAY_COLS = [
     "residual_fallback_used",
 ]
 
+
 def _float_or_none(s) -> Optional[float]:
     try:
         return float(s)
     except (ValueError, TypeError):
         return None
 
+
 def _pct(s, decimals: int = 1) -> str:
     v = _float_or_none(s)
     return f"{v:.{decimals}f}%" if v is not None else (str(s) if s else "—")
+
 
 def _fmt(val: str, col: str) -> str:
     if not val:
@@ -65,16 +98,22 @@ def _fmt(val: str, col: str) -> str:
     if col in ("compressed_ppl", "baseline_ppl", "delta_ppl"):
         v = _float_or_none(val)
         return f"{v:.4f}" if v is not None else val
-    if col in ("residual_coverage_pct", "expert_param_reduction_pct", "relative_delta_pct", "actual_pct"):
+    if col in ("residual_coverage_pct", "expert_param_reduction_pct",
+               "relative_delta_pct", "actual_pct"):
         return _pct(val)
-    if col in ("residual_applied_experts", "residual_rejected_experts"):
+    if col in ("residual_applied_experts", "residual_rejected_experts",
+               "selected_layer_channels", "removed_expert_neurons"):
         v = _float_or_none(val)
         return f"{int(v)}" if v is not None else val
     if col == "residual_lambda":
         v = _float_or_none(val)
         if v is not None:
             return f"{v:.0e}" if v < 0.01 else f"{v:.3f}"
+    if col == "pruning_plan_path":
+        # Show only the filename to keep table narrow
+        return os.path.basename(val) if val else "—"
     return val
+
 
 def _get_target(row: Dict) -> str:
     return row.get("target_pct") or row.get("expert_target_pct") or "unknown"
@@ -86,8 +125,26 @@ def _get_group_key(row: Dict) -> Tuple[str, str]:
     dataset = row.get("eval_dataset") or row.get("dataset") or "unknown"
     return (target, dataset)
 
-# ── Load CSVs from manifest ────────────────────────────────────────────────────
-def load_from_manifest(manifest_path: str) -> tuple[List[Dict], List[str]]:
+
+def _detect_mode(rows: List[Dict]) -> str:
+    """Auto-detect summary mode from the loaded rows.
+
+    Returns "selector" if there are multiple distinct selectors and only one
+    distinct method (pure_delete baseline comparison); otherwise "residual".
+    """
+    selectors = {r.get("selector", "") for r in rows if r.get("selector", "")}
+    methods   = {
+        r.get("moe_pruning_method") or r.get("requested_method") or r.get("actual_method") or ""
+        for r in rows
+    }
+    methods.discard("")
+    if len(selectors) > 1 and len(methods) <= 1:
+        return "selector"
+    return "residual"
+
+
+# ── Load CSVs from manifest ───────────────────────────────────────────────────
+def load_from_manifest(manifest_path: str) -> Tuple[List[Dict], List[str]]:
     """Load CSV rows listed in the manifest. Returns (rows, warnings)."""
     warnings = []
     with open(manifest_path) as f:
@@ -95,7 +152,6 @@ def load_from_manifest(manifest_path: str) -> tuple[List[Dict], List[str]]:
 
     csv_files = manifest.get("csv_files", [])
     if not csv_files:
-        # Fallback: look for CSVs in the run dir's csvs/ subdirectory
         run_dir = os.path.dirname(manifest_path)
         csv_dir = os.path.join(run_dir, "csvs")
         csv_files = sorted(glob.glob(os.path.join(csv_dir, "moe_target_pruning_*.csv")))
@@ -108,7 +164,6 @@ def load_from_manifest(manifest_path: str) -> tuple[List[Dict], List[str]]:
 
     rows = []
     for csv_path in csv_files:
-        # Safety: skip per_layer CSVs, summary CSVs, unrelated files
         fname = os.path.basename(csv_path)
         if "_per_layer" in fname or "summary" in fname:
             warnings.append(f"Skipping non-main CSV: {fname}")
@@ -119,15 +174,14 @@ def load_from_manifest(manifest_path: str) -> tuple[List[Dict], List[str]]:
         try:
             with open(csv_path, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
-                file_rows = list(reader)
-                rows.extend(file_rows)
+                rows.extend(list(reader))
         except Exception as e:
             warnings.append(f"Could not read {csv_path}: {e}")
 
     return rows, warnings
 
-# ── Load CSVs from run directory directly ─────────────────────────────────────
-def load_from_run_dir(run_dir: str) -> tuple[List[Dict], List[str]]:
+
+def load_from_run_dir(run_dir: str) -> Tuple[List[Dict], List[str]]:
     manifest = os.path.join(run_dir, "sweep_manifest.json")
     if os.path.exists(manifest):
         return load_from_manifest(manifest)
@@ -142,34 +196,62 @@ def load_from_run_dir(run_dir: str) -> tuple[List[Dict], List[str]]:
             rows.extend(list(csv.DictReader(fh)))
     return rows, warnings
 
-# ── Cross-method consistency checks ───────────────────────────────────────────
-def check_consistency(rows: List[Dict], target: str) -> List[str]:
+
+# ── Consistency checks ────────────────────────────────────────────────────────
+def check_consistency_selector(rows: List[Dict], group_label: str) -> List[str]:
+    """Consistency checks for selector-baseline groups.
+
+    Specifically:
+    - Warns if actual_pct differs across selectors (compression not matched).
+    - Does NOT warn about different plan_paths (expected: each selector has its own plan).
+    - Warns about status or forward_check failures.
+    """
     warnings = []
-    plan_paths = {r.get("pruning_plan_path", "") for r in rows if r.get("pruning_plan_path", "")}
-    if len(plan_paths) > 1:
-        warnings.append(f"Multiple pruning_plan_path values at target={target}: {plan_paths}")
 
     actual_pcts = {r.get("actual_pct", "") for r in rows if r.get("actual_pct", "")}
     if len(actual_pcts) > 1:
-        warnings.append(f"Inconsistent actual_pct at target={target}: {actual_pcts}")
+        warnings.append(
+            f"{group_label}: inconsistent actual_pct across selectors: {actual_pcts} "
+            f"(budget_mismatch — check moe_budget_mode=uniform is set)"
+        )
+
+    for row in rows:
+        sel = row.get("selector", "?")
+        if str(row.get("status", "")).lower() not in ("ok", ""):
+            warnings.append(f"{group_label} selector={sel}: status={row.get('status')!r}")
+        if str(row.get("forward_check", "")).lower() not in ("true", "1", ""):
+            warnings.append(f"{group_label} selector={sel}: forward_check={row.get('forward_check')!r}")
+
+    return warnings
+
+
+def check_consistency_residual(rows: List[Dict], group_label: str) -> List[str]:
+    """Consistency checks for residual-method groups."""
+    warnings = []
+
+    plan_paths = {r.get("pruning_plan_path", "") for r in rows if r.get("pruning_plan_path", "")}
+    if len(plan_paths) > 1:
+        warnings.append(f"{group_label}: multiple pruning_plan_path values: {plan_paths}")
+
+    actual_pcts = {r.get("actual_pct", "") for r in rows if r.get("actual_pct", "")}
+    if len(actual_pcts) > 1:
+        warnings.append(f"{group_label}: inconsistent actual_pct: {actual_pcts}")
 
     for row in rows:
         method = row.get("moe_pruning_method") or row.get("requested_method") or "?"
         if str(row.get("residual_fallback_used", "")).lower() in ("true", "1"):
-            warnings.append(
-                f"target={target} method={method}: residual_fallback_used=True"
-            )
-        status = row.get("status", "")
-        if status.lower() not in ("ok", ""):
-            warnings.append(f"target={target} method={method}: status={status!r}")
+            warnings.append(f"{group_label} method={method}: residual_fallback_used=True")
+        if str(row.get("status", "")).lower() not in ("ok", ""):
+            warnings.append(f"{group_label} method={method}: status={row.get('status')!r}")
         cov = _float_or_none(row.get("residual_coverage_pct", ""))
         if cov is not None and cov == 0.0 and method not in ("pure_delete",):
-            warnings.append(
-                f"target={target} method={method}: residual_coverage_pct=0"
-            )
+            warnings.append(f"{group_label} method={method}: residual_coverage_pct=0")
+
     return warnings
 
-def find_winner(rows: List[Dict]) -> Optional[Dict]:
+
+def find_winner_selector(rows: List[Dict]) -> Optional[Dict]:
+    """Row with lowest relative_delta_pct among ok rows."""
     ok_rows = [r for r in rows if r.get("status", "").lower() in ("ok", "")]
     if not ok_rows:
         return None
@@ -178,7 +260,11 @@ def find_winner(rows: List[Dict]) -> Optional[Dict]:
         return v if v is not None else float("inf")
     return min(ok_rows, key=key)
 
-# ── Print fixed-width table ────────────────────────────────────────────────────
+
+find_winner_residual = find_winner_selector  # same logic
+
+
+# ── Table rendering ───────────────────────────────────────────────────────────
 def print_table(rows: List[Dict], cols: List[str]) -> None:
     avail = [c for c in cols if any(c in r and r[c] for r in rows)]
     widths = {c: max(len(c), max((len(_fmt(r.get(c, ""), c)) for r in rows), default=0))
@@ -190,17 +276,19 @@ def print_table(rows: List[Dict], cols: List[str]) -> None:
         line = "  ".join(_fmt(row.get(c, ""), c).ljust(widths[c]) for c in avail)
         print(line)
 
+
 def make_md_table(rows: List[Dict], cols: List[str]) -> str:
     avail = [c for c in cols if any(c in r and r[c] for r in rows)]
     header = " | ".join(avail)
-    sep = " | ".join(["---"] * len(avail))
-    lines = [f"| {header} |", f"| {sep} |"]
+    sep    = " | ".join(["---"] * len(avail))
+    lines  = [f"| {header} |", f"| {sep} |"]
     for row in rows:
         cells = [_fmt(row.get(c, ""), c) for c in avail]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default=None,
@@ -211,6 +299,8 @@ def main():
                     help="Output directory for summary files (default: same as run dir)")
     ap.add_argument("--quiet", action="store_true",
                     help="Suppress per-target table output")
+    ap.add_argument("--mode", default=None, choices=["selector", "residual"],
+                    help="Force summary mode (default: auto-detect from rows)")
     args = ap.parse_args()
 
     if not args.manifest and not args.run_dir:
@@ -236,64 +326,91 @@ def main():
 
     print(f"[summarize] Loaded {len(rows)} rows.")
 
+    # Auto-detect or force mode
+    mode = args.mode or _detect_mode(rows)
+    print(f"[summarize] Mode: {mode}")
+
+    # Choose display columns and helpers
+    if mode == "selector":
+        display_cols       = DISPLAY_COLS_SELECTOR
+        check_consistency  = check_consistency_selector
+        find_winner        = find_winner_selector
+        winner_prefix      = "Best selector"
+        winner_key         = "selector"
+    else:
+        display_cols       = DISPLAY_COLS_RESIDUAL
+        check_consistency  = check_consistency_residual
+        find_winner        = find_winner_residual
+        winner_prefix      = "Best"
+        winner_key         = None  # use moe_pruning_method / actual_method
+
     # Group by (target_pct, dataset)
     groups: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
     for row in rows:
         key = _get_group_key(row)
         groups[key].append(row)
 
-    unknown_count = sum(
-        len(v) for k, v in groups.items() if "unknown" in k
-    )
+    unknown_count = sum(len(v) for k, v in groups.items() if "unknown" in k)
     if unknown_count:
         print(f"[summarize] WARN: {unknown_count} rows have unknown target_pct or dataset",
               file=sys.stderr)
 
     all_warnings: List[str] = []
-    md_sections: List[str] = ["# MoE Residual Method Sweep Summary\n"]
+    md_sections: List[str] = [
+        f"# MoE {'Selector Baseline' if mode == 'selector' else 'Residual Method'} Summary\n"
+    ]
 
     def _sort_key(k: Tuple[str, str]) -> tuple:
         target, dataset = k
         return (_float_or_none(target) or 0, dataset)
 
     for (target, dataset) in sorted(groups, key=_sort_key):
-        group_rows = groups[(target, dataset)]
+        group_rows  = groups[(target, dataset)]
         group_label = f"target={target}%  dataset={dataset}"
-        warnings = check_consistency(group_rows, group_label)
+        warnings    = check_consistency(group_rows, group_label)
         all_warnings.extend(warnings)
-        winner = find_winner(group_rows)
+        winner      = find_winner(group_rows)
 
         if not args.quiet:
-            print(f"\n{'═'*70}")
+            print(f"\n{'='*70}")
             print(f"  Target: {target}%   Dataset: {dataset}   ({len(group_rows)} rows)")
-            print(f"{'═'*70}")
-            print_table(group_rows, DISPLAY_COLS)
+            print(f"{'='*70}")
+            print_table(group_rows, display_cols)
             if winner:
-                wm = winner.get("moe_pruning_method") or winner.get("actual_method") or "?"
-                print(f"\n  ✓ Best: {wm}  relative_delta_pct={_pct(winner.get('relative_delta_pct',''))}")
+                if winner_key:
+                    wlabel = winner.get(winner_key, "?")
+                else:
+                    wlabel = (winner.get("moe_pruning_method") or
+                               winner.get("actual_method") or "?")
+                print(f"\n  >>> {winner_prefix}: {wlabel}"
+                      f"  relative_delta_pct={_pct(winner.get('relative_delta_pct', ''))}")
             for w in warnings:
-                print(f"  ⚠  {w}")
+                print(f"  WARNING: {w}")
 
         md_sections.append(f"\n## Target: {target}%  /  Dataset: {dataset}\n")
-        md_sections.append(make_md_table(group_rows, DISPLAY_COLS))
+        md_sections.append(make_md_table(group_rows, display_cols))
         if winner:
-            wm = winner.get("moe_pruning_method") or winner.get("actual_method") or "?"
+            if winner_key:
+                wlabel = winner.get(winner_key, "?")
+            else:
+                wlabel = (winner.get("moe_pruning_method") or
+                           winner.get("actual_method") or "?")
             md_sections.append(
-                f"\n**Best:** `{wm}` — relative_delta_pct={_pct(winner.get('relative_delta_pct',''))}\n"
+                f"\n**{winner_prefix}:** `{wlabel}` —"
+                f" relative_delta_pct={_pct(winner.get('relative_delta_pct', ''))}\n"
             )
         if warnings:
             md_sections.append("\n**Warnings:**\n" + "\n".join(f"- {w}" for w in warnings) + "\n")
 
-    if all_warnings:
-        if not args.quiet:
-            print(f"\n{'═'*70}")
-            print("  WARNINGS")
-            print(f"{'═'*70}")
-            for w in all_warnings:
-                print(f"  ⚠  {w}")
+    if all_warnings and not args.quiet:
+        print(f"\n{'='*70}")
+        print("  WARNINGS")
+        print(f"{'='*70}")
+        for w in all_warnings:
+            print(f"  WARNING: {w}")
 
-    # Write summary CSV
-    all_keys = []
+    # Write summary CSV (all rows, all keys)
+    all_keys: List[str] = []
     seen_keys: set = set()
     for r in rows:
         for k in r:
@@ -312,6 +429,7 @@ def main():
     with open(md_out, "w", encoding="utf-8") as f:
         f.write("\n".join(md_sections))
     print(f"[summarize] Wrote {md_out}")
+
 
 if __name__ == "__main__":
     main()
