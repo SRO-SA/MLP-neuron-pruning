@@ -25,10 +25,11 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ── Display columns (in order) ─────────────────────────────────────────────────
 DISPLAY_COLS = [
+    "eval_dataset",            # dataset used for calibration and evaluation
     "moe_pruning_method",
     "requested_method",
     "actual_method",
@@ -77,6 +78,13 @@ def _fmt(val: str, col: str) -> str:
 
 def _get_target(row: Dict) -> str:
     return row.get("target_pct") or row.get("expert_target_pct") or "unknown"
+
+
+def _get_group_key(row: Dict) -> Tuple[str, str]:
+    """Return (target_pct_str, dataset_str) for grouping rows."""
+    target  = _get_target(row)
+    dataset = row.get("eval_dataset") or row.get("dataset") or "unknown"
+    return (target, dataset)
 
 # ── Load CSVs from manifest ────────────────────────────────────────────────────
 def load_from_manifest(manifest_path: str) -> tuple[List[Dict], List[str]]:
@@ -228,38 +236,46 @@ def main():
 
     print(f"[summarize] Loaded {len(rows)} rows.")
 
-    # Group by target
-    groups: Dict[str, List[Dict]] = defaultdict(list)
+    # Group by (target_pct, dataset)
+    groups: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
     for row in rows:
-        t = _get_target(row)
-        groups[t].append(row)
+        key = _get_group_key(row)
+        groups[key].append(row)
 
-    if "unknown" in groups:
-        print(f"[summarize] WARN: {len(groups['unknown'])} rows have unknown target_pct",
+    unknown_count = sum(
+        len(v) for k, v in groups.items() if "unknown" in k
+    )
+    if unknown_count:
+        print(f"[summarize] WARN: {unknown_count} rows have unknown target_pct or dataset",
               file=sys.stderr)
 
     all_warnings: List[str] = []
     md_sections: List[str] = ["# MoE Residual Method Sweep Summary\n"]
 
-    for target in sorted(groups, key=lambda x: _float_or_none(x) or 0):
-        target_rows = groups[target]
-        warnings = check_consistency(target_rows, target)
+    def _sort_key(k: Tuple[str, str]) -> tuple:
+        target, dataset = k
+        return (_float_or_none(target) or 0, dataset)
+
+    for (target, dataset) in sorted(groups, key=_sort_key):
+        group_rows = groups[(target, dataset)]
+        group_label = f"target={target}%  dataset={dataset}"
+        warnings = check_consistency(group_rows, group_label)
         all_warnings.extend(warnings)
-        winner = find_winner(target_rows)
+        winner = find_winner(group_rows)
 
         if not args.quiet:
             print(f"\n{'═'*70}")
-            print(f"  Target: {target}%   ({len(target_rows)} rows)")
+            print(f"  Target: {target}%   Dataset: {dataset}   ({len(group_rows)} rows)")
             print(f"{'═'*70}")
-            print_table(target_rows, DISPLAY_COLS)
+            print_table(group_rows, DISPLAY_COLS)
             if winner:
                 wm = winner.get("moe_pruning_method") or winner.get("actual_method") or "?"
                 print(f"\n  ✓ Best: {wm}  relative_delta_pct={_pct(winner.get('relative_delta_pct',''))}")
             for w in warnings:
                 print(f"  ⚠  {w}")
 
-        md_sections.append(f"\n## Target: {target}%\n")
-        md_sections.append(make_md_table(target_rows, DISPLAY_COLS))
+        md_sections.append(f"\n## Target: {target}%  /  Dataset: {dataset}\n")
+        md_sections.append(make_md_table(group_rows, DISPLAY_COLS))
         if winner:
             wm = winner.get("moe_pruning_method") or winner.get("actual_method") or "?"
             md_sections.append(

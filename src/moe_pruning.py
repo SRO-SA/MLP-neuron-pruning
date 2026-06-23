@@ -596,11 +596,21 @@ def _score_expert_moe(
     Dispatcher: returns [d_ff] importance scores for one expert.
 
     selector options:
-      "rmsnorm_bound"    – weight-only RMSNorm-bounded SwiGLU score
+      "rmsnorm_bound"    – weight-only RMSNorm-bounded SwiGLU score (default)
+      "down_norm"        – L2 norm of each down_proj column (simple baseline)
+      "random"           – uniform random scores (random baseline; caller sets seed)
       "activation_score" – activation × down-column-norm score (needs calib)
     """
     if selector == "activation_score":
         return compute_activation_scores_for_expert(expert_module, calib_inputs)
+    elif selector == "down_norm":
+        w = get_expert_weights(expert_module)
+        # down_proj: [d_model, d_ff] — column norms give per-channel importance
+        return w["down_proj"].detach().float().cpu().norm(dim=0)  # [d_ff]
+    elif selector == "random":
+        w = get_expert_weights(expert_module)
+        # Uniform random — reproducibility controlled by torch.manual_seed at call site
+        return torch.rand(w["d_ff"])
     else:
         # default: rmsnorm_bound (weight-only, no calib needed)
         return get_expert_scores(expert_module)
