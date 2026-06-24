@@ -219,17 +219,38 @@ except Exception: print("NA")
 PYSMALL
 }
 
+# Helper: read pruning method name for the label.
+# Priority: DOWNSTREAM_METHOD env (if not "unknown") > plan JSON "method" field > "pure_delete".
+_plan_method() {
+    local pf="$1"
+    if [ "${DOWNSTREAM_METHOD}" != "unknown" ] && [ -n "${DOWNSTREAM_METHOD}" ]; then
+        echo "${DOWNSTREAM_METHOD}"
+        return
+    fi
+    [ -f "${pf}" ] || { echo "pure_delete"; return; }
+    python - "${pf}" << 'PYMETHOD'
+import json, sys
+try:
+    with open(sys.argv[1]) as f: d = json.load(f)
+    m = (d.get("method") or d.get("pruning_method") or "").strip()
+    print(m if m else "pure_delete")
+except Exception: print("pure_delete")
+PYMETHOD
+}
+
 if [ "${SMOKE}" = "1" ]; then
     plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_2.0pct_align${ALIGN}.json"
     _apct="$(_plan_actual_pct "${plan}")"
-    label="${DOWNSTREAM_METHOD}__${SELECTOR}__wikitext2__target2pct__actual${_apct}pct"
-    SETTINGS+=("${label}|${plan}|${DOWNSTREAM_METHOD}|${SELECTOR}|wikitext2|2.0")
+    _meth="$(_plan_method "${plan}")"
+    label="${_meth}__${SELECTOR}__wikitext2__target2pct__actual${_apct}pct"
+    SETTINGS+=("${label}|${plan}|${_meth}|${SELECTOR}|wikitext2|2.0")
 else
     for target in 2 4 8; do
         plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
         _apct="$(_plan_actual_pct "${plan}")"
-        label="${DOWNSTREAM_METHOD}__${SELECTOR}__wikitext2__target${target}pct__actual${_apct}pct"
-        SETTINGS+=("${label}|${plan}|${DOWNSTREAM_METHOD}|${SELECTOR}|wikitext2|${target}.0")
+        _meth="$(_plan_method "${plan}")"
+        label="${_meth}__${SELECTOR}__wikitext2__target${target}pct__actual${_apct}pct"
+        SETTINGS+=("${label}|${plan}|${_meth}|${SELECTOR}|wikitext2|${target}.0")
     done
 fi
 
@@ -499,6 +520,56 @@ for setting in "${SETTINGS[@]}"; do
         fi
         eval_model="${PRUNED_MODEL_DIR}"
         echo "[eval] Pruned model saved to: ${eval_model}"
+
+        # ── Pruned model sanity checks (printed for every pruned setting) ─────
+        echo "[eval] --- Pruned model sanity checks ---"
+        python - "${PRUNED_MODEL_DIR}" "${plan}" << 'PYSANITY'
+import json, glob, os, sys
+save_dir  = sys.argv[1]
+plan_path = sys.argv[2]
+
+# Read config.json for moe_intermediate_size and hidden_size
+cfg_path = os.path.join(save_dir, "config.json")
+orig_moe = saved_moe = hidden_size = "?"
+if os.path.isfile(cfg_path):
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    saved_moe   = cfg.get("moe_intermediate_size", "?")
+    hidden_size = cfg.get("hidden_size", "?")
+
+# Recover original moe_intermediate_size from plan (old_intermediate = pre-prune d_ff)
+if os.path.isfile(plan_path):
+    try:
+        with open(plan_path) as f:
+            plan_data = json.load(f)
+        for lc in plan_data.get("layers", []):
+            old = lc.get("old_intermediate")
+            if old:
+                orig_moe = old
+                break
+    except Exception:
+        pass
+
+# Count checkpoint shards
+shard_files = (
+    glob.glob(os.path.join(save_dir, "model*.safetensors")) +
+    glob.glob(os.path.join(save_dir, "pytorch_model*.bin"))
+)
+n_shards = len(shard_files)
+
+# Derived weight shapes: gate/up are [d_ff_new, d_model], down is [d_model, d_ff_new]
+gate_shape = "[" + str(saved_moe) + ", " + str(hidden_size) + "]"
+up_shape   = "[" + str(saved_moe) + ", " + str(hidden_size) + "]"
+down_shape = "[" + str(hidden_size) + ", " + str(saved_moe) + "]"
+
+print("[eval]   pruned model path              : " + save_dir)
+print("[eval]   original moe_intermediate_size : " + str(orig_moe))
+print("[eval]   saved moe_intermediate_size    : " + str(saved_moe))
+print("[eval]   sample gate_proj.weight shape  : " + gate_shape)
+print("[eval]   sample up_proj.weight shape    : " + up_shape)
+print("[eval]   sample down_proj.weight shape  : " + down_shape)
+print("[eval]   checkpoint shards              : " + str(n_shards))
+PYSANITY
     fi
 
     # ── Optional logits-difference sanity check ───────────────────────────────
@@ -663,27 +734,27 @@ for rf in sorted(result_files):
                     "status":        "ok",
                 })
     except Exception as e:
-        print(f"[eval] WARNING: could not parse {rf}: {e}")
+        print("[eval] WARNING: could not parse {}: {}".format(rf, e))
 
 if rows:
     fields = ["setting_label", "method", "selector", "dataset", "target_pct", "actual_pct",
               "task", "metric", "value", "stderr", "num_fewshot", "model_name", "status"]
     with open(summary_csv, "a", newline="") as fh:
         csv.DictWriter(fh, fieldnames=fields).writerows(rows)
-    print(f"[eval] Appended {len(rows)} rows to {summary_csv}")
+    print("[eval] Appended {} rows to {}".format(len(rows), summary_csv))
     for r in rows:
         task_v   = r["task"]
         metric_v = r["metric"]
         value_v  = r["value"]
         stderr_v = r.get("stderr")
-        line = f"[eval]   {task_v}  {metric_v}={value_v:.4f}"
+        line = "[eval]   {}  {}={:.4f}".format(task_v, metric_v, value_v)
         if isinstance(stderr_v, float):
-            line += f"  stderr={stderr_v:.4f}"
+            line += "  stderr={:.4f}".format(stderr_v)
         print(line)
 else:
     result_files_str = str(result_files)
-    print(f"[eval] WARNING: no results parsed from {results_dir}")
-    print(f"[eval]   Files searched: {result_files_str}")
+    print("[eval] WARNING: no results parsed from {}".format(results_dir))
+    print("[eval]   Files searched: {}".format(result_files_str))
     sys.exit(1)
 PYEOF
 
