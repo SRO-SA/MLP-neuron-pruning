@@ -70,6 +70,7 @@ OUT_DIR="${RESULTS_DIR}/speed_memory_runs/${SWEEP_ID}"
 JSON_DIR="${OUT_DIR}/jsons"
 LOG_DIR="${OUT_DIR}/logs"
 OUT_CSV="${OUT_DIR}/speed_memory_results.csv"
+CKPT_DIR="${OUT_DIR}/pruned_checkpoints"
 
 echo "[speed] Speed/memory benchmark ID: ${SWEEP_ID}"
 echo "[speed] Model:  ${MODEL}"
@@ -160,7 +161,7 @@ if [ "${DRY_RUN}" = "1" ]; then
 fi
 
 # ── Create output dirs ────────────────────────────────────────────────────────
-mkdir -p "${JSON_DIR}" "${LOG_DIR}"
+mkdir -p "${JSON_DIR}" "${LOG_DIR}" "${CKPT_DIR}"
 echo "[speed] Output dir: ${OUT_DIR}"
 echo "[speed] Running ${#SETTINGS[@]} settings ..."
 
@@ -255,9 +256,43 @@ for setting in "${SETTINGS[@]}"; do
         fi
     fi
 
+    # ── Stage 1: create pruned checkpoint (skipped for baseline) ─────────────
+    pruned_ckpt=""
+    if [ "${plan_path}" != "NONE" ]; then
+        pruned_ckpt="${CKPT_DIR}/${label}"
+        echo "[speed] Stage 1: creating pruned checkpoint ..."
+        echo "[speed]   ckpt_dir : ${pruned_ckpt}"
+        set +e
+        python3 scripts/apply_moe_plan_save_checkpoint.py \
+            --model    "${MODEL}" \
+            --plan     "${plan_path}" \
+            --method   "${method}" \
+            --ckpt-dir "${pruned_ckpt}" \
+            --dtype    "${DTYPE}" \
+            --label    "${label}" \
+            2>&1 | tee "${LOG_DIR}/${label}_ckpt.log"
+        ckpt_exit="${PIPESTATUS[0]}"
+        set -e
+        if [ "${ckpt_exit}" -ne 0 ]; then
+            echo "[speed] ERROR: checkpoint creation failed for ${label} (exit ${ckpt_exit})"
+            FAILED=$(( FAILED + 1 ))
+            continue
+        fi
+        echo "[speed] Stage 1 complete: ${pruned_ckpt}"
+    fi
+
+    # ── Stage 2: benchmark from saved checkpoint (or original for baseline) ──
+    benchmark_model="${MODEL}"
+    if [ -n "${pruned_ckpt}" ]; then
+        benchmark_model="${pruned_ckpt}"
+    fi
+
     # Build Python args as an array (handles paths with spaces safely)
+    # Note: --apply-plan-inside-benchmark is NOT passed (default=False).
+    # The benchmark loads the saved pruned checkpoint directly.
     py_args=(
-        --model          "${MODEL}"
+        --model          "${benchmark_model}"
+        --base-model     "${MODEL}"
         --label          "${label}"
         --method         "${method}"
         --selector       "${selector}"
@@ -307,16 +342,20 @@ out_csv  = sys.argv[2]
 
 CSV_FIELDS = [
     "label", "method", "selector", "dataset", "target_pct", "actual_pct",
+    "loaded_model_path", "base_model_name", "pruning_plan_path",
+    "applying_plan_inside_benchmark", "mode",
+    "saved_moe_intermediate_size",
+    "sample_gate_proj_shape", "sample_up_proj_shape", "sample_down_proj_shape",
+    "num_checkpoint_shards", "checkpoint_size_gib",
     "expert_param_reduction_pct", "total_model_param_reduction_pct",
     "active_expert_flop_reduction_pct",
+    "params_before", "params_after", "n_layers_pruned",
     "prompt_len", "generated_tokens", "batch_size",
     "prefill_latency_ms_mean", "decode_latency_ms_mean",
     "end_to_end_latency_ms_mean", "tokens_per_sec_mean",
-    "peak_allocated_mib_total", "peak_reserved_mib_total",
+    "memory_after_load_allocated_mib_total", "memory_after_load_reserved_mib_total",
+    "peak_inference_allocated_mib_total", "peak_inference_reserved_mib_total",
     "peak_allocated_mib_gpu0", "peak_allocated_mib_gpu1",
-    "memory_after_load_mib_total", "memory_after_pruning_mib_total",
-    "memory_after_benchmark_mib_total",
-    "n_layers_pruned", "params_before", "params_after",
     "load_sec", "n_warmup", "n_bench",
     "model_name", "plan_path", "status",
 ]
@@ -327,7 +366,7 @@ for jf in sorted(glob.glob(os.path.join(json_dir, "*.json"))):
         with open(jf) as fh:
             rows.append(json.load(fh))
     except Exception as e:
-        print(f"[speed] WARNING: cannot parse {jf}: {e}")
+        print("[speed] WARNING: cannot parse {}: {}".format(jf, e))
 
 if not rows:
     print("[speed] WARNING: no JSON results found.")
@@ -338,43 +377,88 @@ with open(out_csv, "w", newline="") as fh:
     writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
-print(f"[speed] CSV written: {out_csv}  ({len(rows)} rows)")
+print("[speed] CSV written: {}  ({} rows)".format(out_csv, len(rows)))
 
-W_M = 34; W_S = 13; W_D = 9
-print("\n[speed] Summary  (PeakTotalMiB = sum across all GPUs)")
-hdr = (
-    f"  {'Method':<{W_M}}  {'Selector':<{W_S}}  {'Dataset':<{W_D}}"
-    f"  {'Tgt%':>5}  {'Act%':>5}  {'Prm%':>6}"
-    f"  {'Pre_ms':>8}  {'Tok/s':>7}"
-    f"  {'PkTotMiB':>9}  {'PkGPU0':>7}  {'PkGPU1':>7}"
+W_M = 34
+print("\n[speed] Summary")
+print("  LoadMiB    = memory_after_load_allocated_mib_total (model weights in GPU)")
+print("  InferPkMiB = peak_inference_allocated_mib_total (generate() only, separate peak)")
+hdr = "  {:<{W}}  {:>5}  {:>5}  {:>7}  {:>8}  {:>7}  {:>9}  {:>11}  {:>8}  {:>8}  {:<12}".format(
+    "Method", "Tgt%", "Act%", "MoeDim", "Pre_ms", "Tok/s",
+    "LoadMiB", "InferPkMiB", "GPU0MiB", "GPU1MiB", "Mode", W=W_M
 )
-print(hdr); print("  " + "-" * (len(hdr) - 2))
+print(hdr)
+print("  " + "-" * (len(hdr) - 2))
 for r in rows:
-    method = r.get("method", "?")[:W_M]
+    method = str(r.get("method", "?"))[:W_M]
     st     = r.get("status", "?")
-    if st != "ok":
-        print(f"  {method:<{W_M}}  {st}")
+    if st not in ("ok",):
+        print("  {:<{W}}  {}".format(method, st, W=W_M))
         continue
-    selctr = r.get("selector", "?")[:W_S]
-    ds     = r.get("dataset",  "?")[:W_D]
-    tgt    = r.get("target_pct", 0.0) or 0.0
-    act    = r.get("actual_pct", 0.0) or 0.0
-    pct    = r.get("total_model_param_reduction_pct", 0.0) or 0.0
-    pre    = r.get("prefill_latency_ms_mean",  float("nan"))
-    tps    = r.get("tokens_per_sec_mean",       float("nan"))
-    pk_tot = r.get("peak_allocated_mib_total",  float("nan"))
-    pk_g0  = r.get("peak_allocated_mib_gpu0",   float("nan"))
-    pk_g1  = r.get("peak_allocated_mib_gpu1",   float("nan"))
-    print(
-        f"  {method:<{W_M}}  {selctr:<{W_S}}  {ds:<{W_D}}"
-        f"  {tgt:>5.1f}  {act:>5.1f}  {pct:>6.2f}"
-        f"  {pre:>8.1f}  {tps:>7.1f}"
-        f"  {pk_tot:>9.0f}  {pk_g0:>7.0f}  {pk_g1:>7.0f}"
-    )
+    tgt      = r.get("target_pct", 0.0) or 0.0
+    act      = r.get("actual_pct", 0.0) or 0.0
+    moe_dim  = r.get("saved_moe_intermediate_size")
+    moe_str  = str(moe_dim) if moe_dim is not None else "?"
+    pre      = r.get("prefill_latency_ms_mean",               float("nan"))
+    tps      = r.get("tokens_per_sec_mean",                   float("nan"))
+    load_mib = r.get("memory_after_load_allocated_mib_total", float("nan"))
+    inf_mib  = r.get("peak_inference_allocated_mib_total",    float("nan"))
+    g0       = r.get("peak_allocated_mib_gpu0",               float("nan"))
+    g1       = r.get("peak_allocated_mib_gpu1",               float("nan"))
+    mode     = str(r.get("mode", "?"))[:12]
+    print("  {:<{W}}  {:>5.1f}  {:>5.1f}  {:>7}  {:>8.1f}  {:>7.1f}  {:>9.0f}  {:>11.0f}  {:>8.0f}  {:>8.0f}  {:<12}".format(
+        method, tgt, act, moe_str, pre, tps, load_mib, inf_mib, g0, g1, mode, W=W_M
+    ))
 print()
 PYEOF
 
-# ── Final report ─────────────────────────────────────────────────────────────
+# -- Validate pruned rows: must load saved checkpoints, not original model ------
+echo ""
+echo "[speed] Validating result JSONs ..."
+python3 - "${JSON_DIR}" "${MODEL}" << 'PY_VALIDATE'
+import json, os, glob, sys
+
+json_dir       = sys.argv[1]
+original_model = sys.argv[2]
+
+failed = 0
+for jf in sorted(glob.glob(os.path.join(json_dir, "*.json"))):
+    try:
+        with open(jf) as f:
+            r = json.load(f)
+    except Exception as e:
+        print("[speed] WARNING: cannot read {}: {}".format(jf, e))
+        continue
+    if r.get("status") in ("dry_run",):
+        continue
+    plan = r.get("pruning_plan_path", "") or r.get("plan_path", "")
+    if not plan:
+        continue  # baseline -- skip
+    label  = r.get("label", os.path.basename(jf))
+    loaded = r.get("loaded_model_path", "")
+    if loaded == original_model:
+        print("[speed] FAIL: {}: loaded original model instead of saved checkpoint".format(label))
+        failed += 1
+    if r.get("applying_plan_inside_benchmark", False):
+        print("[speed] FAIL: {}: applying_plan_inside_benchmark=True in default mode".format(label))
+        failed += 1
+    moe_dim = r.get("saved_moe_intermediate_size")
+    if moe_dim is not None and moe_dim == 768:
+        print("[speed] WARN: {}: saved_moe_intermediate_size=768 -- checkpoint may not be pruned".format(label))
+
+if failed:
+    print("[speed] Validation FAILED: {} issue(s)".format(failed))
+    sys.exit(1)
+print("[speed] Validation OK: all pruned rows use saved checkpoints")
+PY_VALIDATE
+
+validate_exit="${PIPESTATUS[0]}"
+if [ "${validate_exit}" -ne 0 ]; then
+    echo "[speed] ERROR: result validation failed."
+    FAILED=$(( FAILED + 1 ))
+fi
+
+# -- Final report ---------------------------------------------------------------
 echo ""
 echo "[speed] BENCHMARK COMPLETE  (id=${SWEEP_ID})"
 echo "[speed]   Succeeded : ${SUCCEEDED}"
@@ -382,6 +466,7 @@ echo "[speed]   Skipped   : ${SKIPPED}  (missing plans)"
 echo "[speed]   Failed    : ${FAILED}"
 echo "[speed]   CSV       : ${OUT_CSV}"
 echo "[speed]   Logs      : ${LOG_DIR}/"
+echo "[speed]   Checkpts  : ${CKPT_DIR}/"
 echo "[speed]   Memory    : each setting ran in a separate Python process."
 echo ""
 
