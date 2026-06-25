@@ -59,6 +59,11 @@ MODEL_MOE_DIM="${MODEL_MOE_DIM:-768}"
 MOE_ALIGN="${MOE_ALIGN:-16}"
 SUMMARIZE_ONLY="${SUMMARIZE_ONLY:-0}"
 RUN_DIR="${RUN_DIR:-}"
+ONLY_METHODS="${ONLY_METHODS:-}"
+ONLY_TARGETS="${ONLY_TARGETS:-}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
+AUTO_GENERATE_PLAN="${AUTO_GENERATE_PLAN:-0}"
+CONFIG_PREFIX="$(echo "${MODEL}" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -84,9 +89,15 @@ if [ "${SMOKE}" = "1" ]; then
     LIMIT_ARGS="--limit ${SMOKE_LIMIT}"
 fi
 
-# ── Sweep ID ──────────────────────────────────────────────────────────────────
-SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${RESULTS_DIR}/downstream_eval_runs/${SWEEP_ID}"
+# ── Sweep ID / Run directory ───────────────────────────────────────────────────
+if [ -n "${RUN_DIR}" ] && [ "${SUMMARIZE_ONLY}" != "1" ]; then
+    OUT_DIR="${RUN_DIR}"
+    SWEEP_ID="$(basename "${RUN_DIR}")"
+    echo "[eval] RUN_DIR set: reusing existing run directory ${OUT_DIR}"
+else
+    SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
+    OUT_DIR="${RESULTS_DIR}/downstream_eval_runs/${SWEEP_ID}"
+fi
 SUMMARY_CSV="${OUT_DIR}/downstream_summary.csv"
 PRUNED_MODEL_DIR="${OUT_DIR}/pruned_model_tmp"
 
@@ -244,6 +255,49 @@ except Exception: print("pure_delete")
 PYMETHOD
 }
 
+# ── Helper: check if a setting already has lm_eval JSON output ───────────────
+_setting_has_output() {
+    local _lbl="$1"
+    local _lm_out="${OUT_DIR}/${_lbl}_lm_eval"
+    if [ -d "${_lm_out}" ] && [ "$(find "${_lm_out}" -name "*.json" 2>/dev/null | wc -l)" -gt "0" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# ── Helper: apply ONLY_METHODS / ONLY_TARGETS filter ─────────────────────────
+# Returns 0 (pass) or 1 (filtered out).
+# Baseline (method=baseline) always passes.
+_setting_passes_filter() {
+    local _fm="$1"
+    local _ft="$2"   # target_pct string, e.g. "2.0" or "6.0"
+
+    [ "${_fm}" = "baseline" ] && return 0
+
+    if [ -n "${ONLY_METHODS}" ]; then
+        local _found=0
+        local _om
+        IFS=',' read -ra _oms <<< "${ONLY_METHODS}"
+        for _om in "${_oms[@]}"; do
+            [ "${_om}" = "${_fm}" ] && _found=1 && break
+        done
+        [ "${_found}" = "0" ] && return 1
+    fi
+
+    if [ -n "${ONLY_TARGETS}" ]; then
+        local _tint="${_ft%%.*}"   # "2.0" -> "2"
+        local _found=0
+        local _ot
+        IFS=',' read -ra _ots <<< "${ONLY_TARGETS}"
+        for _ot in "${_ots[@]}"; do
+            [ "${_ot}" = "${_tint}" ] && _found=1 && break
+        done
+        [ "${_found}" = "0" ] && return 1
+    fi
+
+    return 0
+}
+
 if [ "${SMOKE}" = "1" ]; then
     plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_2.0pct_align${ALIGN}.json"
     _apct="$(_plan_actual_pct "${plan}")"
@@ -279,19 +333,37 @@ fi
 if [ "${DRY_RUN}" = "1" ]; then
     echo ""
     echo "[eval] Planned settings (${#SETTINGS[@]} total):"
+    [ -n "${RUN_DIR}" ] && [ -d "${OUT_DIR}" ] && echo "[eval] RUN_DIR: reusing ${OUT_DIR}"
+    [ -n "${ONLY_METHODS}" ] && echo "[eval] ONLY_METHODS filter : ${ONLY_METHODS}"
+    [ -n "${ONLY_TARGETS}" ] && echo "[eval] ONLY_TARGETS filter : ${ONLY_TARGETS}"
+    [ "${SKIP_EXISTING}" = "1" ] && echo "[eval] SKIP_EXISTING=1: completed settings will be skipped"
     n=0
     for setting in "${SETTINGS[@]}"; do
         n=$(( n + 1 ))
         IFS='|' read -r label plan method selector dataset target_pct <<< "${setting}"
-        exists=""
-        if [ "${plan}" = "NONE" ]; then
-            exists="(baseline)"
-        elif [ -f "${plan}" ]; then
-            exists="[plan exists]"
-        else
-            exists="[PLAN MISSING -- run full benchmark first]"
+        if ! _setting_passes_filter "${method}" "${target_pct}"; then
+            printf "  %2d. %-65s  [filtered]\n" "${n}" "${label}"
+            continue
         fi
-        printf "  %2d. %-45s  method=%-8s  %s\n" "${n}" "${label}" "${method}" "${exists}"
+        _dr_skip=""
+        if [ "${SKIP_EXISTING}" = "1" ] && _setting_has_output "${label}"; then
+            _dr_skip="[SKIP: output exists]"
+        fi
+        _dr_plan=""
+        if [ "${plan}" = "NONE" ]; then
+            _dr_plan="(baseline)"
+        elif [ -f "${plan}" ]; then
+            _dr_plan="[plan ok]"
+        elif [ "${AUTO_GENERATE_PLAN}" = "1" ]; then
+            _dr_plan="[plan missing → auto-generate]"
+        else
+            _dr_plan="[PLAN MISSING]"
+        fi
+        if [ -n "${_dr_skip}" ]; then
+            printf "  %2d. %-65s  %s\n" "${n}" "${label}" "${_dr_skip}"
+        else
+            printf "  %2d. %-65s  %-35s → RUN\n" "${n}" "${label}" "${_dr_plan}"
+        fi
     done
     echo ""
     echo "[eval] Tasks: ${TASKS}"
@@ -300,7 +372,6 @@ if [ "${DRY_RUN}" = "1" ]; then
     fi
     echo ""
     echo "[eval] DRY_RUN complete."
-    echo "[eval] To run: bash scripts/run_moe_downstream_eval.sh"
     echo "[eval] Missing plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
     exit 0
 fi
@@ -516,11 +587,14 @@ print("[apply_plan] Done.")
 PYEOF
 }
 
-# ── Write CSV header ──────────────────────────────────────────────────────────
+# ── Write CSV header (skip if already exists — RUN_DIR append mode) ──────────
 python - "${SUMMARY_CSV}" << 'PYEOF'
 import csv, os, sys
 out_path = sys.argv[1]
 os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+if os.path.isfile(out_path):
+    print("[eval] CSV exists (append mode): " + out_path)
+    sys.exit(0)
 fields = [
     "setting_label", "method", "selector", "dataset",
     "target_pct", "actual_pct", "moe_dim",
@@ -531,7 +605,7 @@ fields = [
 ]
 with open(out_path, "w", newline="") as fh:
     csv.DictWriter(fh, fieldnames=fields).writeheader()
-print(f"[eval] CSV header written: {out_path}")
+print("[eval] CSV header written: " + out_path)
 PYEOF
 
 # ── Run each setting ──────────────────────────────────────────────────────────
@@ -542,6 +616,19 @@ for setting in "${SETTINGS[@]}"; do
     IFS='|' read -r label plan method selector dataset target_pct <<< "${setting}"
     out_json="${OUT_DIR}/${label}.json"
     log_file="${OUT_DIR}/${label}.log"
+
+    # ── Filter by ONLY_METHODS / ONLY_TARGETS ────────────────────────────────
+    if ! _setting_passes_filter "${method}" "${target_pct}"; then
+        echo "[eval] Skipping (filtered): ${label}"
+        continue
+    fi
+
+    # ── SKIP_EXISTING: skip settings that already have output ─────────────────
+    if [ "${SKIP_EXISTING}" = "1" ] && _setting_has_output "${label}"; then
+        echo "[eval] Skipping (output exists): ${label}"
+        SUCCEEDED=$(( SUCCEEDED + 1 ))
+        continue
+    fi
 
     echo ""
     echo "================================================================"
@@ -554,10 +641,42 @@ for setting in "${SETTINGS[@]}"; do
         echo "[eval] Using baseline model (no pruning)."
     else
         if [ ! -f "${plan}" ]; then
-            echo "[eval] ERROR: plan not found: ${plan}"
-            echo "[eval]   Generate plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
-            FAILED=$(( FAILED + 1 ))
-            continue
+            if [ "${AUTO_GENERATE_PLAN}" = "1" ]; then
+                _local_target_int="${target_pct%%.*}"
+                _local_cfg="configs/moe_selector_baseline/${CONFIG_PREFIX}_wikitext2_n${N_EVAL}_target${_local_target_int}_sel_${SELECTOR}.yaml"
+                echo "[eval] AUTO_GENERATE_PLAN=1: plan missing, generating ..."
+                echo "[eval]   Config: ${_local_cfg}"
+                echo "[eval]   Plan  : ${plan}"
+                if [ ! -f "${_local_cfg}" ]; then
+                    echo "[eval]   Config not found; running generate_moe_selector_baseline_configs.py ..."
+                    python3 scripts/generate_moe_selector_baseline_configs.py || {
+                        echo "[eval] ERROR: failed to generate selector-baseline configs."
+                        FAILED=$(( FAILED + 1 ))
+                        continue
+                    }
+                fi
+                if [ ! -f "${_local_cfg}" ]; then
+                    echo "[eval] ERROR: config still missing: ${_local_cfg}"
+                    FAILED=$(( FAILED + 1 ))
+                    continue
+                fi
+                set +e
+                python3 run_experiment.py                     --config "${_local_cfg}"                     --moe-target-pruning                     2>&1 | tee "${OUT_DIR}/${label}_plan_gen.log"
+                _gen_exit="${PIPESTATUS[0]}"
+                set -e
+                if [ "${_gen_exit}" -ne 0 ] || [ ! -f "${plan}" ]; then
+                    echo "[eval] ERROR: plan generation failed for ${label}"
+                    FAILED=$(( FAILED + 1 ))
+                    continue
+                fi
+                echo "[eval] Plan generated: ${plan}"
+            else
+                echo "[eval] ERROR: plan not found: ${plan}"
+                echo "[eval]   Generate plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
+                echo "[eval]   Or retry with: AUTO_GENERATE_PLAN=1"
+                FAILED=$(( FAILED + 1 ))
+                continue
+            fi
         fi
         echo "[eval] Applying pruning plan: ${plan}"
         rm -rf "${PRUNED_MODEL_DIR}"
