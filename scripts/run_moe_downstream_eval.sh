@@ -53,6 +53,12 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 SMOKE_LIMIT="${SMOKE_LIMIT:-50}"
 CHECK_LOGITS_DIFF="${CHECK_LOGITS_DIFF:-0}"
 DOWNSTREAM_METHOD="${DOWNSTREAM_METHOD:-unknown}"
+INCLUDE_RESIDUAL="${INCLUDE_RESIDUAL:-0}"
+RESIDUAL_METHOD="${RESIDUAL_METHOD:-residual_nearest_channel_merge_moe}"
+MODEL_MOE_DIM="${MODEL_MOE_DIM:-768}"
+MOE_ALIGN="${MOE_ALIGN:-16}"
+SUMMARIZE_ONLY="${SUMMARIZE_ONLY:-0}"
+RUN_DIR="${RUN_DIR:-}"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -245,13 +251,28 @@ if [ "${SMOKE}" = "1" ]; then
     label="${_meth}__${SELECTOR}__wikitext2__target2pct__actual${_apct}pct"
     SETTINGS+=("${label}|${plan}|${_meth}|${SELECTOR}|wikitext2|2.0")
 else
-    for target in 2 4 8; do
+    for target in 2 4 6 8; do
         plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
         _apct="$(_plan_actual_pct "${plan}")"
         _meth="$(_plan_method "${plan}")"
         label="${_meth}__${SELECTOR}__wikitext2__target${target}pct__actual${_apct}pct"
         SETTINGS+=("${label}|${plan}|${_meth}|${SELECTOR}|wikitext2|${target}.0")
     done
+fi
+
+# ── Optional residual settings (INCLUDE_RESIDUAL=1) ─────────────────────────
+if [ "${INCLUDE_RESIDUAL}" = "1" ] && [ "${SMOKE}" != "1" ]; then
+    echo "[eval] INCLUDE_RESIDUAL=1: adding residual settings (2%, 4%, 6%, 8%)"
+    for target in 2 4 6 8; do
+        r_plan="${PLAN_DIR}/${MODEL_SLUG}_wikitext2_n${N_EVAL}_calib${CALIB_N}_${SELECTOR}_${AGG_MODE}_${target}.0pct_align${ALIGN}.json"
+        _rapct="$(_plan_actual_pct "${r_plan}")"
+        r_label="${RESIDUAL_METHOD}__${SELECTOR}__wikitext2__target${target}pct__actual${_rapct}pct"
+        SETTINGS+=("${r_label}|${r_plan}|${RESIDUAL_METHOD}|${SELECTOR}|wikitext2|${target}.0")
+    done
+else
+    if [ "${SMOKE}" != "1" ]; then
+        echo "[eval] INCLUDE_RESIDUAL=0: residual settings skipped (set INCLUDE_RESIDUAL=1 to enable)"
+    fi
 fi
 
 # ── DRY_RUN: list settings and exit ──────────────────────────────────────────
@@ -282,6 +303,27 @@ if [ "${DRY_RUN}" = "1" ]; then
     echo "[eval] To run: bash scripts/run_moe_downstream_eval.sh"
     echo "[eval] Missing plans: bash scripts/run_moe_residual_selected_full_benchmark.sh"
     exit 0
+fi
+
+# ── SUMMARIZE_ONLY mode: rebuild summaries from existing lm_eval outputs ────────
+if [ "${SUMMARIZE_ONLY}" = "1" ]; then
+    if [ -z "${RUN_DIR}" ]; then
+        echo "[eval] ERROR: SUMMARIZE_ONLY=1 requires RUN_DIR=<run_dir_path>"
+        exit 1
+    fi
+    if [ ! -d "${RUN_DIR}" ]; then
+        echo "[eval] ERROR: RUN_DIR not found: ${RUN_DIR}"
+        exit 1
+    fi
+    echo "[eval] SUMMARIZE_ONLY=1: rebuilding summaries from ${RUN_DIR} ..."
+    python3 scripts/downstream_eval_summarize.py \
+        --run-dir    "${RUN_DIR}" \
+        --summarize-only \
+        --plan-dir   "${PLAN_DIR}" \
+        --orig-moe-dim "${MODEL_MOE_DIM}" \
+        --moe-align  "${MOE_ALIGN}" \
+        --model      "${MODEL}"
+    exit $?
 fi
 
 # ── Require lm_eval -- exit 2 if missing ─────────────────────────────────────
@@ -479,8 +521,14 @@ python - "${SUMMARY_CSV}" << 'PYEOF'
 import csv, os, sys
 out_path = sys.argv[1]
 os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-fields = ["setting_label", "method", "selector", "dataset", "target_pct", "actual_pct",
-          "task", "metric", "value", "stderr", "num_fewshot", "model_name", "status"]
+fields = [
+    "setting_label", "method", "selector", "dataset",
+    "target_pct", "actual_pct", "moe_dim",
+    "expert_param_reduction_pct", "total_model_param_reduction_pct",
+    "pruning_plan_path", "model_path", "is_pruned",
+    "task", "metric", "value", "stderr",
+    "num_fewshot", "limit", "batch_size", "status",
+]
 with open(out_path, "w", newline="") as fh:
     csv.DictWriter(fh, fieldnames=fields).writeheader()
 print(f"[eval] CSV header written: {out_path}")
@@ -672,30 +720,57 @@ PYLOGITS
         continue
     fi
 
-    # Parse lm_eval JSON results (recursive search) and append to summary CSV
+    # Parse lm_eval JSON results and append to summary CSV
+    _limit_now="none"
+    [ "${SMOKE}" = "1" ] && _limit_now="${SMOKE_LIMIT}"
     python - "${lm_out}" "${label}" "${plan}" \
         "${MODEL}" "${NUM_FEWSHOT}" "${SUMMARY_CSV}" \
-        "${method}" "${selector}" "${dataset}" "${target_pct}" << 'PYEOF'
+        "${method}" "${selector}" "${dataset}" "${target_pct}" \
+        "${eval_model}" "${_limit_now}" "${BATCH_SIZE}" \
+        "${MODEL_MOE_DIM}" "${MOE_ALIGN}" << 'PYEOF'
 import csv, json, os, sys, glob
 
 (results_dir, label, plan, model_name,
  num_fewshot, summary_csv,
- method, selector, dataset, target_pct) = sys.argv[1:11]
+ method, selector, dataset, target_pct,
+ eval_model_dir, limit_val, batch_size_val,
+ orig_moe_dim_str, moe_align_str) = sys.argv[1:16]
 
-# Compute actual_pct from plan JSON (reliable, plan-side ground truth)
+orig_moe_dim = int(orig_moe_dim_str)
+moe_align    = int(moe_align_str)
+is_pruned    = (plan != "NONE")
+
+# Compute actual_pct from plan JSON
 actual_pct = 0.0
-if plan != "NONE" and os.path.isfile(plan):
+if is_pruned and os.path.isfile(plan):
     try:
         with open(plan) as pf:
             plan_data = json.load(pf)
-        total  = sum(lcfg.get("old_intermediate", 0) for lcfg in plan_data.get("layers", []))
-        pruned = sum(len(lcfg.get("prune_idx", []))   for lcfg in plan_data.get("layers", []))
+        total  = sum(lc.get("old_intermediate", 0) for lc in plan_data.get("layers", []))
+        pruned = sum(len(lc.get("prune_idx", []))   for lc in plan_data.get("layers", []))
         if total > 0:
             actual_pct = round(100.0 * pruned / total, 3)
     except Exception as e:
-        print(f"[eval] WARNING: cannot compute actual_pct from plan: {e}")
+        print("[eval] WARNING: cannot compute actual_pct: " + str(e))
 
-# Find lm_eval JSON output recursively (location varies by lm_eval version)
+# Infer moe_dim: prefer saved config.json, else compute from actual_pct
+moe_dim = orig_moe_dim
+if is_pruned:
+    cfg_path = os.path.join(eval_model_dir, "config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path) as cf:
+                cfg = json.load(cf)
+            moe_dim = cfg.get("moe_intermediate_size", orig_moe_dim)
+        except Exception:
+            pass
+    if moe_dim == orig_moe_dim and actual_pct > 0:
+        pruned_n = round(orig_moe_dim * actual_pct / 100.0 / moe_align) * moe_align
+        moe_dim  = max(0, orig_moe_dim - pruned_n)
+
+expert_pct = actual_pct if is_pruned else 0.0
+
+# Find lm_eval JSON output recursively
 result_files = glob.glob(os.path.join(results_dir, "**/*.json"), recursive=True)
 result_files = list(set(result_files))
 
@@ -709,52 +784,58 @@ for rf in sorted(result_files):
             continue
         for task, metrics in results.items():
             for metric_key, val in metrics.items():
-                # Skip stderr entries -- we look them up separately
                 if "_stderr," in metric_key:
                     continue
                 if not (metric_key.endswith(",none") or metric_key == "acc"):
                     continue
-                metric = metric_key.replace(",none", "")
-                # Corresponding stderr key
+                metric     = metric_key.replace(",none", "")
                 stderr_key = metric + "_stderr,none"
-                stderr = metrics.get(stderr_key, "")
+                stderr     = metrics.get(stderr_key, "")
                 rows.append({
-                    "setting_label": label,
-                    "method":        method,
-                    "selector":      selector,
-                    "dataset":       dataset,
-                    "target_pct":    target_pct,
-                    "actual_pct":    actual_pct,
-                    "task":          task,
-                    "metric":        metric,
-                    "value":         val,
-                    "stderr":        stderr,
-                    "num_fewshot":   num_fewshot,
-                    "model_name":    model_name,
-                    "status":        "ok",
+                    "setting_label":                  label,
+                    "method":                         method,
+                    "selector":                       selector,
+                    "dataset":                        dataset,
+                    "target_pct":                     target_pct,
+                    "actual_pct":                     actual_pct,
+                    "moe_dim":                        moe_dim,
+                    "expert_param_reduction_pct":     expert_pct,
+                    "total_model_param_reduction_pct": "NA",
+                    "pruning_plan_path":              plan if is_pruned else "NONE",
+                    "model_path":                     eval_model_dir,
+                    "is_pruned":                      str(is_pruned),
+                    "task":                           task,
+                    "metric":                         metric,
+                    "value":                          val,
+                    "stderr":                         stderr,
+                    "num_fewshot":                    num_fewshot,
+                    "limit":                          limit_val,
+                    "batch_size":                     batch_size_val,
+                    "status":                         "ok",
                 })
     except Exception as e:
         print("[eval] WARNING: could not parse {}: {}".format(rf, e))
 
 if rows:
-    fields = ["setting_label", "method", "selector", "dataset", "target_pct", "actual_pct",
-              "task", "metric", "value", "stderr", "num_fewshot", "model_name", "status"]
+    fields = [
+        "setting_label", "method", "selector", "dataset",
+        "target_pct", "actual_pct", "moe_dim",
+        "expert_param_reduction_pct", "total_model_param_reduction_pct",
+        "pruning_plan_path", "model_path", "is_pruned",
+        "task", "metric", "value", "stderr",
+        "num_fewshot", "limit", "batch_size", "status",
+    ]
     with open(summary_csv, "a", newline="") as fh:
-        csv.DictWriter(fh, fieldnames=fields).writerows(rows)
+        csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore").writerows(rows)
     print("[eval] Appended {} rows to {}".format(len(rows), summary_csv))
     for r in rows:
-        task_v   = r["task"]
-        metric_v = r["metric"]
-        value_v  = r["value"]
-        stderr_v = r.get("stderr")
-        line = "[eval]   {}  {}={:.4f}".format(task_v, metric_v, value_v)
-        if isinstance(stderr_v, float):
-            line += "  stderr={:.4f}".format(stderr_v)
+        line = "[eval]   {}  {}={:.4f}".format(r["task"], r["metric"], float(r["value"]))
+        if isinstance(r.get("stderr"), float):
+            line += "  stderr={:.4f}".format(r["stderr"])
         print(line)
 else:
-    result_files_str = str(result_files)
-    print("[eval] WARNING: no results parsed from {}".format(results_dir))
-    print("[eval]   Files searched: {}".format(result_files_str))
+    print("[eval] WARNING: no results parsed from " + results_dir)
+    print("[eval]   Files searched: " + str(result_files))
     sys.exit(1)
 PYEOF
 
@@ -773,6 +854,18 @@ PYEOF
         rm -rf "${PRUNED_MODEL_DIR}"
     fi
 done
+
+# ── Build comparison summary ─────────────────────────────────────────────────
+if [ "${SUCCEEDED}" -gt 0 ]; then
+    echo "[eval] Building comparison summary ..."
+    python3 scripts/downstream_eval_summarize.py \
+        --run-dir    "${OUT_DIR}" \
+        --plan-dir   "${PLAN_DIR}" \
+        --orig-moe-dim "${MODEL_MOE_DIM}" \
+        --moe-align  "${MOE_ALIGN}" \
+        --model      "${MODEL}" \
+        2>&1 || echo "[eval] WARNING: comparison summary step failed (non-fatal)"
+fi
 
 # -- Final summary -----------------------------------------------------------
 echo ""
