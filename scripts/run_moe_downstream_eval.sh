@@ -64,6 +64,7 @@ ONLY_TARGETS="${ONLY_TARGETS:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 AUTO_GENERATE_PLAN="${AUTO_GENERATE_PLAN:-0}"
 CONFIG_PREFIX="$(echo "${MODEL}" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+CLEANUP_CHECKPOINTS="${CLEANUP_CHECKPOINTS:-0}"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -99,7 +100,7 @@ else
     OUT_DIR="${RESULTS_DIR}/downstream_eval_runs/${SWEEP_ID}"
 fi
 SUMMARY_CSV="${OUT_DIR}/downstream_summary.csv"
-PRUNED_MODEL_DIR="${OUT_DIR}/pruned_model_tmp"
+CKPT_BASE_DIR="${OUT_DIR}/pruned_checkpoints"
 
 echo "[eval] Downstream eval ID: ${SWEEP_ID}"
 echo "[eval] Model:  ${MODEL}"
@@ -429,164 +430,6 @@ fi
 mkdir -p "${OUT_DIR}"
 echo "[eval] Output dir: ${OUT_DIR}"
 
-# ── Helper: apply pruning plan, update config, save pruned model ──────────────
-apply_and_save_pruned_model() {
-    local plan_path="$1"
-    local save_dir="$2"
-    python - "${MODEL}" "${plan_path}" "${save_dir}" "${DTYPE}" << 'PYEOF'
-import sys, json, torch, torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model_name, plan_path, save_dir, dtype_str = sys.argv[1:5]
-dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-dtype = dtype_map.get(dtype_str, torch.bfloat16)
-
-print(f"[apply_plan] Loading model {model_name} ...")
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=dtype, device_map="cpu", trust_remote_code=True
-)
-model.eval()
-
-print(f"[apply_plan] Loading plan {plan_path} ...")
-with open(plan_path) as fh:
-    plan = json.load(fh)
-
-# Find the transformer layer list
-layer_list = None
-for attr in ("model", "transformer"):
-    sub = getattr(model, attr, None)
-    if sub is not None:
-        for la in ("layers", "h", "blocks"):
-            ll = getattr(sub, la, None)
-            if ll is not None:
-                layer_list = ll
-                break
-    if layer_list is not None:
-        break
-
-if layer_list is None:
-    sys.exit("ERROR: cannot find layer list in model")
-
-# Apply pruning
-n_pruned = 0
-for lcfg in plan.get("layers", []):
-    li        = lcfg["layer_idx"]
-    prune_idx = lcfg["prune_idx"]
-    old_d_ff  = lcfg["old_intermediate"]
-    if not prune_idx:
-        continue
-    keep = torch.ones(old_d_ff, dtype=torch.bool)
-    keep[prune_idx] = False
-    layer = layer_list[li]
-    mlp   = getattr(layer, "mlp", None)
-    if mlp is None:
-        continue
-    experts = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
-    with torch.no_grad():
-        for expert in experts:
-            gate = getattr(expert, "gate_proj", None)
-            up   = getattr(expert, "up_proj",   None)
-            down = getattr(expert, "down_proj",  None)
-            if gate is None or up is None or down is None:
-                continue
-            gate.weight = nn.Parameter(gate.weight[keep, :].contiguous())
-            up.weight   = nn.Parameter(up.weight[keep, :].contiguous())
-            down.weight = nn.Parameter(down.weight[:, keep].contiguous())
-    n_pruned += 1
-
-print(f"[apply_plan] Pruned {n_pruned} layers.")
-
-# --- Detect new MoE intermediate size from expert weights ---
-all_sizes = set()
-for layer in layer_list:
-    mlp     = getattr(layer, "mlp", None)
-    if mlp is None:
-        continue
-    experts = getattr(mlp, "experts", None)
-    if experts is None:
-        continue
-    for expert in experts:
-        down = getattr(expert, "down_proj", None)
-        if down is not None:
-            all_sizes.add(down.weight.shape[1])
-
-new_size = None
-if not all_sizes:
-    print("[apply_plan] WARNING: no MoE experts found, skipping config update")
-elif len(all_sizes) > 1:
-    sys.exit(
-        f"ERROR: pruned MoE has non-uniform expert sizes: {sorted(all_sizes)}. "
-        "Vanilla HF reload requires a uniform moe_intermediate_size. "
-        "Use moe_budget_mode=uniform or evaluate in-memory."
-    )
-else:
-    orig_moe = getattr(model.config, "moe_intermediate_size", None)
-    new_size  = list(all_sizes)[0]
-    print(f"[apply_plan] original moe_intermediate_size={orig_moe}")
-    print(f"[apply_plan] new uniform moe_intermediate_size={new_size}")
-    model.config.moe_intermediate_size = new_size
-
-    # Print sample expert weight shapes for verification (all three projections)
-    for layer in layer_list:
-        mlp     = getattr(layer, "mlp", None)
-        experts = getattr(mlp, "experts", None) if mlp else None
-        if experts:
-            exp0 = experts[0]
-            gate = getattr(exp0, "gate_proj", None)
-            up   = getattr(exp0, "up_proj",   None)
-            down = getattr(exp0, "down_proj",  None)
-            if gate is not None:
-                print(f"[apply_plan] sample gate_proj shape ={list(gate.weight.shape)}")
-            if up is not None:
-                print(f"[apply_plan] sample up_proj shape   ={list(up.weight.shape)}")
-            if down is not None:
-                print(f"[apply_plan] sample down_proj shape ={list(down.weight.shape)}")
-            break
-    print("[apply_plan] forward_check=True")
-
-# Save
-print(f"[apply_plan] Saving to {save_dir} ...")
-model.save_pretrained(save_dir, safe_serialization=True)
-tokenizer.save_pretrained(save_dir)
-print("[apply_plan] Save complete.")
-
-# Config sanity check: read back config.json and verify the stored size
-import pathlib, glob as _glob
-cfg_path = pathlib.Path(save_dir) / "config.json"
-if cfg_path.exists():
-    import json as _json
-    with open(cfg_path) as _f:
-        _cfg = _json.load(_f)
-    saved_moe = _cfg.get("moe_intermediate_size", "NOT_FOUND")
-    print(f"[apply_plan] saved moe_intermediate_size={saved_moe}")
-    if new_size is not None and saved_moe != new_size:
-        sys.exit(f"ERROR: config sanity failed: saved={saved_moe}, expected={new_size}")
-    print("[apply_plan] Config sanity OK")
-else:
-    print("[apply_plan] WARNING: config.json not found after save")
-
-# Count checkpoint shards
-shard_files = (
-    _glob.glob(str(pathlib.Path(save_dir) / "model*.safetensors")) +
-    _glob.glob(str(pathlib.Path(save_dir) / "pytorch_model*.bin"))
-)
-print(f"[apply_plan] checkpoint shards: {len(shard_files)}")
-
-# AutoConfig reload verification
-from transformers import AutoConfig as _AutoCfg
-print("[apply_plan] Verifying with AutoConfig.from_pretrained ...")
-loaded_cfg = _AutoCfg.from_pretrained(save_dir, trust_remote_code=True)
-loaded_moe = getattr(loaded_cfg, "moe_intermediate_size", None)
-print(f"[apply_plan] AutoConfig moe_intermediate_size={loaded_moe}")
-if new_size is not None and loaded_moe != new_size:
-    sys.exit(f"ERROR: AutoConfig mismatch: loaded={loaded_moe}, expected={new_size}")
-print("[apply_plan] AutoConfig reload: OK")
-
-print("[apply_plan] Done.")
-PYEOF
-}
-
 # ── Write CSV header (skip if already exists — RUN_DIR append mode) ──────────
 python - "${SUMMARY_CSV}" << 'PYEOF'
 import csv, os, sys
@@ -600,6 +443,7 @@ fields = [
     "target_pct", "actual_pct", "moe_dim",
     "expert_param_reduction_pct", "total_model_param_reduction_pct",
     "pruning_plan_path", "model_path", "is_pruned",
+    "requested_method", "actual_method", "residual_applied", "residual_fallback_used",
     "task", "metric", "value", "stderr",
     "num_fewshot", "limit", "batch_size", "status",
 ]
@@ -678,34 +522,67 @@ for setting in "${SETTINGS[@]}"; do
                 continue
             fi
         fi
-        echo "[eval] Applying pruning plan: ${plan}"
-        rm -rf "${PRUNED_MODEL_DIR}"
-        if ! apply_and_save_pruned_model "${plan}" "${PRUNED_MODEL_DIR}"; then
-            echo "[eval] ERROR: plan application/save failed for ${label}"
+        SETTING_CKPT_DIR="${CKPT_BASE_DIR}/${label}"
+        echo "[eval] Applying pruning plan (method=${method}): ${plan}"
+        mkdir -p "${CKPT_BASE_DIR}"
+        set +e
+        python3 scripts/apply_moe_plan_save_checkpoint.py \
+            --model    "${MODEL}" \
+            --plan     "${plan}" \
+            --method   "${method}" \
+            --ckpt-dir "${SETTING_CKPT_DIR}" \
+            --dtype    "${DTYPE}" \
+            --label    "${label}" \
+            --calib-n  64 \
+            2>&1 | tee "${OUT_DIR}/${label}_apply.log"
+        _apply_exit="${PIPESTATUS[0]}"
+        set -e
+        if [ "${_apply_exit}" -ne 0 ]; then
+            echo "[eval] ERROR: checkpoint creation failed for ${label} (exit ${_apply_exit})"
             FAILED=$(( FAILED + 1 ))
             continue
         fi
-        eval_model="${PRUNED_MODEL_DIR}"
+        eval_model="${SETTING_CKPT_DIR}"
         echo "[eval] Pruned model saved to: ${eval_model}"
 
-        # ── Pruned model sanity checks (printed for every pruned setting) ─────
+        # ── Pruned model sanity checks (read pruning_metadata.json) ──────────
         echo "[eval] --- Pruned model sanity checks ---"
-        python - "${PRUNED_MODEL_DIR}" "${plan}" << 'PYSANITY'
+        python - "${SETTING_CKPT_DIR}" "${plan}" << 'PYSANITY'
 import json, glob, os, sys
 save_dir  = sys.argv[1]
 plan_path = sys.argv[2]
 
-# Read config.json for moe_intermediate_size and hidden_size
+pm_path  = os.path.join(save_dir, "pruning_metadata.json")
 cfg_path = os.path.join(save_dir, "config.json")
 orig_moe = saved_moe = hidden_size = "?"
-if os.path.isfile(cfg_path):
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    saved_moe   = cfg.get("moe_intermediate_size", "?")
-    hidden_size = cfg.get("hidden_size", "?")
+requested_method = actual_method = "?"
+residual_applied = residual_fallback = weight_hash = "?"
 
-# Recover original moe_intermediate_size from plan (old_intermediate = pre-prune d_ff)
-if os.path.isfile(plan_path):
+if os.path.isfile(pm_path):
+    try:
+        with open(pm_path) as f:
+            pm = json.load(f)
+        saved_moe         = pm.get("saved_moe_intermediate_size", "?")
+        orig_moe          = pm.get("original_moe_intermediate_size", "?")
+        requested_method  = pm.get("requested_method", "?")
+        actual_method     = pm.get("actual_method", "?")
+        residual_applied  = str(pm.get("residual_applied", "?"))
+        residual_fallback = str(pm.get("residual_fallback_used", "?"))
+        weight_hash       = pm.get("weight_hash", "?")
+    except Exception as e:
+        print("[eval]   WARNING: could not read pruning_metadata.json: " + str(e))
+
+if os.path.isfile(cfg_path):
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        if saved_moe == "?":
+            saved_moe = cfg.get("moe_intermediate_size", "?")
+        hidden_size = cfg.get("hidden_size", "?")
+    except Exception:
+        pass
+
+if orig_moe == "?" and os.path.isfile(plan_path):
     try:
         with open(plan_path) as f:
             plan_data = json.load(f)
@@ -717,14 +594,11 @@ if os.path.isfile(plan_path):
     except Exception:
         pass
 
-# Count checkpoint shards
 shard_files = (
     glob.glob(os.path.join(save_dir, "model*.safetensors")) +
     glob.glob(os.path.join(save_dir, "pytorch_model*.bin"))
 )
-n_shards = len(shard_files)
-
-# Derived weight shapes: gate/up are [d_ff_new, d_model], down is [d_model, d_ff_new]
+n_shards   = len(shard_files)
 gate_shape = "[" + str(saved_moe) + ", " + str(hidden_size) + "]"
 up_shape   = "[" + str(saved_moe) + ", " + str(hidden_size) + "]"
 down_shape = "[" + str(hidden_size) + ", " + str(saved_moe) + "]"
@@ -736,6 +610,13 @@ print("[eval]   sample gate_proj.weight shape  : " + gate_shape)
 print("[eval]   sample up_proj.weight shape    : " + up_shape)
 print("[eval]   sample down_proj.weight shape  : " + down_shape)
 print("[eval]   checkpoint shards              : " + str(n_shards))
+print("[eval]   requested_method               : " + str(requested_method))
+print("[eval]   actual_method                  : " + str(actual_method))
+print("[eval]   residual_applied               : " + str(residual_applied))
+print("[eval]   residual_fallback_used         : " + str(residual_fallback))
+print("[eval]   weight_hash                    : " + str(weight_hash))
+if str(residual_fallback) == "True":
+    print("[eval]   WARNING: residual not applied -- results are equivalent to pure_delete")
 PYSANITY
     fi
 
@@ -872,6 +753,27 @@ if is_pruned and os.path.isfile(plan):
     except Exception as e:
         print("[eval] WARNING: cannot compute actual_pct: " + str(e))
 
+# Read pruning_metadata.json for actual_method and residual status
+requested_method_val   = method
+actual_method_val      = method
+residual_applied_val   = False
+residual_fallback_val  = False
+if is_pruned:
+    pm_path = os.path.join(eval_model_dir, "pruning_metadata.json")
+    if os.path.isfile(pm_path):
+        try:
+            with open(pm_path) as pmf:
+                pm = json.load(pmf)
+            requested_method_val  = pm.get("requested_method", method)
+            actual_method_val     = pm.get("actual_method", method)
+            residual_applied_val  = pm.get("residual_applied", False)
+            residual_fallback_val = pm.get("residual_fallback_used", False)
+        except Exception as e:
+            print("[eval] WARNING: could not read pruning_metadata.json: " + str(e))
+    else:
+        # Old checkpoint without pruning_metadata.json; assume pure_delete
+        actual_method_val = "pure_delete"
+
 # Infer moe_dim: prefer saved config.json, else compute from actual_pct
 moe_dim = orig_moe_dim
 if is_pruned:
@@ -910,9 +812,12 @@ for rf in sorted(result_files):
                 metric     = metric_key.replace(",none", "")
                 stderr_key = metric + "_stderr,none"
                 stderr     = metrics.get(stderr_key, "")
+                row_status = "ok"
+                if residual_fallback_val and method not in ("baseline", "pure_delete"):
+                    row_status = "residual_not_applied"
                 rows.append({
                     "setting_label":                  label,
-                    "method":                         method,
+                    "method":                         actual_method_val,
                     "selector":                       selector,
                     "dataset":                        dataset,
                     "target_pct":                     target_pct,
@@ -923,6 +828,10 @@ for rf in sorted(result_files):
                     "pruning_plan_path":              plan if is_pruned else "NONE",
                     "model_path":                     eval_model_dir,
                     "is_pruned":                      str(is_pruned),
+                    "requested_method":               requested_method_val,
+                    "actual_method":                  actual_method_val,
+                    "residual_applied":               str(residual_applied_val),
+                    "residual_fallback_used":         str(residual_fallback_val),
                     "task":                           task,
                     "metric":                         metric,
                     "value":                          val,
@@ -930,7 +839,7 @@ for rf in sorted(result_files):
                     "num_fewshot":                    num_fewshot,
                     "limit":                          limit_val,
                     "batch_size":                     batch_size_val,
-                    "status":                         "ok",
+                    "status":                         row_status,
                 })
     except Exception as e:
         print("[eval] WARNING: could not parse {}: {}".format(rf, e))
@@ -941,6 +850,7 @@ if rows:
         "target_pct", "actual_pct", "moe_dim",
         "expert_param_reduction_pct", "total_model_param_reduction_pct",
         "pruning_plan_path", "model_path", "is_pruned",
+        "requested_method", "actual_method", "residual_applied", "residual_fallback_used",
         "task", "metric", "value", "stderr",
         "num_fewshot", "limit", "batch_size", "status",
     ]
@@ -968,9 +878,11 @@ PYEOF
     echo "[eval] OK: ${label}"
     SUCCEEDED=$(( SUCCEEDED + 1 ))
 
-    # Clean up temporary pruned model
-    if [ "${plan}" != "NONE" ] && [ -d "${PRUNED_MODEL_DIR}" ]; then
-        rm -rf "${PRUNED_MODEL_DIR}"
+    # Checkpoints kept by default for hash comparison and potential re-use.
+    # Set CLEANUP_CHECKPOINTS=1 to delete after eval.
+    if [ "${CLEANUP_CHECKPOINTS}" = "1" ] && [ "${plan}" != "NONE" ] && [ -d "${SETTING_CKPT_DIR:-}" ]; then
+        rm -rf "${SETTING_CKPT_DIR}"
+        echo "[eval] Cleaned up checkpoint: ${SETTING_CKPT_DIR}"
     fi
 done
 
@@ -984,6 +896,78 @@ if [ "${SUCCEEDED}" -gt 0 ]; then
         --moe-align  "${MOE_ALIGN}" \
         --model      "${MODEL}" \
         2>&1 || echo "[eval] WARNING: comparison summary step failed (non-fatal)"
+fi
+
+# ── Checkpoint hash comparison diagnostic ────────────────────────────────────
+if [ -d "${CKPT_BASE_DIR:-}" ] && [ "$(ls -A "${CKPT_BASE_DIR}" 2>/dev/null)" ]; then
+    echo ""
+    echo "[eval] --- Checkpoint hash comparison diagnostic ---"
+    python - "${CKPT_BASE_DIR}" << 'PYHASH'
+import json, os, sys
+
+ckpt_base = sys.argv[1]
+by_target = {}   # {target_pct_str: {requested_method: info_dict}}
+
+for entry in sorted(os.scandir(ckpt_base), key=lambda e: e.name):
+    if not entry.is_dir():
+        continue
+    pm_path = os.path.join(entry.path, "pruning_metadata.json")
+    if not os.path.isfile(pm_path):
+        continue
+    try:
+        with open(pm_path) as f:
+            pm = json.load(f)
+    except Exception:
+        continue
+    tgt = str(pm.get("target_pct", pm.get("actual_pct", "?")))
+    req = pm.get("requested_method", "?")
+    if tgt not in by_target:
+        by_target[tgt] = {}
+    by_target[tgt][req] = {
+        "actual_method":         pm.get("actual_method", "?"),
+        "residual_applied":      pm.get("residual_applied", "?"),
+        "residual_fallback_used": pm.get("residual_fallback_used", "?"),
+        "weight_hash":           pm.get("weight_hash", "?"),
+        "ckpt_dir":              entry.path,
+    }
+
+if not by_target:
+    print("[eval] No pruning_metadata.json found in " + ckpt_base)
+    sys.exit(0)
+
+print("[eval] {:>6}  {:<38}  {:<16}  {:>16}  {:<16}  {}".format(
+    "Target", "requested_method", "actual_method", "weight_hash", "residual_applied", "fallback"))
+print("[eval] " + "-" * 110)
+
+issues = []
+for tgt in sorted(by_target.keys()):
+    methods = by_target[tgt]
+    pd_hash = methods.get("pure_delete", {}).get("weight_hash")
+    for req, info in sorted(methods.items()):
+        h = info["weight_hash"]
+        note = ""
+        if req != "pure_delete" and pd_hash and h == pd_hash:
+            if not info.get("residual_fallback_used"):
+                note = " *** SAME HASH AS PURE_DELETE -- residual not applied ***"
+                issues.append("target={} method={}: identical hash to pure_delete but fallback=False".format(tgt, req))
+            else:
+                note = " (fallback to pure_delete, expected same hash)"
+        print("[eval] {:>6}  {:<38}  {:<16}  {:>16}  {:<16}  {}{}".format(
+            tgt, req[:38], str(info["actual_method"])[:16], str(h)[:16],
+            str(info["residual_applied"]), str(info["residual_fallback_used"]), note))
+
+print("[eval]")
+if issues:
+    for iss in issues:
+        print("[eval] ERROR: " + iss)
+    sys.exit(1)
+else:
+    print("[eval] Hash check: OK")
+PYHASH
+    _hash_exit=$?
+    if [ "${_hash_exit}" -ne 0 ]; then
+        echo "[eval] WARNING: hash comparison detected issue (see above)."
+    fi
 fi
 
 # -- Final summary -----------------------------------------------------------

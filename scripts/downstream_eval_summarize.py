@@ -45,12 +45,14 @@ SUMMARY_FIELDS = [
     "target_pct", "actual_pct", "moe_dim",
     "expert_param_reduction_pct", "total_model_param_reduction_pct",
     "pruning_plan_path", "model_path", "is_pruned",
+    "requested_method", "actual_method", "residual_applied", "residual_fallback_used",
     "task", "metric", "value", "stderr",
     "num_fewshot", "limit", "batch_size", "status",
 ]
 
 COMPARISON_FIELDS = [
     "method", "selector", "dataset", "target_pct", "actual_pct", "moe_dim",
+    "requested_method", "actual_method", "residual_applied", "residual_fallback_used",
     "task", "metric",
     "baseline_value", "pruned_value", "delta", "relative_delta_pct",
     "baseline_stderr", "pruned_stderr",
@@ -201,20 +203,24 @@ def build_comparison(summary_rows: List[Dict]) -> List[Dict]:
         except (ValueError, TypeError):
             delta = rel = "NA"
         comp_rows.append({
-            "method":             row.get("method", ""),
-            "selector":           row.get("selector", ""),
-            "dataset":            row.get("dataset", ""),
-            "target_pct":         row.get("target_pct", ""),
-            "actual_pct":         row.get("actual_pct", ""),
-            "moe_dim":            row.get("moe_dim", ""),
-            "task":               row["task"],
-            "metric":             row["metric"],
-            "baseline_value":     base["value"],
-            "pruned_value":       row["value"],
-            "delta":              delta,
-            "relative_delta_pct": rel,
-            "baseline_stderr":    base.get("stderr", ""),
-            "pruned_stderr":      row.get("stderr", ""),
+            "method":                 row.get("actual_method") or row.get("method", ""),
+            "selector":               row.get("selector", ""),
+            "dataset":                row.get("dataset", ""),
+            "target_pct":             row.get("target_pct", ""),
+            "actual_pct":             row.get("actual_pct", ""),
+            "moe_dim":                row.get("moe_dim", ""),
+            "requested_method":       row.get("requested_method", row.get("method", "")),
+            "actual_method":          row.get("actual_method", row.get("method", "")),
+            "residual_applied":       row.get("residual_applied", "unknown"),
+            "residual_fallback_used": row.get("residual_fallback_used", "unknown"),
+            "task":                   row["task"],
+            "metric":                 row["metric"],
+            "baseline_value":         base["value"],
+            "pruned_value":           row["value"],
+            "delta":                  delta,
+            "relative_delta_pct":     rel,
+            "baseline_stderr":        base.get("stderr", ""),
+            "pruned_stderr":          row.get("stderr", ""),
         })
     return comp_rows
 
@@ -223,7 +229,7 @@ def print_comparison_table(comp_rows: List[Dict]) -> None:
     if not comp_rows:
         print("[summarize] No comparison rows to display.")
         return
-    W = 14
+    W = 36
     hdr = (
         "  {:<14}  {:<9}  {:<{W}}  {:>7}  {:>7}  {:>9}  {:>9}  {:>8}".format(
             "Task", "Metric", "Method", "Target", "MoeDim",
@@ -234,7 +240,7 @@ def print_comparison_table(comp_rows: List[Dict]) -> None:
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for r in comp_rows:
-        method = str(r.get("method", ""))[:W]
+        method = str(r.get("actual_method") or r.get("method", ""))[:W]
         tgt    = str(r.get("target_pct", ""))
         moed   = str(r.get("moe_dim", ""))
         try:
@@ -328,6 +334,11 @@ def main() -> None:
                     "pruning_plan_path":              plan_path,
                     "model_path":                     model_path,
                     "is_pruned":                      str(linfo["is_pruned"]),
+                    # Cannot recover residual metadata from lm_eval dirs alone
+                    "requested_method":               linfo["method"],
+                    "actual_method":                  "unknown",
+                    "residual_applied":               "unknown",
+                    "residual_fallback_used":         "unknown",
                     "task":                           m["task"],
                     "metric":                         m["metric"],
                     "value":                          m["value"],

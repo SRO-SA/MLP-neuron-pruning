@@ -5,37 +5,40 @@ apply_moe_plan_save_checkpoint.py
 Stage 1 helper: apply a pruning plan to the original model and save a
 physically-pruned HF checkpoint that can be reloaded with AutoModelForCausalLM.
 
-Writes:
-  <ckpt_dir>/                  -- HF checkpoint (safetensors + config.json + tokenizer)
-  <ckpt_dir>/.bench_meta.json  -- metadata consumed by benchmark_moe_speed_memory.py
+For residual methods (e.g. residual_nearest_channel_merge_moe), calibration
+activations are collected via forward pre-hooks on each expert before physical
+pruning.  The residual reconstruction updates down_proj.weight in-place *before*
+channels are deleted.
 
-If <ckpt_dir>/.bench_meta.json already has save_complete=true, exits immediately
-without reloading the model.
+If moe_residual_methods cannot be imported or calibration activations are
+insufficient, the script falls back to pure_delete and records
+residual_fallback_used=True in pruning_metadata.json.
+
+Writes per checkpoint directory:
+  <ckpt_dir>/                  -- HF checkpoint (safetensors + config.json + tokenizer)
+  <ckpt_dir>/.bench_meta.json  -- metadata for benchmark_moe_speed_memory.py
+  <ckpt_dir>/pruning_metadata.json  -- extended metadata including residual status
 
 Usage:
     python scripts/apply_moe_plan_save_checkpoint.py \\
         --model   Qwen/Qwen3-30B-A3B \\
         --plan    results/pruning_plans/<plan>.json \\
-        --method  pure_delete \\
-        --ckpt-dir results/speed_memory_runs/<id>/pruned_checkpoints/<label> \\
-        --dtype   bfloat16
-
-Expected output (Qwen3-30B-A3B, 4% target):
-  original moe_intermediate_size : 768
-  saved moe_intermediate_size    : 736
-  sample gate_proj shape         : [736, 2048]
-  sample up_proj shape           : [736, 2048]
-  sample down_proj shape         : [2048, 736]
+        --method  residual_nearest_channel_merge_moe \\
+        --ckpt-dir results/downstream_eval_runs/<id>/pruned_checkpoints/<label> \\
+        --dtype   bfloat16 \\
+        --calib-n 64
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional, Set
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import torch
@@ -50,7 +53,98 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirror moe_pruning.py logic -- no import to avoid side effects)
+# Residual methods import (optional; falls back gracefully)
+# ---------------------------------------------------------------------------
+
+_RESIDUAL_DISPATCH = None
+RESIDUAL_METHODS: Set[str] = set()
+
+try:
+    _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+    from moe_residual_methods import (          # type: ignore[import]
+        apply_residual_dispatch_unpacked,
+        RESIDUAL_METHODS as _RM,
+    )
+    _RESIDUAL_DISPATCH = apply_residual_dispatch_unpacked
+    RESIDUAL_METHODS   = _RM
+    print("[ckpt] moe_residual_methods imported OK")
+except ImportError as _ie:
+    print(f"[ckpt] WARNING: moe_residual_methods not available ({_ie}). "
+          "Residual methods will fall back to pure_delete.")
+
+
+# ---------------------------------------------------------------------------
+# Fallback calibration corpus
+# ---------------------------------------------------------------------------
+
+_FALLBACK_CORPUS: List[str] = [
+    "The attention mechanism in transformers allows each token to attend to all other tokens in the sequence.",
+    "Language models learn representations by predicting the probability of the next token given all previous context.",
+    "Mixture-of-experts models route each token to a subset of specialized expert feed-forward networks.",
+    "Structured pruning removes entire neurons or channels from neural networks to reduce memory and compute.",
+    "The SwiGLU activation function computes the element-wise product of a gate and a value projection.",
+    "Gradient-free pruning methods rank neurons by weight norms or activation statistics collected offline.",
+    "In transformer models, each feed-forward block consists of two linear projections and an activation function.",
+    "Expert routing in sparse MoE models is controlled by a learned gating network applied to token embeddings.",
+    "The key insight of residual reconstruction is that pruned channels can be approximated by kept channels.",
+    "Calibration-based pruning methods collect statistics on real data to identify less important neurons.",
+    "Low-rank approximations of weight matrices provide a compact representation with controllable accuracy loss.",
+    "The hidden state dimension in Qwen3-30B-A3B is 2048, with MoE intermediate size of 768 per expert.",
+    "Nearest-channel-merge reconstruction finds the kept channel most similar to each pruned channel.",
+    "Weight norms provide a simple but effective proxy for the importance of individual neurons.",
+    "The output of an MoE layer is the weighted sum of the outputs of all selected experts.",
+    "Perplexity measures the cross-entropy loss exponentiated, providing a measure of language model quality.",
+    "Fine-tuning after pruning can recover accuracy lost during the pruning process.",
+    "Quantization reduces the bit-width of model weights and activations to decrease memory footprint.",
+    "The Llama and Qwen model families both use the transformer decoder-only architecture.",
+    "Structured sparsity removes entire rows or columns, enabling efficient dense matrix operations.",
+    "Knowledge distillation trains a small student model to mimic the outputs of a large teacher model.",
+    "Post-training quantization applies quantization to a pre-trained model without additional training.",
+    "The feedforward network in a transformer applies two linear transformations with a nonlinearity between them.",
+    "In MoE models, the number of active parameters per forward pass is much smaller than the total parameter count.",
+    "Channel pruning selects a subset of feature map channels to retain based on an importance criterion.",
+    "The down-projection matrix in an MoE expert maps from the intermediate dimension back to the model dimension.",
+    "Calibration data should represent the target distribution to ensure accurate importance estimates.",
+    "The gating network in a MoE transformer produces routing probabilities for each token and expert pair.",
+    "Memory bandwidth is often the bottleneck for LLM inference on modern GPU hardware.",
+    "Tensor parallelism distributes model layers across multiple GPUs to enable larger model sizes.",
+    "The tokenizer converts raw text into a sequence of integer token IDs for input to the model.",
+    "Layer normalization stabilizes training by normalizing activations to have zero mean and unit variance.",
+    "Rotary position embeddings encode relative position information directly into the attention computation.",
+    "The vocabulary size of modern language models is typically between 32,000 and 150,000 tokens.",
+    "Flash attention computes the attention matrix in a memory-efficient, tiled fashion on GPU hardware.",
+    "Sparse attention patterns restrict each token to attend only to a subset of positions in the sequence.",
+    "The residual stream accumulates information from each transformer layer as it flows through the network.",
+    "Multi-query attention uses a single key and value head shared across all query heads.",
+    "Temperature scaling at inference time controls the sharpness of the next-token probability distribution.",
+    "Nucleus sampling restricts the sampling distribution to the smallest set of tokens whose probability sums to p.",
+]
+
+
+def _load_calib_texts(n_texts: int = 64) -> List[str]:
+    """Load calibration texts from WikiText-2 or fall back to built-in corpus."""
+    try:
+        from datasets import load_dataset  # type: ignore[import]
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train",
+                          trust_remote_code=True)
+        texts = [
+            row["text"].strip() for row in ds
+            if len(row["text"].strip()) > 80
+        ][:n_texts]
+        if len(texts) >= max(n_texts // 2, 8):
+            print(f"[ckpt] Calibration texts: {len(texts)} from WikiText-2")
+            return texts
+    except Exception as exc:
+        print(f"[ckpt] WikiText-2 unavailable ({exc}); using built-in corpus")
+    texts = (_FALLBACK_CORPUS * ((n_texts // len(_FALLBACK_CORPUS)) + 2))[:n_texts]
+    print(f"[ckpt] Calibration texts: {len(texts)} from fallback corpus")
+    return texts
+
+
+# ---------------------------------------------------------------------------
+# Core helpers (mirror moe_pruning.py logic -- no import to avoid side-effects)
 # ---------------------------------------------------------------------------
 
 def _find_layer_list(model: Any) -> Optional[Any]:
@@ -71,14 +165,9 @@ def apply_pruning_plan(model: Any, plan: Dict) -> int:
     columns from down_proj for each expert.
 
     For MoE layer i, neuron k corresponds to:
-      gate_proj.weight[k, :]   (row k)
-      up_proj.weight[k, :]     (row k)
-      down_proj.weight[:, k]   (column k)
-
-    Removing neuron k means:
-      gate_proj.weight shape: [d_ff, d_model] -> keep rows where keep[k]=True
-      up_proj.weight shape:   [d_ff, d_model] -> keep rows
-      down_proj.weight shape: [d_model, d_ff] -> keep columns
+      gate_proj.weight[k, :]   (row k)  — shape [d_ff, d_model]
+      up_proj.weight[k, :]     (row k)  — shape [d_ff, d_model]
+      down_proj.weight[:, k]   (column k) — shape [d_model, d_ff]
 
     Returns number of layers modified.
     """
@@ -124,10 +213,7 @@ def apply_pruning_plan(model: Any, plan: Dict) -> int:
 
 
 def detect_uniform_moe_dim(model: Any) -> Optional[int]:
-    """
-    Detect the new (pruned) MoE intermediate size by reading down_proj.weight.shape[1].
-    Fails loudly if expert sizes are non-uniform (HF AutoModel cannot represent that).
-    """
+    """Detect the new (pruned) MoE intermediate size from down_proj.weight.shape[1]."""
     layer_list = _find_layer_list(model)
     if layer_list is None:
         return None
@@ -141,7 +227,6 @@ def detect_uniform_moe_dim(model: Any) -> Optional[int]:
         for expert in experts:
             down = getattr(expert, "down_proj", None)
             if down is not None:
-                # down_proj.weight: [d_model, d_ff_new]
                 sizes.add(down.weight.shape[1])
 
     if not sizes:
@@ -169,38 +254,144 @@ def sample_expert_shapes(model: Any) -> Dict[str, Any]:
         if not experts:
             continue
         exp0 = experts[0]
-        gate = getattr(exp0, "gate_proj", None)
-        up   = getattr(exp0, "up_proj",   None)
-        down = getattr(exp0, "down_proj",  None)
-        if gate is not None:
-            result["sample_gate_proj_shape"] = list(gate.weight.shape)
-        if up is not None:
-            result["sample_up_proj_shape"] = list(up.weight.shape)
-        if down is not None:
-            result["sample_down_proj_shape"] = list(down.weight.shape)
+        for proj, key in [("gate_proj", "sample_gate_proj_shape"),
+                           ("up_proj",   "sample_up_proj_shape"),
+                           ("down_proj", "sample_down_proj_shape")]:
+            m = getattr(exp0, proj, None)
+            if m is not None:
+                result[key] = list(m.weight.shape)
         break
     return result
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Calibration activation collection
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model",     required=True,
-                    help="HF model ID or local path (original, unpruned)")
-    ap.add_argument("--plan",      required=True,
-                    help="Pruning plan JSON path")
-    ap.add_argument("--method",    default="pure_delete",
-                    help="Method name (stored in metadata only)")
-    ap.add_argument("--ckpt-dir",  required=True,
-                    help="Output directory for the saved pruned checkpoint")
-    ap.add_argument("--dtype",     default="bfloat16",
-                    choices=["float32", "float16", "bfloat16"])
-    ap.add_argument("--label",     default="",
-                    help="Setting label (stored in metadata only)")
-    return ap.parse_args()
+def collect_expert_activations_by_layer(
+    model:        Any,
+    tokenizer:    Any,
+    calib_texts:  List[str],
+    max_seq_len:  int = 512,
+    plan_layers:  Optional[Set[int]] = None,
+) -> Dict[int, Dict[int, torch.Tensor]]:
+    """
+    Run forward passes on calib_texts and collect per-expert input activations
+    via forward pre-hooks.
+
+    plan_layers: if given, only register hooks on those layer indices to save memory.
+
+    Returns {layer_idx: {expert_idx: Tensor[N_routed, d_model]}}.
+    """
+    layer_list = _find_layer_list(model)
+    if layer_list is None:
+        print("[ckpt] WARNING: cannot find layer list; skipping calibration")
+        return {}
+
+    # Find a device for inputs (works for both single-GPU and multi-GPU device_map)
+    try:
+        input_device = next(model.parameters()).device
+    except StopIteration:
+        input_device = torch.device("cpu")
+
+    raw_acts: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+    hooks: List[Any] = []
+
+    for li, layer in enumerate(layer_list):
+        if plan_layers is not None and li not in plan_layers:
+            continue
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        experts = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
+        for ei, expert in enumerate(experts):
+            def _make_hook(li_: int = li, ei_: int = ei):
+                def _hook(mod: Any, args: tuple) -> None:
+                    if args and isinstance(args[0], torch.Tensor):
+                        # args[0]: [n_routed_tokens, d_model] on expert's device
+                        raw_acts[(li_, ei_)].append(
+                            args[0].detach().float().cpu()
+                        )
+                return _hook
+            h = expert.register_forward_pre_hook(_make_hook())
+            hooks.append(h)
+
+    n_hooks = len(hooks)
+    print(f"[ckpt] Registered {n_hooks} forward pre-hooks on expert modules")
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            for ti, text in enumerate(calib_texts):
+                if not text.strip():
+                    continue
+                try:
+                    enc = tokenizer(
+                        text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_seq_len,
+                    )
+                    enc = {k: v.to(input_device) for k, v in enc.items()}
+                    model(**enc)
+                except Exception as exc:
+                    print(f"[ckpt] WARNING: calibration pass {ti} failed: {exc}")
+                    continue
+        print(f"[ckpt] Calibration complete: {len(calib_texts)} texts processed")
+    finally:
+        for h in hooks:
+            h.remove()
+        print(f"[ckpt] Removed {len(hooks)} hooks")
+
+    # Concatenate per-(layer, expert) tensors
+    result: Dict[int, Dict[int, torch.Tensor]] = {}
+    for (li, ei), tensors in raw_acts.items():
+        if not tensors:
+            continue
+        if li not in result:
+            result[li] = {}
+        result[li][ei] = torch.cat(tensors, dim=0)
+
+    total_tokens = sum(
+        t.shape[0] for ldict in result.values() for t in ldict.values()
+    )
+    print(f"[ckpt] Calibration activations: {len(result)} layers, "
+          f"{total_tokens} total routed tokens")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Weight hash (changes when residual updates down_proj before physical prune)
+# ---------------------------------------------------------------------------
+
+def _compute_weight_hash(model: Any) -> str:
+    """
+    MD5 of the first 1024 bytes of the first two down_proj weight tensors.
+    This hash changes when residual reconstruction updates down_proj in-place
+    before physical pruning — use it to verify residual was actually applied.
+    """
+    layer_list = _find_layer_list(model)
+    if layer_list is None:
+        return "nolayers"
+    m = hashlib.md5()
+    n_found = 0
+    for layer in layer_list:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        experts = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
+        for expert in experts:
+            down = getattr(expert, "down_proj", None)
+            if down is None or not hasattr(down, "weight"):
+                continue
+            data = down.weight.detach().float().cpu().numpy().tobytes()[:1024]
+            m.update(data)
+            n_found += 1
+            if n_found >= 2:
+                break
+        if n_found >= 2:
+            break
+    return m.hexdigest()[:16] if n_found > 0 else "nohash"
 
 
 # ---------------------------------------------------------------------------
@@ -208,148 +399,254 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = parse_args()
-    ckpt_dir  = args.ckpt_dir
-    meta_path = os.path.join(ckpt_dir, ".bench_meta.json")
+    ap = argparse.ArgumentParser(
+        description="Apply a MoE pruning plan to a model and save a HF checkpoint."
+    )
+    ap.add_argument("--model",         required=True,
+                    help="HuggingFace model name or path")
+    ap.add_argument("--plan",          required=True,
+                    help="Path to pruning plan JSON")
+    ap.add_argument("--ckpt-dir",      required=True,
+                    help="Directory to save the pruned checkpoint")
+    ap.add_argument("--method",        default="pure_delete",
+                    help="Pruning method label (e.g. pure_delete, residual_nearest_channel_merge_moe)")
+    ap.add_argument("--dtype",         default="bfloat16",
+                    choices=["float32", "float16", "bfloat16"])
+    ap.add_argument("--label",         default="",
+                    help="Human-readable label (used only for logging)")
+    ap.add_argument("--calib-n",       type=int, default=64,
+                    help="Number of calibration texts for residual methods")
+    ap.add_argument("--calib-seq-len", type=int, default=512,
+                    help="Max sequence length during calibration")
+    args = ap.parse_args()
 
-    # Fast-path: skip if checkpoint already complete
-    if os.path.isdir(ckpt_dir) and os.path.isfile(meta_path):
+    method    = args.method
+    ckpt_dir  = args.ckpt_dir
+    label_str = args.label or method
+
+    # ── Fast-path: skip if already saved ─────────────────────────────────────
+    bench_meta_path = os.path.join(ckpt_dir, ".bench_meta.json")
+    pm_path         = os.path.join(ckpt_dir, "pruning_metadata.json")
+    if os.path.isfile(bench_meta_path) and os.path.isfile(pm_path):
         try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-            if meta.get("save_complete"):
-                saved_dim = meta.get("saved_moe_intermediate_size")
-                print(f"[ckpt] Checkpoint already complete: {ckpt_dir}")
-                print(f"[ckpt]   saved_moe_intermediate_size = {saved_dim}")
+            with open(pm_path) as f:
+                pm = json.load(f)
+            if pm.get("save_complete"):
+                print(f"[ckpt] Fast-path: checkpoint already complete at {ckpt_dir}")
                 return
         except Exception:
-            pass  # corrupt meta -- recreate
+            pass
+        print(f"[ckpt] save_complete not confirmed; re-applying.")
 
-    print("[ckpt] apply_moe_plan_save_checkpoint.py")
-    print(f"[ckpt]   model    : {args.model}")
-    print(f"[ckpt]   plan     : {args.plan}")
-    print(f"[ckpt]   method   : {args.method}")
-    print(f"[ckpt]   ckpt_dir : {ckpt_dir}")
-    print(f"[ckpt]   dtype    : {args.dtype}")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
+    print(f"[ckpt] ===================================================")
+    print(f"[ckpt] label   : {label_str}")
+    print(f"[ckpt] method  : {method}")
+    print(f"[ckpt] plan    : {args.plan}")
+    print(f"[ckpt] ckpt_dir: {ckpt_dir}")
+    print(f"[ckpt] dtype   : {args.dtype}")
+    print(f"[ckpt] ===================================================")
+
+    # ── Load plan ─────────────────────────────────────────────────────────────
     if not os.path.isfile(args.plan):
-        sys.exit(f"ERROR: plan not found: {args.plan}")
-
+        print(f"[ckpt] ERROR: plan not found: {args.plan}")
+        sys.exit(1)
     with open(args.plan) as f:
         plan_data = json.load(f)
 
-    n_plan_layers = len(plan_data.get("layers", []))
-    total  = sum(lc.get("old_intermediate", 0) for lc in plan_data.get("layers", []))
-    pruned = sum(len(lc.get("prune_idx", []))  for lc in plan_data.get("layers", []))
-    actual_pct = round(100.0 * pruned / max(total, 1), 3) if total else 0.0
-    print(f"[ckpt]   plan     : {n_plan_layers} layers, {pruned}/{total} channels ({actual_pct:.3f}%)")
+    plan_layers_set: Set[int] = {
+        lc["layer_idx"]
+        for lc in plan_data.get("layers", [])
+        if lc.get("prune_idx")
+    }
+    print(f"[ckpt] Plan: {len(plan_data.get('layers', []))} layer configs, "
+          f"{len(plan_layers_set)} layers with actual pruning")
 
-    dtype_map = {"float32": torch.float32, "float16": torch.float16,
-                 "bfloat16": torch.bfloat16}
-    dtype = dtype_map[args.dtype]
+    orig_moe_dim_from_plan: Optional[int] = None
+    for lc in plan_data.get("layers", []):
+        v = lc.get("old_intermediate")
+        if v:
+            orig_moe_dim_from_plan = int(v)
+            break
 
-    # ── Load original model ──────────────────────────────────────────────────
-    print("[ckpt] Loading tokenizer ...")
+    # ── Load model ────────────────────────────────────────────────────────────
+    dtype_map = {
+        "float32":  torch.float32,
+        "float16":  torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map.get(args.dtype, torch.bfloat16)
+
+    print(f"[ckpt] Loading model {args.model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    print(f"[ckpt] Loading original model (dtype={args.dtype}, device_map=auto) ...")
-    t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, device_map="auto", trust_remote_code=True,
+        args.model,
+        torch_dtype=dtype,
+        device_map="cpu",
+        trust_remote_code=True,
     )
     model.eval()
-    load_sec = time.perf_counter() - t0
-    print(f"[ckpt] Loaded in {load_sec:.1f}s")
+    print("[ckpt] Model loaded.")
 
-    original_moe_dim = getattr(model.config, "moe_intermediate_size", None)
-    print(f"[ckpt]   original moe_intermediate_size : {original_moe_dim}")
+    # ── Residual reconstruction (if requested) ────────────────────────────────
+    residual_applied     = False
+    residual_fallback    = False
+    actual_method        = method
+    residual_n_layers    = 0
+    residual_stats_summary: Dict[str, Any] = {}
 
-    # ── Apply pruning ────────────────────────────────────────────────────────
-    print("[ckpt] Applying pruning plan ...")
-    n_modified = apply_pruning_plan(model, plan_data)
-    print(f"[ckpt]   {n_modified} layers modified.")
+    if method in RESIDUAL_METHODS:
+        if _RESIDUAL_DISPATCH is None:
+            print(f"[ckpt] WARNING: moe_residual_methods not importable. "
+                  f"Falling back to pure_delete for method={method}")
+            residual_fallback = True
+            actual_method     = "pure_delete"
+        else:
+            print(f"[ckpt] Residual method: {method}")
+            print(f"[ckpt] Collecting calibration activations (n={args.calib_n}) ...")
+            calib_texts = _load_calib_texts(n_texts=args.calib_n)
+            try:
+                layer_acts = collect_expert_activations_by_layer(
+                    model, tokenizer, calib_texts,
+                    max_seq_len=args.calib_seq_len,
+                    plan_layers=plan_layers_set,
+                )
+                if not layer_acts:
+                    print("[ckpt] WARNING: no activations collected; falling back to pure_delete")
+                    residual_fallback = True
+                    actual_method     = "pure_delete"
+                else:
+                    print(f"[ckpt] Applying residual method to {len(layer_acts)} layers ...")
+                    layer_list = _find_layer_list(model)
+                    if layer_list is None:
+                        print("[ckpt] WARNING: cannot find layer list; residual skipped")
+                        residual_fallback = True
+                        actual_method     = "pure_delete"
+                    else:
+                        for lc in plan_data.get("layers", []):
+                            li        = lc["layer_idx"]
+                            prune_idx = lc.get("prune_idx", [])
+                            if not prune_idx or li not in layer_acts:
+                                continue
+                            layer   = layer_list[li]
+                            mlp     = getattr(layer, "mlp", None)
+                            if mlp is None:
+                                continue
+                            experts        = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
+                            acts_by_expert = layer_acts[li]
+                            for ei, expert in enumerate(experts):
+                                if ei not in acts_by_expert:
+                                    continue
+                                acts = acts_by_expert[ei]
+                                try:
+                                    stats = _RESIDUAL_DISPATCH(
+                                        method, expert, prune_idx, acts,
+                                    )
+                                    residual_n_layers += 1
+                                    if stats:
+                                        residual_stats_summary[f"L{li}_E{ei}"] = stats
+                                except Exception as exc:
+                                    print(f"[ckpt] WARNING: residual L{li} E{ei} failed: {exc}")
+                        residual_applied = True
+                        actual_method    = method
+                        print(f"[ckpt] Residual applied to {residual_n_layers} (layer, expert) pairs")
+            except Exception as exc:
+                print(f"[ckpt] WARNING: residual calibration failed: {exc}; falling back to pure_delete")
+                residual_fallback = True
+                actual_method     = "pure_delete"
 
-    # Detect new uniform MoE dim
+    # Hash after residual but before physical pruning
+    hash_post_residual = _compute_weight_hash(model)
+    print(f"[ckpt] weight_hash (post-residual, pre-prune): {hash_post_residual}")
+
+    # ── Physical pruning ──────────────────────────────────────────────────────
+    print("[ckpt] Applying physical pruning ...")
+    n_mod = apply_pruning_plan(model, plan_data)
+    print(f"[ckpt] Physical pruning complete: {n_mod} layers modified")
+
+    # Hash after physical pruning — this is the final saved hash
+    hash_final = _compute_weight_hash(model)
+    print(f"[ckpt] weight_hash (post-prune, final): {hash_final}")
+
+    # ── Detect new uniform MoE dim + update config ────────────────────────────
     try:
-        new_moe_dim = detect_uniform_moe_dim(model)
+        new_moe_size: Optional[int] = detect_uniform_moe_dim(model)
     except RuntimeError as exc:
-        sys.exit(f"ERROR: {exc}")
+        print(f"[ckpt] ERROR: {exc}")
+        sys.exit(1)
 
-    if new_moe_dim is None:
-        print("[ckpt] WARNING: no MoE experts found -- moe_intermediate_size not updated")
-        new_moe_dim = original_moe_dim
+    if new_moe_size is not None:
+        old_moe = getattr(model.config, "moe_intermediate_size", None)
+        print(f"[ckpt] moe_intermediate_size: {old_moe} → {new_moe_size}")
+        model.config.moe_intermediate_size = new_moe_size
+        shapes = sample_expert_shapes(model)
+        for k, v in shapes.items():
+            print(f"[ckpt] {k}: {v}")
     else:
-        model.config.moe_intermediate_size = new_moe_dim
-        print(f"[ckpt]   saved moe_intermediate_size   : {new_moe_dim}")
+        print("[ckpt] WARNING: no expert down_proj found; skipping config update")
 
-    # Print sample expert shapes for verification
-    shapes = sample_expert_shapes(model)
-    for key in ("sample_gate_proj_shape", "sample_up_proj_shape", "sample_down_proj_shape"):
-        if key in shapes:
-            short_key = key.replace("sample_", "").replace("_shape", "")
-            print(f"[ckpt]   {short_key} shape : {shapes[key]}")
-
-    # ── Save checkpoint ──────────────────────────────────────────────────────
-    os.makedirs(ckpt_dir, exist_ok=True)
-    print(f"[ckpt] Saving to {ckpt_dir} ...")
-    t1 = time.perf_counter()
+    # ── Save checkpoint ───────────────────────────────────────────────────────
+    print(f"[ckpt] Saving checkpoint to {ckpt_dir} ...")
     model.save_pretrained(ckpt_dir, safe_serialization=True)
     tokenizer.save_pretrained(ckpt_dir)
-    save_sec = time.perf_counter() - t1
-    print(f"[ckpt] Saved in {save_sec:.1f}s")
+    print("[ckpt] Save complete.")
 
-    # Count shards and total size
+    # Count shards
     shard_files = (
         glob.glob(os.path.join(ckpt_dir, "model*.safetensors")) +
         glob.glob(os.path.join(ckpt_dir, "pytorch_model*.bin"))
     )
-    n_shards = len(shard_files)
-    ckpt_size_gib = (
-        sum(os.path.getsize(f) for f in shard_files) / (1024 ** 3)
-        if shard_files else 0.0
-    )
-    print(f"[ckpt]   num checkpoint shards : {n_shards}  ({ckpt_size_gib:.2f} GiB)")
-
-    # ── Verify saved config.json ─────────────────────────────────────────────
-    cfg_path = os.path.join(ckpt_dir, "config.json")
-    with open(cfg_path) as f:
-        saved_cfg = json.load(f)
-    saved_dim_in_file = saved_cfg.get("moe_intermediate_size", "NOT_FOUND")
-    print(f"[ckpt]   config.json moe_intermediate_size : {saved_dim_in_file}")
-    if new_moe_dim is not None and saved_dim_in_file != new_moe_dim:
-        sys.exit(f"ERROR: config sanity failed: saved={saved_dim_in_file}, expected={new_moe_dim}")
+    print(f"[ckpt] Checkpoint shards: {len(shard_files)}")
 
     # AutoConfig reload verification
-    print("[ckpt] AutoConfig.from_pretrained verification ...")
     loaded_cfg = AutoConfig.from_pretrained(ckpt_dir, trust_remote_code=True)
-    loaded_dim = getattr(loaded_cfg, "moe_intermediate_size", None)
-    print(f"[ckpt]   AutoConfig moe_intermediate_size : {loaded_dim}")
-    if new_moe_dim is not None and loaded_dim != new_moe_dim:
-        sys.exit(f"ERROR: AutoConfig mismatch: loaded={loaded_dim}, expected={new_moe_dim}")
-    print("[ckpt] AutoConfig reload: OK")
+    loaded_moe = getattr(loaded_cfg, "moe_intermediate_size", None)
+    if new_moe_size is not None and loaded_moe != new_moe_size:
+        print(f"[ckpt] ERROR: AutoConfig mismatch: loaded={loaded_moe}, expected={new_moe_size}")
+        sys.exit(1)
+    print(f"[ckpt] AutoConfig verify OK: moe_intermediate_size={loaded_moe}")
 
-    # ── Write metadata ───────────────────────────────────────────────────────
-    meta: Dict[str, Any] = {
-        "label":                           args.label,
-        "base_model_name":                 args.model,
-        "plan_path":                       args.plan,
-        "method":                          args.method,
-        "actual_pct":                      actual_pct,
-        "original_moe_intermediate_size":  original_moe_dim,
-        "saved_moe_intermediate_size":     new_moe_dim,
-        "n_shards":                        n_shards,
-        "checkpoint_size_gib":             round(ckpt_size_gib, 3),
-        "save_complete":                   True,
+    # ── Write metadata ────────────────────────────────────────────────────────
+    # .bench_meta.json (backward compat for benchmark_moe_speed_memory.py)
+    bench_meta = {
+        "model":                        args.model,
+        "plan":                         args.plan,
+        "method":                       actual_method,
+        "label":                        label_str,
+        "dtype":                        args.dtype,
+        "saved_moe_intermediate_size":  new_moe_size,
+        "original_moe_intermediate_size": orig_moe_dim_from_plan,
     }
-    meta.update(shapes)
+    with open(bench_meta_path, "w") as f:
+        json.dump(bench_meta, f, indent=2)
 
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
+    # pruning_metadata.json (new — includes residual status and hash for verification)
+    pruning_metadata: Dict[str, Any] = {
+        "requested_method":                     method,
+        "actual_method":                        actual_method,
+        "residual_applied":                     residual_applied,
+        "residual_fallback_used":               residual_fallback,
+        "weight_hash":                          hash_final,
+        "weight_hash_post_residual_pre_prune":  hash_post_residual,
+        "residual_n_layers_applied":            residual_n_layers,
+        "residual_stats_summary":               residual_stats_summary,
+        "calib_n":                              args.calib_n if method in RESIDUAL_METHODS else 0,
+        "saved_moe_intermediate_size":          new_moe_size,
+        "original_moe_intermediate_size":       orig_moe_dim_from_plan,
+        "target_pct":                           plan_data.get("target_pct"),
+        "save_complete":                        True,
+    }
+    with open(pm_path, "w") as f:
+        json.dump(pruning_metadata, f, indent=2)
 
-    print(f"[ckpt] Metadata: {meta_path}")
-    print(f"[ckpt] Checkpoint complete: {ckpt_dir}")
+    print(f"[ckpt] pruning_metadata.json written: {pm_path}")
+    print(f"[ckpt] requested_method       = {method}")
+    print(f"[ckpt] actual_method          = {actual_method}")
+    print(f"[ckpt] residual_applied       = {residual_applied}")
+    print(f"[ckpt] residual_fallback_used = {residual_fallback}")
+    print(f"[ckpt] weight_hash            = {hash_final}")
+    print(f"[ckpt] Done.")
 
 
 if __name__ == "__main__":
