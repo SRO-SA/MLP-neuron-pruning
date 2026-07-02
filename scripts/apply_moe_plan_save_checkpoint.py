@@ -269,11 +269,13 @@ def sample_expert_shapes(model: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def collect_expert_activations_by_layer(
-    model:        Any,
-    tokenizer:    Any,
-    calib_texts:  List[str],
-    max_seq_len:  int = 512,
-    plan_layers:  Optional[Set[int]] = None,
+    model:            Any,
+    tokenizer:        Any,
+    calib_texts:      List[str],
+    max_seq_len:      int = 512,
+    plan_layers:      Optional[Set[int]] = None,
+    max_calib_layers: int = 0,
+    timeout_sec:      float = 900.0,
 ) -> Dict[int, Dict[int, torch.Tensor]]:
     """
     Run forward passes on calib_texts and collect per-expert input activations
@@ -296,10 +298,15 @@ def collect_expert_activations_by_layer(
 
     raw_acts: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
     hooks: List[Any] = []
+    _n_hooked_layers = 0
 
     for li, layer in enumerate(layer_list):
         if plan_layers is not None and li not in plan_layers:
             continue
+        if max_calib_layers > 0 and _n_hooked_layers >= max_calib_layers:
+            print(f"[ckpt] max_calib_layers={max_calib_layers} reached; "
+                  f"skipping layer {li} and beyond", flush=True)
+            break
         mlp = getattr(layer, "mlp", None)
         if mlp is None:
             continue
@@ -315,15 +322,31 @@ def collect_expert_activations_by_layer(
                 return _hook
             h = expert.register_forward_pre_hook(_make_hook())
             hooks.append(h)
+        _n_hooked_layers += 1
 
     n_hooks = len(hooks)
-    print(f"[ckpt] Registered {n_hooks} forward pre-hooks on expert modules")
+    print(f"[ckpt] Registered {n_hooks} forward pre-hooks "
+          f"across {_n_hooked_layers} layers", flush=True)
 
+    import time as _time
+    _n_texts  = len(calib_texts)
+    _t_start  = _time.monotonic()
     try:
         model.eval()
         with torch.no_grad():
             for ti, text in enumerate(calib_texts):
+                _elapsed = _time.monotonic() - _t_start
+                if _elapsed > timeout_sec:
+                    print(
+                        f"[ckpt] WARNING: calibration timeout ({timeout_sec:.0f}s) "
+                        f"after {ti}/{_n_texts} texts; proceeding with partial activations",
+                        flush=True,
+                    )
+                    break
+                print(f"[ckpt] calibration {ti + 1}/{_n_texts} "
+                      f"(elapsed {_elapsed:.1f}s) ...", flush=True)
                 if not text.strip():
+                    print(f"[ckpt]   (skipped — empty text)", flush=True)
                     continue
                 try:
                     enc = tokenizer(
@@ -335,9 +358,12 @@ def collect_expert_activations_by_layer(
                     enc = {k: v.to(input_device) for k, v in enc.items()}
                     model(**enc)
                 except Exception as exc:
-                    print(f"[ckpt] WARNING: calibration pass {ti} failed: {exc}")
+                    print(f"[ckpt] WARNING: calibration pass {ti} failed: {exc}",
+                          flush=True)
                     continue
-        print(f"[ckpt] Calibration complete: {len(calib_texts)} texts processed")
+        _total_elapsed = _time.monotonic() - _t_start
+        print(f"[ckpt] Calibration complete: {_n_texts} texts "
+              f"in {_total_elapsed:.1f}s", flush=True)
     finally:
         for h in hooks:
             h.remove()
@@ -418,6 +444,11 @@ def main() -> None:
                     help="Number of calibration texts for residual methods")
     ap.add_argument("--calib-seq-len", type=int, default=512,
                     help="Max sequence length during calibration")
+    ap.add_argument("--device-map",       default="",
+                    help="device_map for AutoModelForCausalLM. "
+                         "Default: 'auto' for residual methods, 'cpu' for pure_delete")
+    ap.add_argument("--max-calib-layers", type=int, default=0,
+                    help="Debug: limit calibration hooks to first N layers (0 = all)")
     args = ap.parse_args()
 
     method    = args.method
@@ -478,16 +509,43 @@ def main() -> None:
     }
     dtype = dtype_map.get(args.dtype, torch.bfloat16)
 
-    print(f"[ckpt] Loading model {args.model} ...")
+    # Choose device_map: explicit arg > method-based default
+    if args.device_map:
+        _device_map: str = args.device_map
+    elif method in RESIDUAL_METHODS:
+        _device_map = "auto"
+    else:
+        _device_map = "cpu"
+
+    print(f"[ckpt] loading device_map: {_device_map}", flush=True)
+    print(f"[ckpt] Loading model {args.model} ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=dtype,
-        device_map="cpu",
+        device_map=_device_map,
         trust_remote_code=True,
     )
     model.eval()
-    print("[ckpt] Model loaded.")
+
+    try:
+        _first_device = str(next(model.parameters()).device)
+    except StopIteration:
+        _first_device = "unknown"
+    print(f"[ckpt] first parameter device: {_first_device}", flush=True)
+    print("[ckpt] Model loaded.", flush=True)
+
+    # Residual methods need GPU unless explicitly opted out
+    if method in RESIDUAL_METHODS:
+        _allow_cpu = os.environ.get("ALLOW_CPU_RESIDUAL", "0").strip() == "1"
+        if "cpu" in _first_device.lower() and not _allow_cpu:
+            print(
+                f"[ckpt] ERROR: residual method '{method}' requires GPU but first parameter "
+                f"is on '{_first_device}'. "
+                "Set ALLOW_CPU_RESIDUAL=1 to override (will be very slow).",
+                flush=True,
+            )
+            sys.exit(1)
 
     # ── Residual reconstruction (if requested) ────────────────────────────────
     residual_applied     = False
@@ -511,6 +569,10 @@ def main() -> None:
                     model, tokenizer, calib_texts,
                     max_seq_len=args.calib_seq_len,
                     plan_layers=plan_layers_set,
+                    max_calib_layers=args.max_calib_layers,
+                    timeout_sec=float(
+                        os.environ.get("RESIDUAL_CALIB_TIMEOUT_SEC", "900")
+                    ),
                 )
                 if not layer_acts:
                     print("[ckpt] WARNING: no activations collected; falling back to pure_delete")

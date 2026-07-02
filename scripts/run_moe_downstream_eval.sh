@@ -65,6 +65,9 @@ SKIP_EXISTING="${SKIP_EXISTING:-0}"
 AUTO_GENERATE_PLAN="${AUTO_GENERATE_PLAN:-0}"
 CONFIG_PREFIX="$(echo "${MODEL}" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
 CLEANUP_CHECKPOINTS="${CLEANUP_CHECKPOINTS:-0}"
+RESIDUAL_CALIB_N="${RESIDUAL_CALIB_N:-8}"
+RESIDUAL_CALIB_SEQ_LEN="${RESIDUAL_CALIB_SEQ_LEN:-128}"
+RESIDUAL_CALIB_TIMEOUT_SEC="${RESIDUAL_CALIB_TIMEOUT_SEC:-900}"
 
 MODEL_SLUG="$(echo "${MODEL}" | tr '/' '_' | tr '-' '_')"
 PLAN_DIR="${RESULTS_DIR}/pruning_plans"
@@ -526,14 +529,17 @@ for setting in "${SETTINGS[@]}"; do
         echo "[eval] Applying pruning plan (method=${method}): ${plan}"
         mkdir -p "${CKPT_BASE_DIR}"
         set +e
+        RESIDUAL_CALIB_TIMEOUT_SEC="${RESIDUAL_CALIB_TIMEOUT_SEC}" \
         python3 scripts/apply_moe_plan_save_checkpoint.py \
-            --model    "${MODEL}" \
-            --plan     "${plan}" \
-            --method   "${method}" \
-            --ckpt-dir "${SETTING_CKPT_DIR}" \
-            --dtype    "${DTYPE}" \
-            --label    "${label}" \
-            --calib-n  64 \
+            --model         "${MODEL}" \
+            --plan          "${plan}" \
+            --method        "${method}" \
+            --ckpt-dir      "${SETTING_CKPT_DIR}" \
+            --dtype         "${DTYPE}" \
+            --label         "${label}" \
+            --calib-n       "${RESIDUAL_CALIB_N}" \
+            --calib-seq-len "${RESIDUAL_CALIB_SEQ_LEN}" \
+            --device-map    auto \
             2>&1 | tee "${OUT_DIR}/${label}_apply.log"
         _apply_exit="${PIPESTATUS[0]}"
         set -e
