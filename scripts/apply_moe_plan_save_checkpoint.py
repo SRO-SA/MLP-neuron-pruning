@@ -548,79 +548,155 @@ def main() -> None:
             sys.exit(1)
 
     # ── Residual reconstruction (if requested) ────────────────────────────────
-    residual_applied     = False
-    residual_fallback    = False
-    actual_method        = method
-    residual_n_layers    = 0
+    residual_applied      = False
+    residual_fallback     = False
+    actual_method         = method
+    residual_n_layers     = 0
+    residual_failed_pairs = 0
     residual_stats_summary: Dict[str, Any] = {}
+
+    # Hash before any residual updates — used to verify residual actually changed weights
+    hash_pre_residual = _compute_weight_hash(model)
+    print(f"[ckpt] weight_hash (pre-residual): {hash_pre_residual}", flush=True)
 
     if method in RESIDUAL_METHODS:
         if _RESIDUAL_DISPATCH is None:
-            print(f"[ckpt] WARNING: moe_residual_methods not importable. "
-                  f"Falling back to pure_delete for method={method}")
-            residual_fallback = True
-            actual_method     = "pure_delete"
-        else:
-            print(f"[ckpt] Residual method: {method}")
-            print(f"[ckpt] Collecting calibration activations (n={args.calib_n}) ...")
-            calib_texts = _load_calib_texts(n_texts=args.calib_n)
+            print(
+                f"[ckpt] ERROR: moe_residual_methods not importable. "
+                f"Cannot apply residual method={method}. Check PYTHONPATH.",
+                flush=True,
+            )
+            sys.exit(1)
+
+        print(f"[ckpt] Residual method: {method}", flush=True)
+        print(f"[ckpt] Collecting calibration activations "
+              f"(n={args.calib_n}, seq_len={args.calib_seq_len}) ...", flush=True)
+        calib_texts = _load_calib_texts(n_texts=args.calib_n)
+        try:
+            layer_acts = collect_expert_activations_by_layer(
+                model, tokenizer, calib_texts,
+                max_seq_len=args.calib_seq_len,
+                plan_layers=plan_layers_set,
+                max_calib_layers=args.max_calib_layers,
+                timeout_sec=float(
+                    os.environ.get("RESIDUAL_CALIB_TIMEOUT_SEC", "900")
+                ),
+            )
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(f"[ckpt] ERROR: calibration failed: {exc}", flush=True)
+            sys.exit(1)
+
+        if not layer_acts:
+            print(
+                "[ckpt] ERROR: no calibration activations collected. "
+                "Cannot apply residual without activations.",
+                flush=True,
+            )
+            sys.exit(1)
+
+        print(f"[ckpt] Activations collected: {len(layer_acts)} layer(s) with data", flush=True)
+
+        layer_list_r = _find_layer_list(model)
+        if layer_list_r is None:
+            print("[ckpt] ERROR: cannot find transformer layer list.", flush=True)
+            sys.exit(1)
+
+        for lc in plan_data.get("layers", []):
+            li             = lc["layer_idx"]
+            prune_idx_list = lc.get("prune_idx", [])
+            old_d_ff       = lc.get("old_intermediate", 0)
+            if not prune_idx_list or old_d_ff == 0:
+                continue
+            if li not in layer_acts:
+                print(f"[ckpt] L{li}: no activations available; skipping", flush=True)
+                continue
+
+            layer_obj = layer_list_r[li]
+            mlp       = getattr(layer_obj, "mlp", None)
+            if mlp is None:
+                continue
+            experts = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
+
+            # Build index tensors required by apply_residual_dispatch_unpacked
+            prune_idx_t = torch.tensor(prune_idx_list, dtype=torch.long)
+            keep_mask   = torch.ones(old_d_ff, dtype=torch.bool)
+            keep_mask[prune_idx_t] = False
+            keep_idx_t  = torch.where(keep_mask)[0]
+
+            # expert_activations: {ei: Tensor[N, d_model]}
+            acts_by_expert = layer_acts[li]
+
+            # ── Dispatch: pass WHOLE expert list + both index tensors + cfg ──
             try:
-                layer_acts = collect_expert_activations_by_layer(
-                    model, tokenizer, calib_texts,
-                    max_seq_len=args.calib_seq_len,
-                    plan_layers=plan_layers_set,
-                    max_calib_layers=args.max_calib_layers,
-                    timeout_sec=float(
-                        os.environ.get("RESIDUAL_CALIB_TIMEOUT_SEC", "900")
-                    ),
+                stats = _RESIDUAL_DISPATCH(
+                    method,
+                    experts,         # list of all expert nn.Modules in this layer
+                    prune_idx_t,     # Tensor[n_pruned]
+                    keep_idx_t,      # Tensor[n_kept]
+                    acts_by_expert,  # {ei: Tensor[N, d_model]}
+                    {},              # residual_cfg — empty dict uses defaults
                 )
-                if not layer_acts:
-                    print("[ckpt] WARNING: no activations collected; falling back to pure_delete")
-                    residual_fallback = True
-                    actual_method     = "pure_delete"
-                else:
-                    print(f"[ckpt] Applying residual method to {len(layer_acts)} layers ...")
-                    layer_list = _find_layer_list(model)
-                    if layer_list is None:
-                        print("[ckpt] WARNING: cannot find layer list; residual skipped")
-                        residual_fallback = True
-                        actual_method     = "pure_delete"
-                    else:
-                        for lc in plan_data.get("layers", []):
-                            li        = lc["layer_idx"]
-                            prune_idx = lc.get("prune_idx", [])
-                            if not prune_idx or li not in layer_acts:
-                                continue
-                            layer   = layer_list[li]
-                            mlp     = getattr(layer, "mlp", None)
-                            if mlp is None:
-                                continue
-                            experts        = list(mlp.experts) if hasattr(mlp, "experts") else [mlp]
-                            acts_by_expert = layer_acts[li]
-                            for ei, expert in enumerate(experts):
-                                if ei not in acts_by_expert:
-                                    continue
-                                acts = acts_by_expert[ei]
-                                try:
-                                    stats = _RESIDUAL_DISPATCH(
-                                        method, expert, prune_idx, acts,
-                                    )
-                                    residual_n_layers += 1
-                                    if stats:
-                                        residual_stats_summary[f"L{li}_E{ei}"] = stats
-                                except Exception as exc:
-                                    print(f"[ckpt] WARNING: residual L{li} E{ei} failed: {exc}")
-                        residual_applied = True
-                        actual_method    = method
-                        print(f"[ckpt] Residual applied to {residual_n_layers} (layer, expert) pairs")
+                residual_n_layers += 1
+                if stats:
+                    residual_stats_summary[f"L{li}"] = stats
+                    n_att  = stats.get("n_attempted", "?")
+                    n_ok   = stats.get("n_stable",    "?")
+                    n_fail = int(stats.get("n_failed", 0))
+                    n_skip = stats.get("n_skipped",   "?")
+                    if n_fail > 0:
+                        residual_failed_pairs += n_fail
+                    print(f"[ckpt] L{li}: attempted={n_att}, stable={n_ok}, "
+                          f"failed={n_fail}, skipped={n_skip}", flush=True)
+            except TypeError as exc:
+                # Signature mismatch — stop immediately; never convert to a warning
+                print(f"[ckpt] ERROR: TypeError in residual dispatch at L{li}: {exc}",
+                      flush=True)
+                print("[ckpt] This is a call-site bug — aborting.", flush=True)
+                sys.exit(1)
             except Exception as exc:
-                print(f"[ckpt] WARNING: residual calibration failed: {exc}; falling back to pure_delete")
-                residual_fallback = True
-                actual_method     = "pure_delete"
+                print(f"[ckpt] ERROR: residual L{li} raised {type(exc).__name__}: {exc}",
+                      flush=True)
+                residual_failed_pairs += 1
+
+        # ── Hard validity checks — never save a mislabeled checkpoint ─────────
+        if residual_n_layers == 0:
+            print(
+                "[ckpt] ERROR: residual applied to 0 layers. "
+                "No down_proj weights were updated. "
+                "Refusing to save a checkpoint mislabeled as residual.",
+                flush=True,
+            )
+            sys.exit(1)
+
+        if residual_failed_pairs > 0:
+            print(
+                f"[ckpt] ERROR: {residual_failed_pairs} expert(s) failed during "
+                "residual reconstruction. "
+                "Refusing to save a partially-reconstructed checkpoint.",
+                flush=True,
+            )
+            sys.exit(1)
+
+        residual_applied = True
+        actual_method    = method
+        print(f"[ckpt] Residual applied OK: {residual_n_layers} layer(s) updated, "
+              f"0 failures", flush=True)
 
     # Hash after residual but before physical pruning
     hash_post_residual = _compute_weight_hash(model)
-    print(f"[ckpt] weight_hash (post-residual, pre-prune): {hash_post_residual}")
+    print(f"[ckpt] weight_hash (post-residual, pre-prune): {hash_post_residual}",
+          flush=True)
+
+    # If residual was applied, weights MUST have changed
+    if residual_applied and hash_post_residual == hash_pre_residual:
+        print(f"[ckpt] ERROR: residual method applied to {residual_n_layers} layer(s) "
+              f"but weight hash did not change.", flush=True)
+        print(f"[ckpt]   hash_pre_residual : {hash_pre_residual}", flush=True)
+        print(f"[ckpt]   hash_post_residual: {hash_post_residual}", flush=True)
+        print("[ckpt] Residual made no effective updates -- refusing to save.", flush=True)
+        sys.exit(1)
 
     # ── Physical pruning ──────────────────────────────────────────────────────
     print("[ckpt] Applying physical pruning ...")
@@ -689,7 +765,10 @@ def main() -> None:
         "actual_method":                        actual_method,
         "residual_applied":                     residual_applied,
         "residual_fallback_used":               residual_fallback,
+        "residual_applied_pairs":               residual_n_layers,
+        "residual_failed_pairs":                residual_failed_pairs,
         "weight_hash":                          hash_final,
+        "weight_hash_pre_residual":             hash_pre_residual,
         "weight_hash_post_residual_pre_prune":  hash_post_residual,
         "residual_n_layers_applied":            residual_n_layers,
         "residual_stats_summary":               residual_stats_summary,
@@ -702,13 +781,17 @@ def main() -> None:
     with open(pm_path, "w") as f:
         json.dump(pruning_metadata, f, indent=2)
 
-    print(f"[ckpt] pruning_metadata.json written: {pm_path}")
-    print(f"[ckpt] requested_method       = {method}")
-    print(f"[ckpt] actual_method          = {actual_method}")
-    print(f"[ckpt] residual_applied       = {residual_applied}")
-    print(f"[ckpt] residual_fallback_used = {residual_fallback}")
-    print(f"[ckpt] weight_hash            = {hash_final}")
-    print(f"[ckpt] Done.")
+    print(f"[ckpt] pruning_metadata.json written: {pm_path}", flush=True)
+    print(f"[ckpt] requested_method       = {method}", flush=True)
+    print(f"[ckpt] actual_method          = {actual_method}", flush=True)
+    print(f"[ckpt] residual_applied       = {residual_applied}", flush=True)
+    print(f"[ckpt] residual_applied_pairs = {residual_n_layers}", flush=True)
+    print(f"[ckpt] residual_failed_pairs  = {residual_failed_pairs}", flush=True)
+    print(f"[ckpt] residual_fallback_used = {residual_fallback}", flush=True)
+    print(f"[ckpt] weight_hash_pre_resid  = {hash_pre_residual}", flush=True)
+    print(f"[ckpt] weight_hash_post_resid = {hash_post_residual}", flush=True)
+    print(f"[ckpt] weight_hash_final      = {hash_final}", flush=True)
+    print(f"[ckpt] Done.", flush=True)
 
 
 if __name__ == "__main__":
