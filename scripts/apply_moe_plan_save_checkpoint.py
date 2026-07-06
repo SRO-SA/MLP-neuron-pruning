@@ -554,6 +554,13 @@ def main() -> None:
     residual_n_layers     = 0
     residual_failed_pairs = 0
     residual_stats_summary: Dict[str, Any] = {}
+    # Per-expert weight-change tracking (replaces unreliable global hash check)
+    residual_attempted_pairs = 0
+    residual_changed_pairs   = 0
+    residual_unchanged_pairs = 0
+    _all_max_deltas:  List[float] = []
+    _all_mean_deltas: List[float] = []
+    _MIN_TOKENS_FOR_SNAPSHOT = 16   # must match residual_cfg default
 
     # Hash before any residual updates — used to verify residual actually changed weights
     hash_pre_residual = _compute_weight_hash(model)
@@ -628,6 +635,17 @@ def main() -> None:
             # expert_activations: {ei: Tensor[N, d_model]}
             acts_by_expert = layer_acts[li]
 
+            # -- Snapshot down_proj weights for experts with enough tokens --
+            _before_weights: Dict[int, Any] = {}
+            for _ei, _exp in enumerate(experts):
+                _acts = acts_by_expert.get(_ei)
+                if _acts is not None and _acts.shape[0] >= _MIN_TOKENS_FOR_SNAPSHOT:
+                    _down = getattr(_exp, "down_proj", None)
+                    if _down is not None and hasattr(_down, "weight"):
+                        _before_weights[_ei] = (
+                            _down.weight.detach().float().cpu().clone()
+                        )
+
             # ── Dispatch: pass WHOLE expert list + both index tensors + cfg ──
             try:
                 stats = _RESIDUAL_DISPATCH(
@@ -649,6 +667,22 @@ def main() -> None:
                         residual_failed_pairs += n_fail
                     print(f"[ckpt] L{li}: attempted={n_att}, stable={n_ok}, "
                           f"failed={n_fail}, skipped={n_skip}", flush=True)
+                # -- Compare before/after weights --------------------------
+                for _ei, _bef in _before_weights.items():
+                    _down = getattr(experts[_ei], "down_proj", None)
+                    if _down is None:
+                        continue
+                    _aft   = _down.weight.detach().float().cpu()
+                    _d     = (_aft - _bef).abs()
+                    _maxd  = float(_d.max())
+                    _meand = float(_d.mean())
+                    residual_attempted_pairs += 1
+                    if _maxd > 0.0:
+                        residual_changed_pairs += 1
+                        _all_max_deltas.append(_maxd)
+                        _all_mean_deltas.append(_meand)
+                    else:
+                        residual_unchanged_pairs += 1
             except TypeError as exc:
                 # Signature mismatch — stop immediately; never convert to a warning
                 print(f"[ckpt] ERROR: TypeError in residual dispatch at L{li}: {exc}",
@@ -689,14 +723,41 @@ def main() -> None:
     print(f"[ckpt] weight_hash (post-residual, pre-prune): {hash_post_residual}",
           flush=True)
 
-    # If residual was applied, weights MUST have changed
-    if residual_applied and hash_post_residual == hash_pre_residual:
-        print(f"[ckpt] ERROR: residual method applied to {residual_n_layers} layer(s) "
-              f"but weight hash did not change.", flush=True)
-        print(f"[ckpt]   hash_pre_residual : {hash_pre_residual}", flush=True)
-        print(f"[ckpt]   hash_post_residual: {hash_post_residual}", flush=True)
-        print("[ckpt] Residual made no effective updates -- refusing to save.", flush=True)
-        sys.exit(1)
+    # -- Per-expert validation (replaces unreliable global hash check) ------
+    if residual_applied:
+        _max_delta  = max(_all_max_deltas)  if _all_max_deltas  else 0.0
+        _mean_delta = (
+            sum(_all_mean_deltas) / len(_all_mean_deltas)
+            if _all_mean_deltas else 0.0
+        )
+        print("[ckpt] Residual validation:", flush=True)
+        print(f"[ckpt]   attempted_pairs = {residual_attempted_pairs}", flush=True)
+        print(f"[ckpt]   changed_pairs   = {residual_changed_pairs}", flush=True)
+        print(f"[ckpt]   unchanged_pairs = {residual_unchanged_pairs}", flush=True)
+        print(f"[ckpt]   failed_pairs    = {residual_failed_pairs}", flush=True)
+        print(f"[ckpt]   max_abs_delta   = {_max_delta:.6e}", flush=True)
+        print(f"[ckpt]   mean_abs_delta  = {_mean_delta:.6e}", flush=True)
+        if residual_attempted_pairs == 0:
+            print(
+                "[ckpt] ERROR: 0 experts had enough tokens; residual made no updates.",
+                flush=True,
+            )
+            sys.exit(1)
+        if residual_changed_pairs == 0:
+            print(
+                "[ckpt] ERROR: residual attempted but changed 0 expert weights.",
+                flush=True,
+            )
+            sys.exit(1)
+        if residual_unchanged_pairs > 0:
+            print(
+                f"[ckpt] WARNING: {residual_unchanged_pairs} attempted expert(s) unchanged "
+                "(may have very small updates rounded to zero).",
+                flush=True,
+            )
+    else:
+        _max_delta  = 0.0
+        _mean_delta = 0.0
 
     # ── Physical pruning ──────────────────────────────────────────────────────
     print("[ckpt] Applying physical pruning ...")
@@ -767,6 +828,11 @@ def main() -> None:
         "residual_fallback_used":               residual_fallback,
         "residual_applied_pairs":               residual_n_layers,
         "residual_failed_pairs":                residual_failed_pairs,
+        "residual_attempted_pairs":             residual_attempted_pairs,
+        "residual_changed_pairs":               residual_changed_pairs,
+        "residual_unchanged_pairs":             residual_unchanged_pairs,
+        "residual_max_abs_weight_delta":        _max_delta,
+        "residual_mean_abs_weight_delta":       _mean_delta,
         "weight_hash":                          hash_final,
         "weight_hash_pre_residual":             hash_pre_residual,
         "weight_hash_post_residual_pre_prune":  hash_post_residual,
@@ -786,7 +852,10 @@ def main() -> None:
     print(f"[ckpt] actual_method          = {actual_method}", flush=True)
     print(f"[ckpt] residual_applied       = {residual_applied}", flush=True)
     print(f"[ckpt] residual_applied_pairs = {residual_n_layers}", flush=True)
-    print(f"[ckpt] residual_failed_pairs  = {residual_failed_pairs}", flush=True)
+    print(f"[ckpt] residual_failed_pairs    = {residual_failed_pairs}", flush=True)
+    print(f"[ckpt] residual_attempted_pairs = {residual_attempted_pairs}", flush=True)
+    print(f"[ckpt] residual_changed_pairs   = {residual_changed_pairs}", flush=True)
+    print(f"[ckpt] residual_max_abs_delta   = {_max_delta:.6e}", flush=True)
     print(f"[ckpt] residual_fallback_used = {residual_fallback}", flush=True)
     print(f"[ckpt] weight_hash_pre_resid  = {hash_pre_residual}", flush=True)
     print(f"[ckpt] weight_hash_post_resid = {hash_post_residual}", flush=True)

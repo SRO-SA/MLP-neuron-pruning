@@ -65,6 +65,7 @@ SKIP_EXISTING="${SKIP_EXISTING:-0}"
 AUTO_GENERATE_PLAN="${AUTO_GENERATE_PLAN:-0}"
 CONFIG_PREFIX="$(echo "${MODEL}" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
 CLEANUP_CHECKPOINTS="${CLEANUP_CHECKPOINTS:-0}"
+SKIP_BASELINE="${SKIP_BASELINE:-0}"
 RESIDUAL_CALIB_N="${RESIDUAL_CALIB_N:-8}"
 RESIDUAL_CALIB_SEQ_LEN="${RESIDUAL_CALIB_SEQ_LEN:-128}"
 RESIDUAL_CALIB_TIMEOUT_SEC="${RESIDUAL_CALIB_TIMEOUT_SEC:-900}"
@@ -276,7 +277,10 @@ _setting_passes_filter() {
     local _fm="$1"
     local _ft="$2"   # target_pct string, e.g. "2.0" or "6.0"
 
-    [ "${_fm}" = "baseline" ] && return 0
+    if [ "${_fm}" = "baseline" ]; then
+        [ "${SKIP_BASELINE}" = "1" ] && echo "[filter] SKIP_BASELINE=1: skipping baseline" && return 1
+        return 0
+    fi
 
     if [ -n "${ONLY_METHODS}" ]; then
         local _found=0
