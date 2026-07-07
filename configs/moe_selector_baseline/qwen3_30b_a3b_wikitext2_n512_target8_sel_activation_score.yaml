@@ -12,9 +12,9 @@ moe_selector: activation_score
 moe_same_channel_aggregation: p95
 moe_channel_alignment: 16
 moe_max_layer_channel_prune_frac: 0.1
-max_expert_frac: 0.1
+max_expert_frac: 0.2
 min_expert_tokens: 32
-moe_budget_mode: uniform
+moe_budget_mode: global
 eval_datasets:
 - wikitext2
 moe_calib_dataset: wikitext2

@@ -3,7 +3,7 @@
 #
 # PPL-only selector attribution benchmark.
 # 4 selectors x 4 targets x wikitext2 = 16 runs.
-# All use: pure_delete method, moe_budget_mode=uniform (identical per-layer
+# All use: pure_delete method, moe_budget_mode=global (greedy global layer-channel selection;
 # channel budgets -> actual_pct is selector-independent; only WHICH channels
 # differ).
 #
@@ -17,10 +17,14 @@
 #   bash scripts/run_moe_selector_baseline_ppl.sh          # full 16-run
 #   SMOKE=1 bash scripts/run_moe_selector_baseline_ppl.sh  # 2 runs (rmsnorm+random, target2)
 #   DRY_RUN=1 bash scripts/run_moe_selector_baseline_ppl.sh
+#   SUMMARIZE_ONLY=1 RUN_DIR=results/moe_selector_baselines/20260707_194241 \
+#       bash scripts/run_moe_selector_baseline_ppl.sh
 #
 # Env overrides:
 #   SMOKE=1                      2 runs: rmsnorm_bound+random, target2 only
 #   DRY_RUN=1                    list planned runs, skip execution
+#   SUMMARIZE_ONLY=1             skip runs; rebuild CSVs from existing raw files
+#   RUN_DIR=...                  explicit run dir (required with SUMMARIZE_ONLY=1)
 #   ONLY_SELECTORS=a,b,c         comma-separated selector filter
 #   ONLY_TARGETS=2,4,6,8         comma-separated target pct filter (integers)
 #   N_EVAL=512                   calibration/eval samples (must match config filename)
@@ -40,6 +44,7 @@ cd "${REPO_ROOT}"
 # ── Env config ────────────────────────────────────────────────────────────────
 SMOKE="${SMOKE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+SUMMARIZE_ONLY="${SUMMARIZE_ONLY:-0}"
 ONLY_SELECTORS="${ONLY_SELECTORS:-rmsnorm_bound,down_norm,activation_score,random}"
 ONLY_TARGETS="${ONLY_TARGETS:-2,4,6,8}"
 N_EVAL="${N_EVAL:-512}"
@@ -53,7 +58,8 @@ DATASET="wikitext2"
 MODEL="Qwen/Qwen3-30B-A3B"
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="${RESULTS_BASE}/${RUN_ID}"
+# Allow RUN_DIR override for SUMMARIZE_ONLY mode; otherwise auto-generate
+RUN_DIR="${RUN_DIR:-${RESULTS_BASE}/${RUN_ID}}"
 SUMMARY_CSV="${RUN_DIR}/selector_baseline_summary.csv"
 ATTRIBUTION_CSV="${RUN_DIR}/selector_attribution_summary.csv"
 
@@ -75,7 +81,10 @@ echo "[ppl] Selectors: ${_SEL_LIST[*]}"
 echo "[ppl] Targets  : ${_TGT_LIST[*]}%"
 echo "[ppl] Dataset  : ${DATASET}"
 echo "[ppl] N_EVAL   : ${N_EVAL}"
-if [ "${DRY_RUN}" = "1" ]; then
+if [ "${SUMMARIZE_ONLY}" = "1" ]; then
+    echo "[ppl] Mode     : SUMMARIZE_ONLY"
+    echo "[ppl] Run dir  : ${RUN_DIR}"
+elif [ "${DRY_RUN}" = "1" ]; then
     echo "[ppl] Mode     : DRY_RUN (no execution)"
 else
     echo "[ppl] Run dir  : ${RUN_DIR}"
@@ -87,6 +96,33 @@ echo "[ppl] ======================================================="
 if [ -f "${VENV}/bin/activate" ]; then
     # shellcheck source=/dev/null
     source "${VENV}/bin/activate"
+fi
+
+# ── SUMMARIZE_ONLY: rebuild CSVs from existing raw files; skip all runs ───────
+if [ "${SUMMARIZE_ONLY}" = "1" ]; then
+    if [ ! -d "${RUN_DIR}" ]; then
+        echo "[ppl] ERROR: RUN_DIR=${RUN_DIR} does not exist."
+        echo "[ppl]   Set RUN_DIR=results/moe_selector_baselines/<run_id>"
+        exit 1
+    fi
+    EXPECTED_ROWS=$(( ${#_SEL_LIST[@]} * ${#_TGT_LIST[@]} ))
+    echo "[ppl] Rebuilding summaries from ${RUN_DIR}"
+    echo "[ppl] Expected rows: ${EXPECTED_ROWS}"
+    python3 scripts/summarize_moe_selector_ppl.py \
+        --run-dir      "${RUN_DIR}" \
+        --model        "${MODEL}" \
+        --dataset      "${DATASET}" \
+        --selectors    "${ONLY_SELECTORS}" \
+        --targets      "${ONLY_TARGETS}" \
+        --orig-moe-dim 768 \
+        --moe-align    16 \
+        --min-rows     "${EXPECTED_ROWS}" \
+        2>&1
+    _rc=$?
+    echo ""
+    echo "[ppl] Summary CSV   : ${SUMMARY_CSV}"
+    echo "[ppl] Attribution   : ${ATTRIBUTION_CSV}"
+    exit ${_rc}
 fi
 
 # ── DRY_RUN: list planned runs and exit ───────────────────────────────────────
@@ -119,7 +155,6 @@ fi
 mkdir -p "${RUN_DIR}"
 
 # ── Auto-generate missing configs ─────────────────────────────────────────────
-# Determine selector/target scope for generation (matches the actual run scope).
 _NEED_SELECTORS="${ONLY_SELECTORS}"
 _NEED_TARGETS="${ONLY_TARGETS}"
 if [ "${SMOKE}" = "1" ]; then
@@ -147,7 +182,8 @@ if [ "${_any_missing}" = "1" ]; then
             --selectors  "${_NEED_SELECTORS}" \
             --targets    "${_NEED_TARGETS}" \
             --n-eval     "${N_EVAL}" \
-            --config-dir "${CONFIG_DIR}"
+            --config-dir "${CONFIG_DIR}" \
+            --overwrite
         echo "[ppl] Config generation complete."
     else
         echo "[ppl] ERROR: missing configs and AUTO_GENERATE_CONFIGS is not set."
@@ -178,7 +214,7 @@ if [ "${_MISSING}" -gt 0 ]; then
 fi
 echo "[ppl] Pre-flight OK: all configs found."
 
-# ── Validate config correctness (moe_budget_mode=uniform required) ────────────
+# ── Validate config correctness (moe_budget_mode=global required) ────────────
 _validate_cfg() {
     python3 - "$1" << 'PYVAL'
 import sys, yaml
@@ -186,8 +222,8 @@ path = sys.argv[1]
 with open(path) as f:
     cfg = yaml.safe_load(f)
 bad = []
-if cfg.get("moe_budget_mode") != "uniform":
-    bad.append("moe_budget_mode must be 'uniform', got: " + repr(cfg.get("moe_budget_mode")))
+if cfg.get("moe_budget_mode") not in ("global", None):
+    bad.append("moe_budget_mode must be 'global' (or None/missing), got: " + repr(cfg.get("moe_budget_mode")))
 if cfg.get("scaling_methods") != ["pure_delete"]:
     bad.append("scaling_methods must be ['pure_delete'], got: " + repr(cfg.get("scaling_methods")))
 if bad:
@@ -202,7 +238,7 @@ for sel in "${_SEL_LIST[@]}"; do
         _validate_cfg "${cfg}" || exit 1
     done
 done
-echo "[ppl] Config validation OK (moe_budget_mode=uniform confirmed for all)."
+echo "[ppl] Config validation OK (moe_budget_mode=global confirmed for all)."
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 FAILED=0
@@ -220,16 +256,13 @@ for sel in "${_SEL_LIST[@]}"; do
         echo "[ppl] --- selector=${sel}  target=${tgt}%  ---"
         mkdir -p "${run_out}"
 
-        # Create temp config with output_dir overridden to run_out,
-        # and plan_dir pointed at the shared plan dir (selector-specific filenames).
+        # Create temp config with output_dir overridden to run_out
         python3 - "${base_cfg}" "${run_out}" "${PLAN_DIR}" "${tmp_cfg}" << 'PYCFG'
 import sys, yaml, os
 src, out_dir, plan_dir, dst = sys.argv[1:5]
 with open(src) as f:
     cfg = yaml.safe_load(f)
 cfg["output_dir"] = out_dir
-# Keep save_pruning_plan=true so selector-specific plan is saved.
-# Plan filenames already embed the selector name (from make_pruning_plan_path).
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, default_flow_style=False)
 print("[ppl]   Temp config: " + dst)
@@ -253,7 +286,8 @@ PYCFG
         fi
 
         # Sanity: verify at least one CSV was written
-        _n_csvs=$(find "${run_out}" -name "moe_target_pruning_*.csv" 2>/dev/null | wc -l)
+        _n_csvs=$(find "${run_out}" -name "moe_target_pruning_*.csv" \
+                  ! -name "*_per_layer.csv" 2>/dev/null | wc -l)
         if [ "${_n_csvs}" -eq 0 ]; then
             echo "[ppl] ERROR: run exited 0 but no moe_target_pruning_*.csv in ${run_out}"
             FAILED=$(( FAILED + 1 ))
@@ -261,6 +295,49 @@ PYCFG
         fi
 
         echo "[ppl] OK: ${label} (${_n_csvs} CSV(s) written)"
+
+        # ── Per-run removal distribution diagnostic ───────────────────────────
+        _per_layer_csv=$(find "${run_out}" -name "*_per_layer.csv" | head -1)
+        if [ -n "${_per_layer_csv}" ]; then
+            echo "[ppl] --- Removal distribution for ${label} ---"
+            python3 - "${_per_layer_csv}" << 'PYDIAG'
+import sys, csv, collections
+path = sys.argv[1]
+removed = []
+with open(path, newline="") as f:
+    for row in csv.DictReader(f):
+        # Try explicit column first, then derive from old-new
+        for col in ("removed", "channels_removed", "num_removed"):
+            if col in row and str(row[col]).strip():
+                try:
+                    removed.append(int(float(row[col])))
+                    break
+                except (ValueError, TypeError):
+                    pass
+        else:
+            old_i = row.get("old_intermediate", row.get("original_intermediate", ""))
+            new_i = row.get("new_intermediate", row.get("new_i", ""))
+            try:
+                removed.append(int(float(old_i)) - int(float(new_i)))
+            except (ValueError, TypeError):
+                pass
+if not removed:
+    print("[ppl]   (no removal data in per-layer CSV)")
+else:
+    counts = collections.Counter(removed)
+    print("[ppl]   removed per layer value counts:")
+    for v, c in sorted(counts.items()):
+        print(f"[ppl]     {v:4d}   {c} layers")
+    total    = sum(v * c for v, c in counts.items())
+    n_zero   = counts.get(0, 0)
+    n_nz     = sum(c for v, c in counts.items() if v > 0)
+    print(f"[ppl]   total removed layer-channels : {total}")
+    print(f"[ppl]   layers with zero pruning     : {n_zero}")
+    print(f"[ppl]   layers with nonzero pruning  : {n_nz}")
+    print(f"[ppl]   max removed in one layer     : {max(removed)}")
+PYDIAG
+        fi
+
         SUCCEEDED=$(( SUCCEEDED + 1 ))
     done
 done
@@ -277,7 +354,6 @@ fi
 
 # ── Build summary + attribution CSVs ─────────────────────────────────────────
 EXPECTED_ROWS=$(( ${#_SEL_LIST[@]} * ${#_TGT_LIST[@]} ))
-# For SMOKE or partial runs, don't require the full 16
 if [ "${SMOKE}" = "1" ]; then
     MIN_ROWS="${EXPECTED_ROWS}"
 else
