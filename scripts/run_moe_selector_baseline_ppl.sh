@@ -2,16 +2,16 @@
 # run_moe_selector_baseline_ppl.sh
 #
 # PPL-only selector attribution benchmark.
-# 4 selectors × 4 targets × wikitext2 = 16 runs.
+# 4 selectors x 4 targets x wikitext2 = 16 runs.
 # All use: pure_delete method, moe_budget_mode=uniform (identical per-layer
-# channel budgets → actual_pct is selector-independent; only WHICH channels
+# channel budgets -> actual_pct is selector-independent; only WHICH channels
 # differ).
 #
 # Selectors compared:
-#   rmsnorm_bound    — weight-only RMSNorm-bounded SwiGLU score (proposed)
-#   down_norm        — L2 norm of each down_proj column (simple baseline)
-#   activation_score — SiLU(gate)*up activation × down-norm (calib-based)
-#   random           — uniform random (random baseline)
+#   rmsnorm_bound    -- weight-only RMSNorm-bounded SwiGLU score (proposed)
+#   down_norm        -- L2 norm of each down_proj column (simple baseline)
+#   activation_score -- SiLU(gate)*up activation x down-norm (calib-based)
+#   random           -- uniform random (random baseline)
 #
 # Usage:
 #   bash scripts/run_moe_selector_baseline_ppl.sh          # full 16-run
@@ -24,6 +24,7 @@
 #   ONLY_SELECTORS=a,b,c         comma-separated selector filter
 #   ONLY_TARGETS=2,4,6,8         comma-separated target pct filter (integers)
 #   N_EVAL=512                   calibration/eval samples (must match config filename)
+#   AUTO_GENERATE_CONFIGS=1      auto-generate missing configs before running (default: 1)
 #   CONTINUE_ON_FAIL=1           keep going past failures (default: abort on first)
 #   RESULTS_BASE=...             base dir (default: results/moe_selector_baselines)
 #   CONFIG_DIR=...               config dir (default: configs/moe_selector_baseline)
@@ -42,6 +43,7 @@ DRY_RUN="${DRY_RUN:-0}"
 ONLY_SELECTORS="${ONLY_SELECTORS:-rmsnorm_bound,down_norm,activation_score,random}"
 ONLY_TARGETS="${ONLY_TARGETS:-2,4,6,8}"
 N_EVAL="${N_EVAL:-512}"
+AUTO_GENERATE_CONFIGS="${AUTO_GENERATE_CONFIGS:-1}"
 CONTINUE_ON_FAIL="${CONTINUE_ON_FAIL:-0}"
 RESULTS_BASE="${RESULTS_BASE:-results/moe_selector_baselines}"
 CONFIG_DIR="${CONFIG_DIR:-configs/moe_selector_baseline}"
@@ -78,6 +80,7 @@ if [ "${DRY_RUN}" = "1" ]; then
 else
     echo "[ppl] Run dir  : ${RUN_DIR}"
 fi
+echo "[ppl] AutoGenCfg: ${AUTO_GENERATE_CONFIGS}"
 echo "[ppl] ======================================================="
 
 # ── Activate virtualenv ───────────────────────────────────────────────────────
@@ -96,8 +99,10 @@ if [ "${DRY_RUN}" = "1" ]; then
             cfg="${CONFIG_DIR}/qwen3_30b_a3b_${DATASET}_n${N_EVAL}_target${tgt}_sel_${sel}.yaml"
             if [ -f "${cfg}" ]; then
                 status="FOUND"
+            elif [ "${AUTO_GENERATE_CONFIGS}" = "1" ]; then
+                status="MISSING (will auto-generate)"
             else
-                status="MISSING -- run: python3 scripts/generate_moe_selector_baseline_configs.py"
+                status="MISSING -- set AUTO_GENERATE_CONFIGS=1 or run: python3 scripts/generate_moe_selector_baseline_configs.py --n-eval ${N_EVAL} --dataset ${DATASET} --selectors ${ONLY_SELECTORS} --targets ${ONLY_TARGETS}"
             fi
             printf "  %2d. %-20s  target=%2s%%  [%s]\n" \
                 "${n}" "${sel}" "${tgt}" "${status}"
@@ -105,13 +110,56 @@ if [ "${DRY_RUN}" = "1" ]; then
     done
     echo ""
     echo "[ppl] ${n} run(s) planned."
-    echo "[ppl] Results → ${RESULTS_BASE}/<run_id>/"
-    echo "[ppl] Summary → selector_baseline_summary.csv"
-    echo "[ppl]         → selector_attribution_summary.csv"
+    echo "[ppl] Results -> ${RESULTS_BASE}/<run_id>/"
+    echo "[ppl] Summary -> selector_baseline_summary.csv"
+    echo "[ppl]         -> selector_attribution_summary.csv"
     exit 0
 fi
 
 mkdir -p "${RUN_DIR}"
+
+# ── Auto-generate missing configs ─────────────────────────────────────────────
+# Determine selector/target scope for generation (matches the actual run scope).
+_NEED_SELECTORS="${ONLY_SELECTORS}"
+_NEED_TARGETS="${ONLY_TARGETS}"
+if [ "${SMOKE}" = "1" ]; then
+    _NEED_SELECTORS="rmsnorm_bound,random"
+    _NEED_TARGETS="2"
+fi
+
+_any_missing=0
+for sel in "${_SEL_LIST[@]}"; do
+    for tgt in "${_TGT_LIST[@]}"; do
+        cfg="${CONFIG_DIR}/qwen3_30b_a3b_${DATASET}_n${N_EVAL}_target${tgt}_sel_${sel}.yaml"
+        if [ ! -f "${cfg}" ]; then
+            _any_missing=1
+            break 2
+        fi
+    done
+done
+
+if [ "${_any_missing}" = "1" ]; then
+    if [ "${AUTO_GENERATE_CONFIGS}" = "1" ]; then
+        echo "[ppl] Missing configs detected -- auto-generating (N_EVAL=${N_EVAL}) ..."
+        python3 scripts/generate_moe_selector_baseline_configs.py \
+            --model      "${MODEL}" \
+            --dataset    "${DATASET}" \
+            --selectors  "${_NEED_SELECTORS}" \
+            --targets    "${_NEED_TARGETS}" \
+            --n-eval     "${N_EVAL}" \
+            --config-dir "${CONFIG_DIR}"
+        echo "[ppl] Config generation complete."
+    else
+        echo "[ppl] ERROR: missing configs and AUTO_GENERATE_CONFIGS is not set."
+        echo "[ppl]   To fix, run:"
+        echo "[ppl]     python3 scripts/generate_moe_selector_baseline_configs.py \\"
+        echo "[ppl]         --n-eval ${N_EVAL} --dataset ${DATASET} \\"
+        echo "[ppl]         --selectors ${_NEED_SELECTORS} \\"
+        echo "[ppl]         --targets ${_NEED_TARGETS}"
+        echo "[ppl]   Or re-run with AUTO_GENERATE_CONFIGS=1."
+        exit 1
+    fi
+fi
 
 # ── Pre-flight: validate all configs exist ────────────────────────────────────
 _MISSING=0
@@ -119,14 +167,13 @@ for sel in "${_SEL_LIST[@]}"; do
     for tgt in "${_TGT_LIST[@]}"; do
         cfg="${CONFIG_DIR}/qwen3_30b_a3b_${DATASET}_n${N_EVAL}_target${tgt}_sel_${sel}.yaml"
         if [ ! -f "${cfg}" ]; then
-            echo "[ppl] ERROR: config missing: ${cfg}"
+            echo "[ppl] ERROR: config still missing after generation: ${cfg}"
             _MISSING=$(( _MISSING + 1 ))
         fi
     done
 done
 if [ "${_MISSING}" -gt 0 ]; then
-    echo "[ppl] ERROR: ${_MISSING} config(s) missing."
-    echo "[ppl]   Generate: python3 scripts/generate_moe_selector_baseline_configs.py"
+    echo "[ppl] ERROR: ${_MISSING} config(s) still missing (generation may have failed)."
     exit 1
 fi
 echo "[ppl] Pre-flight OK: all configs found."

@@ -1,0 +1,32 @@
+batch_size: 4
+device_map: auto
+eval_datasets:
+- wikitext2
+expected_expert_layout: unpacked
+load_pruning_plan: null
+max_expert_frac: 0.1
+max_seq_len: 512
+min_expert_tokens: 32
+moe_budget_mode: uniform
+moe_calib_dataset: wikitext2
+moe_calib_samples: 128
+moe_channel_alignment: 16
+moe_inplace_pruning: true
+moe_max_layer_channel_prune_frac: 0.1
+moe_pruning_mode: packed_same_channel
+moe_same_channel_aggregation: p95
+moe_selector: rmsnorm_bound
+moe_selector_needs_calib: false
+moe_smoke_test: false
+output_dir: results/moe_selector_baselines/20260707_115132/rmsnorm_bound_target2
+reconstruction_eval_samples: 128
+save_pruning_plan: true
+scaling_dtype: auto
+scaling_methods:
+- pure_delete
+scaling_models:
+- Qwen/Qwen3-30B-A3B
+seed: 42
+target_pruning_percents:
+- 2.0
+use_fallback_corpus: false
