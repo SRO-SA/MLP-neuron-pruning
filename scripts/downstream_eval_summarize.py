@@ -7,13 +7,14 @@ Post-process downstream evaluation outputs.
 Modes
 -----
 Default (after a run):
-    Reads downstream_summary.csv, computes comparison vs baseline,
-    writes downstream_comparison_summary.csv, prints compact table.
+    Reads downstream_summary.csv, migrates legacy schema if needed, computes
+    comparison vs baseline, writes downstream_comparison_summary.csv, prints table.
 
 --summarize-only (rebuild from raw lm_eval dirs):
-    Scans RUN_DIR for *_lm_eval/ subdirectories, parses labels and
-    lm_eval JSON outputs, rebuilds downstream_summary.csv from scratch,
-    then runs the default mode steps.
+    Scans RUN_DIR for *_lm_eval/ subdirectories, parses labels and lm_eval JSON
+    outputs, reads pruning_metadata.json from ${RUN_DIR}/pruned_checkpoints/${label}/
+    when available, rebuilds downstream_summary.csv from scratch, then runs the
+    default mode steps.
 
 Usage
 -----
@@ -24,7 +25,7 @@ Usage
         --orig-moe-dim 768 --moe-align 16 --model Qwen/Qwen3-30B-A3B
 
     # Rebuild summaries from an existing run without re-running lm_eval:
-    SUMMARIZE_ONLY=1 RUN_DIR=results/downstream_eval_runs/20260624_213446 \\
+    SUMMARIZE_ONLY=1 RUN_DIR=results/downstream_eval_runs/20260624_213446 \
         bash scripts/run_moe_downstream_eval.sh
 """
 
@@ -36,16 +37,28 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── CSV schemas ───────────────────────────────────────────────────────────────
 
+# Current canonical schema (24 fields)
 SUMMARY_FIELDS = [
     "setting_label", "method", "selector", "dataset",
     "target_pct", "actual_pct", "moe_dim",
     "expert_param_reduction_pct", "total_model_param_reduction_pct",
     "pruning_plan_path", "model_path", "is_pruned",
     "requested_method", "actual_method", "residual_applied", "residual_fallback_used",
+    "task", "metric", "value", "stderr",
+    "num_fewshot", "limit", "batch_size", "status",
+]
+
+# Legacy schema (20 fields, missing the 4 residual fields after is_pruned)
+OLD_SUMMARY_FIELDS = [
+    "setting_label", "method", "selector", "dataset",
+    "target_pct", "actual_pct", "moe_dim",
+    "expert_param_reduction_pct", "total_model_param_reduction_pct",
+    "pruning_plan_path", "model_path", "is_pruned",
     "task", "metric", "value", "stderr",
     "num_fewshot", "limit", "batch_size", "status",
 ]
@@ -57,6 +70,103 @@ COMPARISON_FIELDS = [
     "baseline_value", "pruned_value", "delta", "relative_delta_pct",
     "baseline_stderr", "pruned_stderr",
 ]
+
+
+# ── Schema migration + validation ─────────────────────────────────────────────
+
+def migrate_summary_csv(csv_path: str) -> int:
+    """
+    Migrate an existing downstream_summary.csv from the old 20-field schema to the
+    current 24-field schema in place. Returns the number of rows migrated (0 if the
+    file is already current schema or does not exist).
+    Raises RuntimeError on an unexpected schema.
+    """
+    if not os.path.isfile(csv_path):
+        return 0
+    with open(csv_path, newline="") as fh:
+        header = next(csv.reader(fh), [])
+    if header == SUMMARY_FIELDS:
+        return 0   # already correct
+    if header == OLD_SUMMARY_FIELDS:
+        print("[summarize] Detected legacy 20-field schema -- migrating: {}".format(csv_path))
+        with open(csv_path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        for row in rows:
+            m = row.get("method", "")
+            row["requested_method"]   = m
+            row["actual_method"]      = m
+            row["residual_applied"]   = ""
+            row["residual_fallback_used"] = ""
+        with open(csv_path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        print("[summarize] Migration complete: {} rows -> 24-field schema.".format(len(rows)))
+        return len(rows)
+    raise RuntimeError(
+        "[summarize] ERROR: {} has unexpected schema ({} fields).\n"
+        "  Expected {} (legacy) or {} (current) fields.\n"
+        "  First 5 header fields: {}\n"
+        "  Run with SUMMARIZE_ONLY=1 to rebuild from scratch.".format(
+            csv_path, len(header),
+            len(OLD_SUMMARY_FIELDS), len(SUMMARY_FIELDS),
+            header[:5],
+        )
+    )
+
+
+def validate_summary_schema(rows: List[Dict], csv_path: str) -> None:
+    """
+    Fail with a clear error if any row is missing required SUMMARY_FIELDS keys.
+    Missing keys (value == None) indicate a truncated or misaligned CSV row.
+    """
+    bad: List[Tuple[int, List[str]]] = []
+    for i, row in enumerate(rows):
+        missing = [f for f in SUMMARY_FIELDS if row.get(f) is None]
+        if missing:
+            bad.append((i, missing))
+    if not bad:
+        return
+    print("[summarize] ERROR: schema validation failed for {}".format(csv_path))
+    for idx, missing in bad[:10]:
+        print("[summarize]   row {:4d}: missing fields {}".format(idx, missing))
+    if len(bad) > 10:
+        print("[summarize]   ... and {} more rows with missing fields".format(len(bad) - 10))
+    print("[summarize] Hint: CSV may still have a mix of old and new row formats.")
+    print("[summarize] Run with SUMMARIZE_ONLY=1 to rebuild from scratch.")
+    sys.exit(1)
+
+
+def validate_comparison_completeness(
+    summary_rows: List[Dict], comp_rows: List[Dict],
+) -> None:
+    """
+    Print per-method counts and fail clearly if residual rows exist in summary
+    but are absent from comparison (which indicates a join failure).
+    """
+    summary_methods = Counter(
+        str(r.get("actual_method") or r.get("method", ""))
+        for r in summary_rows
+        if str(r.get("method", "")).lower() != "baseline"
+    )
+    comp_methods = Counter(str(r.get("method", "")) for r in comp_rows)
+
+    print("[summarize] Non-baseline row counts:")
+    for m in sorted(set(list(summary_methods) + list(comp_methods))):
+        s_n = summary_methods.get(m, 0)
+        c_n = comp_methods.get(m, 0)
+        flag = "  **MISSING FROM COMPARISON**" if s_n > 0 and c_n == 0 else ""
+        print("[summarize]   {:42s}  summary={:4d}  comparison={:4d}{}".format(
+            m[:42], s_n, c_n, flag))
+
+    missing = sorted(m for m in summary_methods if comp_methods[m] == 0)
+    if missing:
+        print("[summarize] ERROR: the following methods have summary rows but 0 comparison rows:")
+        for m in missing:
+            print("[summarize]   {} ({} summary rows)".format(m, summary_methods[m]))
+        print("[summarize] Check that a baseline setting was evaluated.")
+        print("[summarize] If baseline is missing, re-run without SKIP_BASELINE=1.")
+        sys.exit(1)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,14 +209,12 @@ def find_plan_file(plan_dir: str, method: str, selector: str, dataset: str,
     if not plan_dir or not os.path.isdir(plan_dir):
         return "NONE"
     target = int(float(target_pct))
-    # Exact pattern first
     exact = os.path.join(
         plan_dir,
         f"{model_slug}_{dataset}_n512_calib512_{selector}_p95_{target}.0pct_align16.json",
     )
     if os.path.isfile(exact):
         return exact
-    # Glob fallback (any n/calib values)
     hits = glob.glob(os.path.join(
         plan_dir, f"{model_slug}_{dataset}_n*_{selector}_*_{target}.0pct_align16.json",
     ))
@@ -131,6 +239,23 @@ def read_plan_meta(plan_path: str) -> Dict[str, Any]:
         return {}
 
 
+def read_pruning_metadata(run_dir: str, label: str) -> Dict[str, Any]:
+    """
+    Try to load pruning_metadata.json from the per-setting checkpoint directory.
+    Returns an empty dict if not found.
+    """
+    ckpt_dir = os.path.join(run_dir, "pruned_checkpoints", label)
+    pm_path  = os.path.join(ckpt_dir, "pruning_metadata.json")
+    if not os.path.isfile(pm_path):
+        return {}
+    try:
+        with open(pm_path) as fh:
+            return json.load(fh)
+    except Exception as e:
+        print("[summarize] WARNING: cannot read {}: {}".format(pm_path, e))
+        return {}
+
+
 def parse_lm_eval_dir(lm_eval_dir: str) -> Tuple[List[Dict], Dict]:
     """
     Parse all lm_eval JSON files in a *_lm_eval/ directory.
@@ -148,7 +273,6 @@ def parse_lm_eval_dir(lm_eval_dir: str) -> Tuple[List[Dict], Dict]:
             print("[summarize] WARNING: cannot open {}: {}".format(rf, e))
             continue
 
-        # Extract eval config (num_fewshot, limit, batch_size) from first file that has it
         if not config_info:
             raw_cfg = data.get("config", data.get("configs", {}))
             if isinstance(raw_cfg, dict):
@@ -178,7 +302,7 @@ def parse_lm_eval_dir(lm_eval_dir: str) -> Tuple[List[Dict], Dict]:
 
 def build_comparison(summary_rows: List[Dict]) -> List[Dict]:
     """
-    Join pruned rows against baseline rows by (task, metric).
+    Join ALL non-baseline pruned rows against baseline rows by (task, metric).
     delta = pruned_value - baseline_value  (negative = accuracy degraded).
     """
     baseline: Dict[Tuple, Dict] = {}
@@ -211,8 +335,8 @@ def build_comparison(summary_rows: List[Dict]) -> List[Dict]:
             "moe_dim":                row.get("moe_dim", ""),
             "requested_method":       row.get("requested_method", row.get("method", "")),
             "actual_method":          row.get("actual_method", row.get("method", "")),
-            "residual_applied":       row.get("residual_applied", "unknown"),
-            "residual_fallback_used": row.get("residual_fallback_used", "unknown"),
+            "residual_applied":       row.get("residual_applied", ""),
+            "residual_fallback_used": row.get("residual_fallback_used", ""),
             "task":                   row["task"],
             "metric":                 row["metric"],
             "baseline_value":         base["value"],
@@ -307,6 +431,21 @@ def main() -> None:
             if plan_meta.get("actual_pct"):
                 linfo["actual_pct"] = plan_meta["actual_pct"]
 
+            # Try to recover residual metadata from pruning_metadata.json
+            pm_requested = linfo["method"]
+            pm_actual    = linfo["method"]
+            pm_residual  = ""
+            pm_fallback  = ""
+            if linfo["is_pruned"]:
+                pm = read_pruning_metadata(args.run_dir, label)
+                if pm:
+                    pm_requested = pm.get("requested_method", linfo["method"])
+                    pm_actual    = pm.get("actual_method",    linfo["method"])
+                    pm_residual  = str(pm.get("residual_applied",      ""))
+                    pm_fallback  = str(pm.get("residual_fallback_used", ""))
+                    print("[summarize]   {}: loaded pruning_metadata.json "
+                          "(actual_method={})".format(label, pm_actual))
+
             moe_dim   = infer_moe_dim(linfo["actual_pct"], args.orig_moe_dim, args.moe_align)
             metrics, cfg_info = parse_lm_eval_dir(lm_dir)
 
@@ -315,9 +454,7 @@ def main() -> None:
                 missing_meta.append(label)
                 continue
 
-            limit_val = cfg_info.get("limit", "none")
-            if limit_val is None:
-                limit_val = "none"
+            limit_val  = cfg_info.get("limit", "none") or "none"
             model_path = args.model if not linfo["is_pruned"] else "PRUNED({})".format(label)
 
             for m in metrics:
@@ -334,11 +471,10 @@ def main() -> None:
                     "pruning_plan_path":              plan_path,
                     "model_path":                     model_path,
                     "is_pruned":                      str(linfo["is_pruned"]),
-                    # Cannot recover residual metadata from lm_eval dirs alone
-                    "requested_method":               linfo["method"],
-                    "actual_method":                  "unknown",
-                    "residual_applied":               "unknown",
-                    "residual_fallback_used":         "unknown",
+                    "requested_method":               pm_requested,
+                    "actual_method":                  pm_actual,
+                    "residual_applied":               pm_residual,
+                    "residual_fallback_used":         pm_fallback,
                     "task":                           m["task"],
                     "metric":                         m["metric"],
                     "value":                          m["value"],
@@ -365,13 +501,20 @@ def main() -> None:
 
         if missing_meta:
             print("[summarize] NOTE: no lm_eval output found for: " + str(missing_meta))
-        print("[summarize] NOTE: the following fields were inferred (cannot be recovered):")
-        print("[summarize]   model_path        -> set to 'PRUNED(label)' for pruned rows")
-        print("[summarize]   total_model_param_reduction_pct -> 'NA' (requires full param count)")
 
     # ── Build comparison (default mode and after summarize-only rebuild) ───────
     if not os.path.isfile(summary_csv):
         print("[summarize] ERROR: {} not found. Run eval first.".format(summary_csv))
+        sys.exit(1)
+
+    # Migrate legacy 20-field CSV to current 24-field schema before reading
+    try:
+        n_migrated = migrate_summary_csv(summary_csv)
+        if n_migrated > 0:
+            print("[summarize] Migrated {} legacy row(s) to current 24-field schema.".format(
+                n_migrated))
+    except RuntimeError as e:
+        print(str(e))
         sys.exit(1)
 
     with open(summary_csv, newline="") as fh:
@@ -380,6 +523,9 @@ def main() -> None:
     if not summary_rows:
         print("[summarize] WARNING: {} is empty.".format(summary_csv))
         sys.exit(0)
+
+    # Validate that every row has all required fields (catches misaligned appends)
+    validate_summary_schema(summary_rows, summary_csv)
 
     comp_rows = build_comparison(summary_rows)
     if comp_rows:
@@ -390,6 +536,10 @@ def main() -> None:
         print("[summarize] Comparison CSV: {} rows -> {}".format(len(comp_rows), comparison_csv))
     else:
         print("[summarize] WARNING: no comparison rows (need at least one baseline + one pruned setting).")
+
+    # Validate comparison completeness: every non-baseline method in summary must
+    # appear in comparison (catches residual rows silently dropped by join failure)
+    validate_comparison_completeness(summary_rows, comp_rows)
 
     print_comparison_table(comp_rows)
 

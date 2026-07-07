@@ -443,8 +443,31 @@ import csv, os, sys
 out_path = sys.argv[1]
 os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 if os.path.isfile(out_path):
-    print("[eval] CSV exists (append mode): " + out_path)
-    sys.exit(0)
+    with open(out_path, newline="") as _fh:
+        _hdr = next(csv.reader(_fh), [])
+    if len(_hdr) == len(fields):
+        print("[eval] CSV exists with current {}-field schema (append mode): ".format(len(fields)) + out_path)
+        sys.exit(0)
+    if len(_hdr) == 20 and _hdr[0] == "setting_label" and _hdr[-1] == "status":
+        print("[eval] CSV exists with old 20-field schema -- migrating to {}-field schema ...".format(len(fields)))
+        with open(out_path, newline="") as _fh:
+            _rows = list(csv.DictReader(_fh))
+        for _row in _rows:
+            _m = _row.get("method", "")
+            _row["requested_method"]   = _m
+            _row["actual_method"]      = _m
+            _row["residual_applied"]   = ""
+            _row["residual_fallback_used"] = ""
+        with open(out_path, "w", newline="") as _fh:
+            csv.DictWriter(_fh, fieldnames=fields, extrasaction="ignore").writeheader()
+            csv.DictWriter(_fh, fieldnames=fields, extrasaction="ignore").writerows(_rows)
+        print("[eval] Migration complete: {} rows migrated to {}-field schema: ".format(len(_rows), len(fields)) + out_path)
+        sys.exit(0)
+    import shutil as _shutil, time as _time
+    _bak = out_path + ".bak." + str(int(_time.time()))
+    _shutil.copy2(out_path, _bak)
+    print("[eval] WARNING: CSV has unexpected {} fields -- backing up and starting fresh.".format(len(_hdr)))
+    print("[eval] Backup saved to: " + _bak)
 fields = [
     "setting_label", "method", "selector", "dataset",
     "target_pct", "actual_pct", "moe_dim",
