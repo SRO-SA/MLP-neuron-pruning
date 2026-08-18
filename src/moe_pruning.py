@@ -70,6 +70,10 @@ from .rmsnorm_geometry import (
     compute_rmsnorm_ellipsoid_bound_from_weights,
     compute_rmsnorm_sphere_bound_from_weights,
 )
+from .moe_plan_replay import (
+    build_fixed_allocation_selection,
+    validate_fixed_allocation_source_plan_static,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +135,12 @@ MOE_SUMMARY_CSV_KEYS = [
     # ── Pruning plan ──────────────────────────────────────────────────────────
     "pruning_plan_path",
     "loaded_pruning_plan",
+    "fixed_allocation_replay",
+    "experiment_label",
+    "source_plan_path",
+    "source_allocation_selector",
+    "alternate_channel_selector",
+    "replay_source_overlap_channels",
     # ── Results ───────────────────────────────────────────────────────────────
     "baseline_ppl",
     "compressed_ppl",
@@ -1480,6 +1490,20 @@ def _bound_comparison_metrics(
     metrics.update(_distribution_fields("sphere", sphere))
     metrics.update(_distribution_fields("ellipsoid", ellipsoid))
 
+    positive_legacy = legacy > 0.0
+    legacy_ratio = ellipsoid[positive_legacy] / legacy[positive_legacy]
+    if len(legacy_ratio):
+        metrics.update(
+            _distribution_fields("ellipsoid_to_legacy_ratio", legacy_ratio)
+        )
+    else:
+        metrics.update({
+            "ellipsoid_to_legacy_ratio_min": None,
+            "ellipsoid_to_legacy_ratio_median": None,
+            "ellipsoid_to_legacy_ratio_p95": None,
+            "ellipsoid_to_legacy_ratio_max": None,
+        })
+
     positive_sphere = sphere > 0.0
     ratio = ellipsoid[positive_sphere] / sphere[positive_sphere]
     if len(ratio):
@@ -2322,6 +2346,64 @@ def run_moe_target_pruning_mode(
     # ── Pruning plan save/load ────────────────────────────────────────────────
     save_plan_cfg  = cfg.get("save_pruning_plan", False)
     load_plan_cfg  = cfg.get("load_pruning_plan", None)
+    fixed_allocation_plan_cfg = cfg.get("moe_fixed_allocation_plan", None)
+    fixed_allocation_selector_cfg = cfg.get(
+        "moe_fixed_allocation_selector", None
+    )
+    if bool(fixed_allocation_plan_cfg) != bool(fixed_allocation_selector_cfg):
+        raise ValueError(
+            "moe_fixed_allocation_plan and moe_fixed_allocation_selector must "
+            "be provided together"
+        )
+    if fixed_allocation_plan_cfg:
+        if load_plan_cfg:
+            raise ValueError(
+                "fixed-allocation replay cannot be combined with load_pruning_plan"
+            )
+        if score_comparison_only:
+            raise ValueError(
+                "fixed-allocation replay cannot be combined with "
+                "moe_score_comparison_only"
+            )
+        if not os.path.isfile(str(fixed_allocation_plan_cfg)):
+            raise FileNotFoundError(
+                "fixed-allocation source plan not found: "
+                f"{fixed_allocation_plan_cfg!r}"
+            )
+        if pruning_mode != "packed_same_channel":
+            raise ValueError(
+                "fixed-allocation replay requires "
+                "moe_pruning_mode: packed_same_channel"
+            )
+        if moe_budget_mode != "global":
+            raise ValueError(
+                "fixed-allocation replay requires moe_budget_mode: global; "
+                "the per-layer counts are replayed from a global source plan"
+            )
+        if str(fixed_allocation_selector_cfg) == moe_selector:
+            raise ValueError(
+                "fixed-allocation source selector and alternate channel selector "
+                f"must differ; both are {moe_selector!r}"
+            )
+        _fixed_source_plan = load_pruning_plan(str(fixed_allocation_plan_cfg))
+        if len(TARGET_PCTS) != 1:
+            raise ValueError(
+                "fixed-allocation replay requires exactly one target; got "
+                f"{TARGET_PCTS}"
+            )
+        validate_fixed_allocation_source_plan_static(
+            _fixed_source_plan,
+            source_plan_path=str(fixed_allocation_plan_cfg),
+            expected_source_selector=str(fixed_allocation_selector_cfg),
+            alternate_selector=moe_selector,
+            pruning_mode=pruning_mode,
+            channel_alignment=chan_align,
+            max_layer_frac=max_layer_frac,
+            max_expert_frac=max_exp_frac,
+            target_pct=float(TARGET_PCTS[0]),
+        )
+    else:
+        _fixed_source_plan = None
     # Unified residual config dict passed to apply_residual_dispatch_unpacked
     residual_cfg = {
         "residual_lambda":                    resid_lambda,
@@ -2349,6 +2431,13 @@ def run_moe_target_pruning_mode(
     print(f"  pruning_mode   : {pruning_mode}")
     print(f"  moe_selector   : {moe_selector}")
     print(f"  moe_budget_mode: {moe_budget_mode}")
+    if fixed_allocation_plan_cfg:
+        print(
+            "  FIXED ALLOCATION: "
+            f"{fixed_allocation_selector_cfg} allocation + "
+            f"{moe_selector} channel ranking"
+        )
+        print(f"  SOURCE PLAN    : {fixed_allocation_plan_cfg}")
     if score_comparison_only:
         print("  SCORE COMPARE  : legacy vs sphere vs ellipsoid; no pruning, no PPL")
     if dry_run:
@@ -2747,8 +2836,58 @@ def run_moe_target_pruning_mode(
 
                 removed_expert_neurons = 0
                 selected_layer_channels = 0
+                _fixed_replay_audit: Optional[Dict[str, object]] = None
 
-                if moe_budget_mode == "uniform":
+                if fixed_allocation_plan_cfg:
+                    # ── Fixed-layer-allocation replay ───────────────────────
+                    # Reuse the normal p95-aggregated score vectors, but take
+                    # every layer's channel count from the source plan.  The
+                    # selected indices continue through the unchanged physical
+                    # pruning and evaluation paths below.
+                    per_expert_pruned, _fixed_replay_audit = (
+                        build_fixed_allocation_selection(
+                            _fixed_source_plan,
+                            source_plan_path=str(fixed_allocation_plan_cfg),
+                            expected_source_selector=str(
+                                fixed_allocation_selector_cfg
+                            ),
+                            alternate_selector=moe_selector,
+                            pruning_mode=pruning_mode,
+                            channel_alignment=chan_align,
+                            max_layer_frac=max_layer_frac,
+                            max_expert_frac=max_exp_frac,
+                            target_pct=target_pct,
+                            scores_by_layer={
+                                li: scores.tolist()
+                                for li, scores in layer_avg_scores.items()
+                            },
+                            layer_sizes={
+                                li: expert_sizes[(li, -1)]
+                                for li in layer_avg_scores
+                            },
+                            num_experts_by_layer={
+                                li: layer_idx_to_info[li].num_experts
+                                for li in layer_avg_scores
+                            },
+                            total_expert_neurons=total_expert_neurons,
+                        )
+                    )
+                    selected_layer_channels = int(
+                        _fixed_replay_audit["total_selected_layer_channels"]
+                    )
+                    removed_expert_neurons = int(
+                        _fixed_replay_audit["total_removed_expert_neurons"]
+                    )
+                    print(
+                        "    [fixed-allocation] "
+                        f"fixed_allocation={fixed_allocation_selector_cfg}  "
+                        f"channel_selector={moe_selector}"
+                    )
+                    print(
+                        "    [fixed-allocation] validated source total: "
+                        f"{selected_layer_channels:,} layer-channels"
+                    )
+                elif moe_budget_mode == "uniform":
                     # ── Uniform-budget mode ──────────────────────────────────
                     # Per-layer budget is determined solely from architecture +
                     # target_pct, so actual_pct is identical across all selectors
@@ -2885,11 +3024,28 @@ def run_moe_target_pruning_mode(
                             moe_layers[0].num_experts if moe_layers else 0
                         ),
                     )
+                    if _fixed_replay_audit is not None:
+                        _plan["plan_kind"] = "fixed_layer_allocation_replay"
+                        _plan["fixed_allocation_replay"] = _fixed_replay_audit
+                        _plan["source_plan_path"] = str(
+                            fixed_allocation_plan_cfg
+                        )
+                        _plan["source_allocation_selector"] = str(
+                            fixed_allocation_selector_cfg
+                        )
+                        _plan["alternate_channel_selector"] = moe_selector
+                        _plan["max_expert_frac"] = max_exp_frac
                     _plan_path = make_pruning_plan_path(
                         output_dir, model_name, moe_calib_dataset,
                         n_eval, moe_calib_samples, moe_selector,
                         chan_agg, target_pct, chan_align,
                     )
+                    if _fixed_replay_audit is not None:
+                        _plan_path = _plan_path.replace(
+                            ".json",
+                            f"_fixedalloc_{fixed_allocation_selector_cfg}"
+                            f"_rank_{moe_selector}.json",
+                        )
                     save_pruning_plan(_plan, _plan_path)
                     print(f"    [plan] saved  → {_plan_path}")
 
@@ -2917,6 +3073,34 @@ def run_moe_target_pruning_mode(
                         f"actual_pruned={actual_pruned:,}  "
                         f"actual_pct={actual_pct:.3f}%"
                     )
+
+                _replay_overlap_channels = (
+                    sum(
+                        int(layer["overlap_count"])
+                        for layer in _fixed_replay_audit["layers"]
+                    )
+                    if _fixed_replay_audit is not None else 0
+                )
+                _replay_result_fields = {
+                    "fixed_allocation_replay": _fixed_replay_audit is not None,
+                    "experiment_label": (
+                        f"fixed_allocation={fixed_allocation_selector_cfg} "
+                        f"channel_selector={moe_selector}"
+                        if _fixed_replay_audit is not None else ""
+                    ),
+                    "source_plan_path": (
+                        str(fixed_allocation_plan_cfg)
+                        if _fixed_replay_audit is not None else ""
+                    ),
+                    "source_allocation_selector": (
+                        str(fixed_allocation_selector_cfg)
+                        if _fixed_replay_audit is not None else ""
+                    ),
+                    "alternate_channel_selector": (
+                        moe_selector if _fixed_replay_audit is not None else ""
+                    ),
+                    "replay_source_overlap_channels": _replay_overlap_channels,
+                }
 
                 # ── Fail-fast: verify packed_same_channel used (li,-1) keys ─
                 if pruning_mode == "packed_same_channel" and target_pct > 0:
@@ -2988,6 +3172,8 @@ def run_moe_target_pruning_mode(
                             "aggregation_mode": chan_agg,
                             "selector": moe_selector,
                             "max_layer_frac": max_layer_frac,
+                            **_replay_result_fields,
+                            "fixed_allocation_audit": _fixed_replay_audit,
                             "rows": _dr_rows,
                         }, _jf, indent=2)
                     print(f"  [dry-run] CSV  saved: {_dr_csv}")
@@ -3765,6 +3951,7 @@ def run_moe_target_pruning_mode(
                                 "mean_update_norm":           _mean_upd,
                                 "max_update_norm":            _max_upd,
                             })
+                            err_row.update(_replay_result_fields)
                             all_results.append(err_row)
                             _flush_csv(main_csv_path, [err_row], MOE_SUMMARY_CSV_KEYS)
                         _log_gpu_memory("after forward fail")
@@ -3886,6 +4073,7 @@ def run_moe_target_pruning_mode(
                             "mean_update_norm":           _mean_upd,
                             "max_update_norm":            _max_upd,
                         })
+                        summary.update(_replay_result_fields)
                         print(
                             f"    [{_ds}] baseline={cur_bppl:.4f}  "
                             f"compressed={ppl:.4f}  delta={delta:+.4f}  "
