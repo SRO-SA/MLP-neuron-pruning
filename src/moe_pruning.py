@@ -22,9 +22,9 @@ Key design decisions
    the tokens that were routed to that expert.
 6. Skip experts with fewer than `min_expert_tokens` (default 128) routed tokens
    — mark them as skipped in the report.
-7. Score function: rmsnorm_bound_angle (same as dense pruning), ignoring the
-   RMSNorm weight (no RMSNorm precedes individual expert layers typically).
-   Falls back to down_norm if bound scores fail.
+7. The historical rmsnorm_bound score remains unchanged for reproducibility.
+   The optional rmsnorm_ellipsoid_bound score uses the containing decoder
+   layer's post_attention_layernorm weight (experts share that normalized input).
 
 Usage
 -----
@@ -65,6 +65,11 @@ from .moe_residual_methods import (  # noqa: E402
     apply_pruning_plan_to_selection,
     apply_residual_dispatch_unpacked,
 )
+from .rmsnorm_geometry import (
+    compute_rmsnorm_bound_triplet_from_weights,
+    compute_rmsnorm_ellipsoid_bound_from_weights,
+    compute_rmsnorm_sphere_bound_from_weights,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,14 @@ DEFAULT_MAX_EXPERT_FRAC    = 0.20
 DEFAULT_MIN_EXPERT_TOKENS  = 128
 BEST_RESIDUAL_LAM          = 1e-2
 BEST_RESIDUAL_TAU          = 1.0
+
+SUPPORTED_MOE_SELECTORS = {
+    "rmsnorm_bound",
+    "rmsnorm_ellipsoid_bound",
+    "down_norm",
+    "random",
+    "activation_score",
+}
 
 MOE_MAIN_CSV_KEYS = [
     "model", "target_pruning_percent", "eval_dataset",
@@ -531,6 +544,83 @@ def get_expert_scores(expert_module) -> torch.Tensor:
         w = get_expert_weights(expert_module)
         return w["down_proj"].detach().float().cpu().norm(dim=0)
 
+
+def get_moe_input_rmsnorm_weight(layer_info: MoELayerInfo) -> torch.Tensor:
+    """Return the RMSNorm scale immediately preceding a MoE/MLP block.
+
+    Qwen3 experts do not contain individual RMSNorm modules.  Their shared
+    input is the output of the containing decoder layer's
+    ``post_attention_layernorm``.  A missing or incompatible weight is a hard
+    error for the ellipsoid selector; silently reverting to the legacy score
+    would make the requested experiment invalid.
+    """
+    layer = layer_info.layer_module
+    rmsnorm = getattr(layer, "post_attention_layernorm", None)
+    if rmsnorm is None:
+        raise AssertionError(
+            f"MoE layer {layer_info.layer_idx} has no post_attention_layernorm; "
+            "rmsnorm_ellipsoid_bound requires the norm immediately before the MoE/MLP"
+        )
+    gamma = getattr(rmsnorm, "weight", None)
+    if not isinstance(gamma, torch.Tensor):
+        raise AssertionError(
+            f"MoE layer {layer_info.layer_idx} post_attention_layernorm has no tensor weight"
+        )
+    if gamma.ndim != 1:
+        raise AssertionError(
+            f"MoE layer {layer_info.layer_idx} RMSNorm gamma must be rank 1; "
+            f"got {tuple(gamma.shape)}"
+        )
+    return gamma
+
+
+def compute_rmsnorm_ellipsoid_scores_for_expert(
+    expert_module,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the coordinate-wise RMSNorm ellipsoid bound for one expert."""
+    w = get_expert_weights(expert_module)
+    if tuple(gamma.shape) != (w["d_model"],):
+        raise AssertionError(
+            f"gamma shape {tuple(gamma.shape)} is incompatible with expert "
+            f"d_model={w['d_model']}"
+        )
+    return compute_rmsnorm_ellipsoid_bound_from_weights(
+        w["gate_proj"], w["up_proj"], w["down_proj"], gamma
+    )
+
+
+def compute_rmsnorm_sphere_scores_for_expert(
+    expert_module,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the valid gamma-infinity sphere bound for diagnostics/tests."""
+    w = get_expert_weights(expert_module)
+    if tuple(gamma.shape) != (w["d_model"],):
+        raise AssertionError(
+            f"gamma shape {tuple(gamma.shape)} is incompatible with expert "
+            f"d_model={w['d_model']}"
+        )
+    return compute_rmsnorm_sphere_bound_from_weights(
+        w["gate_proj"], w["up_proj"], w["down_proj"], gamma
+    )
+
+
+def compute_rmsnorm_bound_triplet_for_expert(
+    expert_module,
+    gamma: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute legacy/sphere/ellipsoid scores with one expert FP32 transfer."""
+    w = get_expert_weights(expert_module)
+    if tuple(gamma.shape) != (w["d_model"],):
+        raise AssertionError(
+            f"gamma shape {tuple(gamma.shape)} is incompatible with expert "
+            f"d_model={w['d_model']}"
+        )
+    return compute_rmsnorm_bound_triplet_from_weights(
+        w["gate_proj"], w["up_proj"], w["down_proj"], gamma
+    )
+
 # ---------------------------------------------------------------------------
 # Activation-based expert scoring
 # ---------------------------------------------------------------------------
@@ -591,18 +681,28 @@ def _score_expert_moe(
     expert_module,
     selector: str,
     calib_inputs: "Optional[torch.Tensor]" = None,
+    rmsnorm_gamma: "Optional[torch.Tensor]" = None,
 ) -> torch.Tensor:
     """
     Dispatcher: returns [d_ff] importance scores for one expert.
 
     selector options:
       "rmsnorm_bound"    – weight-only RMSNorm-bounded SwiGLU score (default)
+      "rmsnorm_ellipsoid_bound" – exact coordinate-wise RMSNorm geometry bound
       "down_norm"        – L2 norm of each down_proj column (simple baseline)
       "random"           – uniform random scores (random baseline; caller sets seed)
       "activation_score" – activation × down-column-norm score (needs calib)
     """
     if selector == "activation_score":
         return compute_activation_scores_for_expert(expert_module, calib_inputs)
+    elif selector == "rmsnorm_ellipsoid_bound":
+        if rmsnorm_gamma is None:
+            raise AssertionError(
+                "rmsnorm_ellipsoid_bound requires the containing layer RMSNorm gamma"
+            )
+        return compute_rmsnorm_ellipsoid_scores_for_expert(
+            expert_module, rmsnorm_gamma
+        )
     elif selector == "down_norm":
         w = get_expert_weights(expert_module)
         # down_proj: [d_model, d_ff] — column norms give per-channel importance
@@ -611,9 +711,14 @@ def _score_expert_moe(
         w = get_expert_weights(expert_module)
         # Uniform random — reproducibility controlled by torch.manual_seed at call site
         return torch.rand(w["d_ff"])
-    else:
-        # default: rmsnorm_bound (weight-only, no calib needed)
+    elif selector == "rmsnorm_bound":
+        # Historical selector kept byte-for-byte in get_expert_scores for
+        # reproducibility of the trusted Qwen3-30B-A3B baseline.
         return get_expert_scores(expert_module)
+    raise ValueError(
+        f"Unknown MoE selector {selector!r}. "
+        f"Valid: {', '.join(sorted(SUPPORTED_MOE_SELECTORS))}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1422,268 @@ def _aggregate_expert_scores(
     return stacked.float().mean(dim=0)
 
 
+_BOUND_COMPARE_BOTTOM_FRACTIONS = (0.01, 0.02, 0.04, 0.06, 0.08)
+
+
+def _rankdata_average(values: np.ndarray) -> np.ndarray:
+    """Small dependency-free equivalent of scipy.stats.rankdata(method='average')."""
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    ranks = np.empty(len(values), dtype=np.float64)
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+    return ranks
+
+
+def _spearman_correlation(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+    """Return Spearman correlation, or None when either rank vector is constant."""
+    ra = _rankdata_average(a)
+    rb = _rankdata_average(b)
+    if len(ra) < 2 or float(np.std(ra)) == 0.0 or float(np.std(rb)) == 0.0:
+        return None
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def _distribution_fields(prefix: str, values: np.ndarray) -> Dict[str, float]:
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        f"{prefix}_min": float(np.min(values)),
+        f"{prefix}_median": float(np.median(values)),
+        f"{prefix}_p95": float(np.quantile(values, 0.95)),
+        f"{prefix}_max": float(np.max(values)),
+    }
+
+
+def _bound_comparison_metrics(
+    legacy: np.ndarray,
+    sphere: np.ndarray,
+    ellipsoid: np.ndarray,
+) -> Dict[str, object]:
+    """Compute compact ranking/distribution diagnostics for one score scope."""
+    legacy = np.asarray(legacy, dtype=np.float64)
+    sphere = np.asarray(sphere, dtype=np.float64)
+    ellipsoid = np.asarray(ellipsoid, dtype=np.float64)
+    if not (legacy.shape == sphere.shape == ellipsoid.shape):
+        raise AssertionError(
+            f"comparison score shapes differ: {legacy.shape}, {sphere.shape}, "
+            f"{ellipsoid.shape}"
+        )
+    n = len(legacy)
+    metrics: Dict[str, object] = {"num_channels": int(n)}
+    metrics.update(_distribution_fields("legacy", legacy))
+    metrics.update(_distribution_fields("sphere", sphere))
+    metrics.update(_distribution_fields("ellipsoid", ellipsoid))
+
+    positive_sphere = sphere > 0.0
+    ratio = ellipsoid[positive_sphere] / sphere[positive_sphere]
+    if len(ratio):
+        metrics.update(_distribution_fields("ellipsoid_to_sphere_ratio", ratio))
+    else:
+        metrics.update({
+            "ellipsoid_to_sphere_ratio_min": None,
+            "ellipsoid_to_sphere_ratio_median": None,
+            "ellipsoid_to_sphere_ratio_p95": None,
+            "ellipsoid_to_sphere_ratio_max": None,
+        })
+    tolerance = 1e-5 * np.maximum(1.0, np.abs(sphere))
+    metrics["ellipsoid_gt_sphere_count"] = int(
+        np.count_nonzero(ellipsoid > sphere + tolerance)
+    )
+    metrics["spearman_ellipsoid_vs_legacy"] = _spearman_correlation(
+        ellipsoid, legacy
+    )
+    metrics["spearman_ellipsoid_vs_sphere"] = _spearman_correlation(
+        ellipsoid, sphere
+    )
+
+    legacy_ranks = _rankdata_average(legacy)
+    sphere_ranks = _rankdata_average(sphere)
+    ellipsoid_ranks = _rankdata_average(ellipsoid)
+    metrics["channels_changed_rank_vs_legacy"] = int(
+        np.count_nonzero(legacy_ranks != ellipsoid_ranks)
+    )
+    metrics["channels_changed_rank_vs_sphere"] = int(
+        np.count_nonzero(sphere_ranks != ellipsoid_ranks)
+    )
+
+    for fraction in _BOUND_COMPARE_BOTTOM_FRACTIONS:
+        label = f"bottom_{int(round(100 * fraction))}pct"
+        k = max(1, int(np.ceil(fraction * n)))
+        ellipsoid_bottom = set(np.argsort(ellipsoid, kind="mergesort")[:k].tolist())
+        legacy_bottom = set(np.argsort(legacy, kind="mergesort")[:k].tolist())
+        sphere_bottom = set(np.argsort(sphere, kind="mergesort")[:k].tolist())
+        metrics[f"{label}_count"] = k
+        metrics[f"{label}_overlap_vs_legacy"] = (
+            len(ellipsoid_bottom & legacy_bottom) / k
+        )
+        metrics[f"{label}_overlap_vs_sphere"] = (
+            len(ellipsoid_bottom & sphere_bottom) / k
+        )
+    return metrics
+
+
+def _bottom_selection_details(
+    identities: List[object],
+    legacy: np.ndarray,
+    sphere: np.ndarray,
+    ellipsoid: np.ndarray,
+) -> Dict[str, object]:
+    """Return compact selected-channel identities for requested bottom fractions."""
+    result: Dict[str, object] = {}
+    for fraction in _BOUND_COMPARE_BOTTOM_FRACTIONS:
+        label = f"bottom_{int(round(100 * fraction))}pct"
+        k = max(1, int(np.ceil(fraction * len(identities))))
+        entry: Dict[str, object] = {"count": k}
+        for name, values in (
+            ("legacy", legacy),
+            ("sphere", sphere),
+            ("ellipsoid", ellipsoid),
+        ):
+            idx = np.argsort(values, kind="mergesort")[:k]
+            entry[name] = [identities[int(i)] for i in idx]
+        result[label] = entry
+    return result
+
+
+def collect_moe_bound_comparison_scores(
+    moe_layers: List[MoELayerInfo],
+    aggregation: str = "p95",
+) -> List[Dict[str, object]]:
+    """Compute legacy, valid-sphere, and ellipsoid layer scores.
+
+    Expert weights are converted to FP32 one expert at a time.  Only the small
+    per-channel score vectors are retained for layer aggregation.
+    """
+    records: List[Dict[str, object]] = []
+    for info in moe_layers:
+        gamma = get_moe_input_rmsnorm_weight(info)
+        legacy_scores: List[torch.Tensor] = []
+        sphere_scores: List[torch.Tensor] = []
+        ellipsoid_scores: List[torch.Tensor] = []
+        for expert in info.expert_modules:
+            legacy, sphere, ellipsoid = compute_rmsnorm_bound_triplet_for_expert(
+                expert, gamma
+            )
+            legacy_scores.append(legacy.float())
+            sphere_scores.append(sphere.float())
+            ellipsoid_scores.append(ellipsoid.float())
+        if not legacy_scores:
+            raise AssertionError(f"MoE layer {info.layer_idx} contains no experts")
+        legacy = _aggregate_expert_scores(torch.stack(legacy_scores), aggregation)
+        sphere = _aggregate_expert_scores(torch.stack(sphere_scores), aggregation)
+        ellipsoid = _aggregate_expert_scores(
+            torch.stack(ellipsoid_scores), aggregation
+        )
+        records.append({
+            "layer_idx": info.layer_idx,
+            "num_experts": info.num_experts,
+            "d_ff": int(len(ellipsoid)),
+            "legacy": legacy.detach().float().cpu(),
+            "sphere": sphere.detach().float().cpu(),
+            "ellipsoid": ellipsoid.detach().float().cpu(),
+        })
+    return records
+
+
+def save_moe_bound_comparison_diagnostics(
+    records: List[Dict[str, object]],
+    output_dir: str,
+    timestamp: str,
+    model_name: str,
+    aggregation: str,
+) -> Tuple[str, str]:
+    """Save compact layer/global bound diagnostics to CSV and JSON."""
+    if not records:
+        raise AssertionError("No bound-comparison score records were provided")
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, f"moe_bound_comparison_{timestamp}.csv")
+    json_path = os.path.join(output_dir, f"moe_bound_comparison_{timestamp}.json")
+
+    csv_rows: List[Dict[str, object]] = []
+    json_layers: List[Dict[str, object]] = []
+    global_legacy: List[np.ndarray] = []
+    global_sphere: List[np.ndarray] = []
+    global_ellipsoid: List[np.ndarray] = []
+    global_identities: List[object] = []
+
+    for record in records:
+        li = int(record["layer_idx"])
+        legacy = record["legacy"].numpy()
+        sphere = record["sphere"].numpy()
+        ellipsoid = record["ellipsoid"].numpy()
+        identities: List[object] = list(range(len(legacy)))
+        metrics = _bound_comparison_metrics(legacy, sphere, ellipsoid)
+        csv_rows.append({
+            "scope": "layer",
+            "layer_idx": li,
+            "num_experts": int(record["num_experts"]),
+            "d_ff": int(record["d_ff"]),
+            **metrics,
+        })
+        json_layers.append({
+            "layer_idx": li,
+            "num_experts": int(record["num_experts"]),
+            "d_ff": int(record["d_ff"]),
+            "metrics": metrics,
+            "bottom_channels": _bottom_selection_details(
+                identities, legacy, sphere, ellipsoid
+            ),
+        })
+        global_legacy.append(legacy)
+        global_sphere.append(sphere)
+        global_ellipsoid.append(ellipsoid)
+        global_identities.extend([[li, ch] for ch in range(len(legacy))])
+
+    legacy_all = np.concatenate(global_legacy)
+    sphere_all = np.concatenate(global_sphere)
+    ellipsoid_all = np.concatenate(global_ellipsoid)
+    global_metrics = _bound_comparison_metrics(
+        legacy_all, sphere_all, ellipsoid_all
+    )
+    csv_rows.append({
+        "scope": "global",
+        "layer_idx": "ALL",
+        "num_experts": sum(int(r["num_experts"]) for r in records),
+        "d_ff": sum(int(r["d_ff"]) for r in records),
+        **global_metrics,
+    })
+
+    fieldnames: List[str] = []
+    for row in csv_rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    payload = {
+        "timestamp": timestamp,
+        "model": model_name,
+        "aggregation": aggregation,
+        "legacy_selector": "rmsnorm_bound",
+        "valid_sphere_bound": "gamma_infinity_sphere",
+        "new_selector": "rmsnorm_ellipsoid_bound",
+        "global": {
+            "metrics": global_metrics,
+            "bottom_channels": _bottom_selection_details(
+                global_identities, legacy_all, sphere_all, ellipsoid_all
+            ),
+        },
+        "layers": json_layers,
+    }
+    with open(json_path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    return csv_path, json_path
+
+
 def _print_per_layer_distribution(
     per_expert_pruned: Dict,
     expert_sizes: Dict,
@@ -1923,6 +2290,7 @@ def run_moe_target_pruning_mode(
     pruning_mode   = str(cfg.get("moe_pruning_mode", "packed_same_channel"))
     moe_selector   = str(cfg.get("moe_selector", "rmsnorm_bound"))
     dry_run        = bool(cfg.get("moe_selection_dry_run", False))
+    score_comparison_only = bool(cfg.get("moe_score_comparison_only", False))
     max_layer_frac = float(cfg.get("moe_max_layer_channel_prune_frac", 1.0))
     # "uniform" = per-layer budget fixed from architecture+target_pct (selector-independent);
     # "global"  = global greedy across all layers (original behaviour, may vary per selector).
@@ -1935,6 +2303,16 @@ def run_moe_target_pruning_mode(
     moe_calib_dataset = str(cfg.get("moe_calib_dataset", "wikitext2"))
     EVAL_DATASETS  = [str(d) for d in (
         eval_datasets_override or cfg.get("eval_datasets", ["wikitext2"]))]
+    if moe_selector not in SUPPORTED_MOE_SELECTORS:
+        raise ValueError(
+            f"Unknown moe_selector {moe_selector!r}. "
+            f"Valid: {', '.join(sorted(SUPPORTED_MOE_SELECTORS))}"
+        )
+    if score_comparison_only and chan_agg != "p95":
+        raise ValueError(
+            "moe_score_comparison_only currently requires "
+            "moe_same_channel_aggregation: p95"
+        )
     # ── Residual extended config ───────────────────────────────────────────────
     resid_imp_margin   = float(cfg.get("residual_improvement_margin", 1.0))
     resid_alpha_clip   = float(cfg.get("residual_alpha_clip", 2.0))
@@ -1971,6 +2349,8 @@ def run_moe_target_pruning_mode(
     print(f"  pruning_mode   : {pruning_mode}")
     print(f"  moe_selector   : {moe_selector}")
     print(f"  moe_budget_mode: {moe_budget_mode}")
+    if score_comparison_only:
+        print("  SCORE COMPARE  : legacy vs sphere vs ellipsoid; no pruning, no PPL")
     if dry_run:
         print("  DRY-RUN MODE   : selection only — no pruning, no PPL eval")
     if max_layer_frac < 1.0:
@@ -1993,15 +2373,20 @@ def run_moe_target_pruning_mode(
                   "methods — only the first method will run per process")
     print(f"{'=' * 90}\n")
 
-    # Load eval datasets once
-    print(f"Loading evaluation datasets: {EVAL_DATASETS} ...")
-    all_eval_corpora = load_all_eval_datasets(
-        EVAL_DATASETS, max_samples=n_eval, use_fallback_corpus=use_fb,
-    )
-    for _dn, _txts in all_eval_corpora.items():
-        print(f"  {_dn}: {len(_txts)} samples")
+    # A weight-only comparison does not need evaluation text or PPL.
+    if score_comparison_only:
+        all_eval_corpora = {}
+        print("Skipping evaluation dataset loading (score-comparison-only mode).")
+    else:
+        print(f"Loading evaluation datasets: {EVAL_DATASETS} ...")
+        all_eval_corpora = load_all_eval_datasets(
+            EVAL_DATASETS, max_samples=n_eval, use_fallback_corpus=use_fb,
+        )
+        for _dn, _txts in all_eval_corpora.items():
+            print(f"  {_dn}: {len(_txts)} samples")
 
     all_results: List[Dict] = []
+    comparison_output_paths: List[Tuple[str, str]] = []
 
     def _flush_csv(path, rows, keys):
         if not rows:
@@ -2116,6 +2501,43 @@ def run_moe_target_pruning_mode(
             )
             print(f"  Total expert MLP neurons (prunable): {total_expert_neurons:,}")
 
+            if score_comparison_only:
+                print("\n  Computing weight-only RMSNorm bound comparison ...")
+                _cmp_records = collect_moe_bound_comparison_scores(
+                    moe_layers, aggregation=chan_agg
+                )
+                _cmp_csv, _cmp_json = save_moe_bound_comparison_diagnostics(
+                    _cmp_records, output_dir, ts, model_name, chan_agg
+                )
+                comparison_output_paths.append((_cmp_csv, _cmp_json))
+                _global_legacy = np.concatenate([
+                    r["legacy"].numpy() for r in _cmp_records
+                ])
+                _global_sphere = np.concatenate([
+                    r["sphere"].numpy() for r in _cmp_records
+                ])
+                _global_ellipsoid = np.concatenate([
+                    r["ellipsoid"].numpy() for r in _cmp_records
+                ])
+                _gm = _bound_comparison_metrics(
+                    _global_legacy, _global_sphere, _global_ellipsoid
+                )
+                print(
+                    "  [score-compare] global Spearman ellipsoid vs legacy: "
+                    f"{_gm['spearman_ellipsoid_vs_legacy']}"
+                )
+                print(
+                    "  [score-compare] ellipsoid/sphere median ratio: "
+                    f"{_gm['ellipsoid_to_sphere_ratio_median']}"
+                )
+                print(
+                    "  [score-compare] ellipsoid > sphere violations: "
+                    f"{_gm['ellipsoid_gt_sphere_count']}"
+                )
+                print(f"  [score-compare] CSV : {_cmp_csv}")
+                print(f"  [score-compare] JSON: {_cmp_json}")
+                continue
+
             # Per-dataset baselines (skipped for dry-run)
             if dry_run:
                 baseline_ppl_per_ds = {_ds: float("nan") for _ds in EVAL_DATASETS}
@@ -2175,14 +2597,22 @@ def run_moe_target_pruning_mode(
                     i.layer_idx: i for i in moe_layers
                 }
                 all_expert_scores: List[Tuple[int, int, torch.Tensor]] = []
+                bound_comparison_records: List[Dict[str, object]] = []
                 print("  Computing expert scores ...")
                 for info in moe_layers:
+                    _layer_gamma = (
+                        get_moe_input_rmsnorm_weight(info)
+                        if moe_selector == "rmsnorm_ellipsoid_bound"
+                        else None
+                    )
                     if pruning_mode == "packed_same_channel":
                         # Aggregate per-expert scores to a single layer-level score.
                         # Works for both packed (Layout B) and unpacked (Layout A):
                         # the same channel indices are removed from every expert.
                         # Selection then picks globally across layers using this score.
                         per_exp_s: List[torch.Tensor] = []
+                        _legacy_per_exp: List[torch.Tensor] = []
+                        _sphere_per_exp: List[torch.Tensor] = []
                         rt_weights: List[float] = []
                         _total_rt = max(
                             sum(routed_counts.get((info.layer_idx, ej), 0)
@@ -2196,14 +2626,29 @@ def run_moe_target_pruning_mode(
                                     if moe_selector == "activation_score"
                                     else None
                                 )
-                                per_exp_s.append(
-                                    _score_expert_moe(exp, moe_selector, _calib_ei).float()
-                                )
+                                if moe_selector == "rmsnorm_ellipsoid_bound":
+                                    (
+                                        _legacy_score,
+                                        _sphere_score,
+                                        _selected_score,
+                                    ) = compute_rmsnorm_bound_triplet_for_expert(
+                                        exp, _layer_gamma
+                                    )
+                                else:
+                                    _selected_score = _score_expert_moe(
+                                        exp, moe_selector, _calib_ei, _layer_gamma
+                                    ).float()
+                                per_exp_s.append(_selected_score)
+                                if moe_selector == "rmsnorm_ellipsoid_bound":
+                                    _legacy_per_exp.append(_legacy_score)
+                                    _sphere_per_exp.append(_sphere_score)
                                 rt_weights.append(
                                     routed_counts.get((info.layer_idx, ei), 0)
                                     / _total_rt
                                 )
                             except Exception as _se:
+                                if moe_selector == "rmsnorm_ellipsoid_bound":
+                                    raise
                                 logger.warning(
                                     "score layer=%d ei=%d: %s",
                                     info.layer_idx, ei, _se,
@@ -2213,6 +2658,21 @@ def run_moe_target_pruning_mode(
                             rt_t      = torch.tensor(rt_weights, dtype=torch.float32)
                             agg_s     = _aggregate_expert_scores(stacked_s, chan_agg, rt_t)
                             all_expert_scores.append((info.layer_idx, -1, agg_s))
+                            if moe_selector == "rmsnorm_ellipsoid_bound":
+                                _legacy_agg = _aggregate_expert_scores(
+                                    torch.stack(_legacy_per_exp, dim=0), chan_agg, rt_t
+                                )
+                                _sphere_agg = _aggregate_expert_scores(
+                                    torch.stack(_sphere_per_exp, dim=0), chan_agg, rt_t
+                                )
+                                bound_comparison_records.append({
+                                    "layer_idx": info.layer_idx,
+                                    "num_experts": info.num_experts,
+                                    "d_ff": int(len(agg_s)),
+                                    "legacy": _legacy_agg.detach().float().cpu(),
+                                    "sphere": _sphere_agg.detach().float().cpu(),
+                                    "ellipsoid": agg_s.detach().float().cpu(),
+                                })
                     else:
                         # per_expert_mask mode: score each expert independently.
                         for ei, exp in enumerate(info.expert_modules):
@@ -2222,13 +2682,28 @@ def run_moe_target_pruning_mode(
                                     if moe_selector == "activation_score"
                                     else None
                                 )
-                                s = _score_expert_moe(exp, moe_selector, _calib_ei)
+                                s = _score_expert_moe(
+                                    exp, moe_selector, _calib_ei, _layer_gamma
+                                )
                                 all_expert_scores.append((info.layer_idx, ei, s))
                             except Exception as _se:
+                                if moe_selector == "rmsnorm_ellipsoid_bound":
+                                    raise
                                 logger.warning(
                                     "score layer=%d ei=%d: %s",
                                     info.layer_idx, ei, _se,
                                 )
+
+                if bound_comparison_records:
+                    _cmp_csv, _cmp_json = save_moe_bound_comparison_diagnostics(
+                        bound_comparison_records,
+                        output_dir,
+                        ts,
+                        model_name,
+                        chan_agg,
+                    )
+                    print(f"  [score-compare] CSV : {_cmp_csv}")
+                    print(f"  [score-compare] JSON: {_cmp_json}")
 
                 # ── Global selection — correct accounting for packed layers ───
                 # For packed layers (ei=-1), selecting one channel removes
@@ -2895,7 +3370,7 @@ def run_moe_target_pruning_mode(
                                     "speedup_expected": True,
                                     "same_channel_across_experts": True,
                                     "aggregation_mode": chan_agg,
-                                    "selector": f"rmsnorm_bound_{chan_agg}",
+                                    "selector": f"{moe_selector}_{chan_agg}",
                                     "method": method,
                                     "d_ff_before": d_ff_orig,
                                     "d_ff_after":  new_inter,
@@ -2942,7 +3417,7 @@ def run_moe_target_pruning_mode(
                                         "speedup_expected": True,
                                         "same_channel_across_experts": False,
                                         "aggregation_mode": "N/A",
-                                        "selector": "rmsnorm_bound",
+                                        "selector": moe_selector,
                                         "method": method,
                                         "d_ff_before": d_ff_orig,
                                         "d_ff_after": d_ff_orig,
@@ -2984,7 +3459,7 @@ def run_moe_target_pruning_mode(
                                     "speedup_expected": True,
                                     "same_channel_across_experts": False,
                                     "aggregation_mode": "N/A",
-                                    "selector": "rmsnorm_bound",
+                                    "selector": moe_selector,
                                     "method": method,
                                     "d_ff_before": d_ff_orig, "d_ff_after": d_ff_new,
                                     "n_pruned": len(prune_idx),
@@ -3442,6 +3917,13 @@ def run_moe_target_pruning_mode(
                 del tokenizer
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    if score_comparison_only:
+        print("\nMOE score comparison complete (no pruning, no PPL).")
+        for _csv_path, _json_path in comparison_output_paths:
+            print(f"  CSV : {_csv_path}")
+            print(f"  JSON: {_json_path}")
+        return
 
     # JSON report
     report = {

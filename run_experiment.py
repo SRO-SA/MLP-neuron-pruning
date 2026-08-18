@@ -258,8 +258,11 @@ def run_experiment(cfg: Dict, args) -> None:
         )
         return
 
-    # ── MOE TARGET-PRUNING MODE ─────────────────────────────────────────────
-    if args.moe_target_pruning:
+    # ── MOE SCORE-COMPARISON / TARGET-PRUNING MODES ─────────────────────────
+    if args.moe_score_comparison_only or args.moe_target_pruning:
+        if args.moe_score_comparison_only:
+            cfg = dict(cfg)
+            cfg["moe_score_comparison_only"] = True
         run_moe_target_pruning_mode(
             cfg,
             device=device,
@@ -691,7 +694,7 @@ def parse_args():
         help=(
             "Pruning selector(s) for --target-pruning-scaling "
             "(e.g. --selectors rmsnorm_bound down_norm random_seed0). "
-            "Supported: rmsnorm_bound, down_norm, activation_score, "
+            "Supported: rmsnorm_bound, rmsnorm_ellipsoid_bound, down_norm, activation_score, "
             "random_seed0, random_seed1, random_seed2. "
             "Overrides selectors in the config."
         ),
@@ -705,6 +708,15 @@ def parse_args():
             "Uses router-aware calibration and per-expert channel scoring. "
             "Does NOT prune router weights or remove entire experts. "
             "Use --models, --target-pruning-percents, --methods, --n-eval to configure."
+        ),
+    )
+    p.add_argument(
+        "--moe-score-comparison-only", action="store_true",
+        dest="moe_score_comparison_only",
+        help=(
+            "Compare legacy rmsnorm_bound, the valid gamma-infinity sphere "
+            "bound, and rmsnorm_ellipsoid_bound on MoE channels. Writes "
+            "compact CSV/JSON diagnostics; performs no pruning and no PPL."
         ),
     )
     p.add_argument(

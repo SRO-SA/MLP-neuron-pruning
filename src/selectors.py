@@ -10,7 +10,10 @@ Selectors
 ---------
 rmsnorm_bound  :  The proposed method.  score_i = R^2 * (||gate_i||*||up_i|| +
                   |gate_i·up_i|)/2 * ||down_i||, R = sqrt(d_model)*||gamma||_inf.
-                  Implemented in bound_analysis.py; imported here as a wrapper.
+                   Implemented in bound_analysis.py; imported here as a wrapper.
+
+rmsnorm_ellipsoid_bound : The coordinate-wise RMSNorm geometry bound using
+                   gamma * gate_i and gamma * up_i instead of gamma-infinity.
 
 down_norm      :  score_i = ||down_proj[:, i]||_2.  The column norm of the down
                   projection.  A simpler weight-norm baseline that ignores gate/up.
@@ -183,6 +186,25 @@ def compute_rmsnorm_bound_scores(layer) -> torch.Tensor:
     return scores.detach().float().cpu()
 
 
+def compute_rmsnorm_ellipsoid_bound_scores(layer) -> torch.Tensor:
+    """Return the exact coordinate-wise RMSNorm ellipsoid score for a dense MLP."""
+    from .model_utils import get_mlp_weights, get_rmsnorm_before_mlp
+    from .rmsnorm_geometry import compute_rmsnorm_ellipsoid_bound_from_weights
+
+    w = get_mlp_weights(layer)
+    rmsnorm = get_rmsnorm_before_mlp(layer)
+    gamma = getattr(rmsnorm, "weight", None)
+    if not isinstance(gamma, torch.Tensor):
+        raise AssertionError(
+            "rmsnorm_ellipsoid_bound requires a tensor RMSNorm weight "
+            "immediately before the MLP"
+        )
+    with torch.no_grad():
+        return compute_rmsnorm_ellipsoid_bound_from_weights(
+            w["gate"], w["up"], w["down"], gamma
+        )
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -199,6 +221,7 @@ def get_scores_for_selector(
     Selector names
     --------------
     "rmsnorm_bound"    → compute_rmsnorm_bound_scores
+    "rmsnorm_ellipsoid_bound" → compute_rmsnorm_ellipsoid_bound_scores
     "down_norm"        → compute_down_norm_scores
     "activation_score" → compute_activation_scores (needs calib_inputs)
     "random"           → compute_random_scores (seed=0)
@@ -209,6 +232,8 @@ def get_scores_for_selector(
     name = selector_name.lower().strip()
     if name in ("rmsnorm_bound", "rmsnorm_bound_angle"):
         return compute_rmsnorm_bound_scores(layer)
+    if name == "rmsnorm_ellipsoid_bound":
+        return compute_rmsnorm_ellipsoid_bound_scores(layer)
     if name == "down_norm":
         return compute_down_norm_scores(layer)
     if name == "activation_score":
@@ -218,7 +243,7 @@ def get_scores_for_selector(
         return compute_random_scores(layer, seed=seed)
     raise ValueError(
         f"Unknown selector '{selector_name}'. "
-        f"Valid: rmsnorm_bound, down_norm, activation_score, "
+        f"Valid: rmsnorm_bound, rmsnorm_ellipsoid_bound, down_norm, activation_score, "
         f"random, random_seed0, random_seed1, random_seed2"
     )
 

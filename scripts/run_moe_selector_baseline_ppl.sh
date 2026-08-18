@@ -2,7 +2,8 @@
 # run_moe_selector_baseline_ppl.sh
 #
 # PPL-only selector attribution benchmark.
-# 4 selectors x 4 targets x wikitext2 = 16 runs.
+# Default: 4 selectors x 4 targets x wikitext2 = 16 runs.
+# ONLY_SELECTORS/ONLY_TARGETS may define smaller controlled verification runs.
 # All use: pure_delete method, moe_budget_mode=global (greedy global layer-channel selection;
 # channel budgets -> actual_pct is selector-independent; only WHICH channels
 # differ).
@@ -216,9 +217,10 @@ echo "[ppl] Pre-flight OK: all configs found."
 
 # ── Validate config correctness (moe_budget_mode=global required) ────────────
 _validate_cfg() {
-    python3 - "$1" << 'PYVAL'
+    python3 - "$1" "$2" << 'PYVAL'
 import sys, yaml
 path = sys.argv[1]
+expected_selector = sys.argv[2]
 with open(path) as f:
     cfg = yaml.safe_load(f)
 bad = []
@@ -226,6 +228,16 @@ if cfg.get("moe_budget_mode") not in ("global", None):
     bad.append("moe_budget_mode must be 'global' (or None/missing), got: " + repr(cfg.get("moe_budget_mode")))
 if cfg.get("scaling_methods") != ["pure_delete"]:
     bad.append("scaling_methods must be ['pure_delete'], got: " + repr(cfg.get("scaling_methods")))
+if cfg.get("moe_selector") != expected_selector:
+    bad.append("moe_selector must match requested selector " + repr(expected_selector) + ", got: " + repr(cfg.get("moe_selector")))
+if cfg.get("moe_pruning_mode") != "packed_same_channel":
+    bad.append("moe_pruning_mode must be 'packed_same_channel', got: " + repr(cfg.get("moe_pruning_mode")))
+if cfg.get("moe_same_channel_aggregation") != "p95":
+    bad.append("moe_same_channel_aggregation must be 'p95', got: " + repr(cfg.get("moe_same_channel_aggregation")))
+if int(cfg.get("moe_channel_alignment", -1)) != 16:
+    bad.append("moe_channel_alignment must be 16, got: " + repr(cfg.get("moe_channel_alignment")))
+if float(cfg.get("max_expert_frac", -1)) != 0.2:
+    bad.append("max_expert_frac must be 0.2, got: " + repr(cfg.get("max_expert_frac")))
 if bad:
     for b in bad: print("[ppl] CONFIG ERROR:", b)
     sys.exit(1)
@@ -235,7 +247,7 @@ PYVAL
 for sel in "${_SEL_LIST[@]}"; do
     for tgt in "${_TGT_LIST[@]}"; do
         cfg="${CONFIG_DIR}/qwen3_30b_a3b_${DATASET}_n${N_EVAL}_target${tgt}_sel_${sel}.yaml"
-        _validate_cfg "${cfg}" || exit 1
+        _validate_cfg "${cfg}" "${sel}" || exit 1
     done
 done
 echo "[ppl] Config validation OK (moe_budget_mode=global confirmed for all)."
@@ -354,11 +366,7 @@ fi
 
 # ── Build summary + attribution CSVs ─────────────────────────────────────────
 EXPECTED_ROWS=$(( ${#_SEL_LIST[@]} * ${#_TGT_LIST[@]} ))
-if [ "${SMOKE}" = "1" ]; then
-    MIN_ROWS="${EXPECTED_ROWS}"
-else
-    MIN_ROWS=16
-fi
+MIN_ROWS="${EXPECTED_ROWS}"
 
 echo "[ppl] Building summary CSVs ..."
 python3 scripts/summarize_moe_selector_ppl.py \

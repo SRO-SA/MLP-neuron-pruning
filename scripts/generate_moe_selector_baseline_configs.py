@@ -39,6 +39,22 @@ except ImportError:
 
 # ── Selectors that require calibration data ────────────────────────────────────
 _CALIB_SELECTORS = {"activation_score"}
+_SUPPORTED_SELECTORS = {
+    "rmsnorm_bound",
+    "rmsnorm_ellipsoid_bound",
+    "down_norm",
+    "activation_score",
+    "random",
+}
+
+
+def _validate_selector_names(selectors: list[str]) -> None:
+    unknown = sorted(set(selectors) - _SUPPORTED_SELECTORS)
+    if unknown:
+        raise ValueError(
+            "unsupported selector(s): " + ", ".join(unknown)
+            + "; valid selectors: " + ", ".join(sorted(_SUPPORTED_SELECTORS))
+        )
 
 
 def _model_slug(model_name: str) -> str:
@@ -150,6 +166,11 @@ def main() -> None:
 
     if not selectors:
         print("ERROR: --selectors is empty.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        _validate_selector_names(selectors)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     if not targets:
         print("ERROR: --targets is empty.", file=sys.stderr)
