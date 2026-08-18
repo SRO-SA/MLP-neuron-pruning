@@ -4,6 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
+
+# When invoked as ``python3 scripts/validate_moe_plan_replay.py``, Python puts
+# ``scripts/`` rather than the repository root on sys.path.  Add the root
+# explicitly so the CLI behaves the same way as module-based test imports.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from src.moe_plan_replay import validate_derived_replay_plan
 

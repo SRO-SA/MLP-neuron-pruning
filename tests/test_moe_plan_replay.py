@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -93,6 +95,22 @@ class FixedAllocationReplayTests(unittest.TestCase):
     def test_same_selector_fails(self):
         with self.assertRaisesRegex(ValueError, "must differ"):
             self._build(alternate_selector="rmsnorm_bound")
+
+    def test_validator_cli_direct_invocation_can_import_src(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        completed = subprocess.run(
+            [
+                sys.executable,
+                os.path.join("scripts", "validate_moe_plan_replay.py"),
+                "--help",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--source", completed.stdout)
 
     def test_alignment_violation_fails(self):
         bad = copy.deepcopy(self.source)
