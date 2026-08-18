@@ -565,22 +565,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-rel_inc_pct"])
-            delta     = r["delta_vs_rmsnorm_bound"]
-            rank      = r["rank_at_target"]
-            delta_str = (
-                f"  [{delta:+.3f}% vs rmsnorm_bound]"
-                if isinstance(delta, float) else ""
-            )
-            print(f"    {rank}. {sel:<22s}  {rel:+.3f}%{delta_str}")
-    print()
-
-    print(
-        f"[summarize] OK: {len(summary_rows)} summary row(s), "
-        f"{len(attribution_rows)} attribution row(s).",
-        flush=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
