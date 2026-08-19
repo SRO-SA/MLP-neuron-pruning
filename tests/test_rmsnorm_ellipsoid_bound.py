@@ -274,6 +274,12 @@ class RMSNormEllipsoidIntegrationTests(unittest.TestCase):
             payload = json.loads(Path(json_path).read_text())
             self.assertEqual(payload["new_selector"], "rmsnorm_ellipsoid_bound")
             self.assertIn("bottom_2pct", payload["global"]["bottom_channels"])
+            self.assertIn("cross_layer_scale", payload)
+            self.assertIn(
+                "ellipsoid_layer_median_cross_layer_max_to_min_positive",
+                payload["cross_layer_scale"],
+            )
+            self.assertIn("does not by itself", payload["cross_layer_scale"]["interpretation"])
 
 
 if __name__ == "__main__":

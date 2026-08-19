@@ -10,9 +10,12 @@ import unittest
 
 from scripts.compare_moe_pruning_plans import compare_plans
 from scripts.generate_moe_plan_replay_configs import build_replay_configs
+from scripts.generate_moe_allocation_ranking_configs import build_matrix_configs
 from src.moe_plan_replay import (
+    build_allocation_ranking_selection,
     build_fixed_allocation_selection,
     validate_derived_replay_plan,
+    validate_derived_allocation_ranking_plan,
 )
 
 
@@ -84,6 +87,96 @@ class FixedAllocationReplayTests(unittest.TestCase):
             audit["alternate_channel_selector"], "rmsnorm_ellipsoid_bound"
         )
 
+    def test_general_interface_same_source_reproduces_plan_ids(self):
+        scores = {
+            0: [0, 1, 2, 3, 4, 5, 6, 7],
+            1: [0, 1, 2, 3, 4, 5, 6, 7],
+        }
+        selection, audit = build_allocation_ranking_selection(
+            self.source,
+            allocation_plan_path=self.source_path,
+            allocation_source="rmsnorm_bound",
+            ranking_source="rmsnorm_bound",
+            pruning_mode="packed_same_channel",
+            channel_alignment=2,
+            max_layer_frac=0.5,
+            max_expert_frac=0.5,
+            target_pct=2.0,
+            scores_by_layer=scores,
+            layer_sizes={0: 8, 1: 8},
+            num_experts_by_layer={0: 4, 1: 4},
+            total_expert_neurons=64,
+            experiment_name="rmsnorm_alloc__rmsnorm_rank",
+        )
+        self.assertEqual(selection[(0, -1)], [0, 1])
+        self.assertEqual(audit["allocation_source"], "rmsnorm_bound")
+        self.assertEqual(audit["ranking_source"], "rmsnorm_bound")
+        self.assertEqual(audit["layers"][0]["jaccard"], 1.0)
+
+    def test_general_interface_changes_only_ids_not_counts(self):
+        selection, audit = build_allocation_ranking_selection(
+            self.source,
+            allocation_plan_path=self.source_path,
+            allocation_source="rmsnorm_bound",
+            ranking_source="rmsnorm_ellipsoid_bound",
+            pruning_mode="packed_same_channel",
+            channel_alignment=2,
+            max_layer_frac=0.5,
+            max_expert_frac=0.5,
+            target_pct=2.0,
+            scores_by_layer={
+                0: [5, 4, 3, 2, 1, 0, 6, 7],
+                1: list(range(8)),
+            },
+            layer_sizes={0: 8, 1: 8},
+            num_experts_by_layer={0: 4, 1: 4},
+            total_expert_neurons=64,
+            experiment_name="rmsnorm_alloc__ellipsoid_rank",
+        )
+        self.assertEqual(selection[(0, -1)], [4, 5])
+        self.assertEqual(audit["total_selected_layer_channels"], 2)
+        self.assertEqual(audit["layers"][0]["ranking_score_min"], 0.0)
+        self.assertEqual(audit["layers"][0]["ranking_score_max"], 7.0)
+        derived = copy.deepcopy(self.source)
+        derived["selector"] = "rmsnorm_ellipsoid_bound"
+        for row in derived["layers"]:
+            row["prune_idx"] = selection[(row["layer_idx"], -1)]
+            row["pruned_channels"] = len(row["prune_idx"])
+            row["new_intermediate"] = row["old_intermediate"] - len(
+                row["prune_idx"]
+            )
+        derived["allocation_ranking"] = audit
+        validate_derived_allocation_ranking_plan(derived, self.source)
+
+    def test_fixed_plan_is_supported_for_allocation_and_ranking(self):
+        ranking_plan = copy.deepcopy(self.source)
+        ranking_plan["selector"] = "down_norm"
+        ranking_plan["layers"][0]["prune_idx"] = [6, 7]
+        ranking_path = os.path.join(self.tempdir.name, "ranking.json")
+        with open(ranking_path, "w", encoding="utf-8") as handle:
+            json.dump(ranking_plan, handle)
+        selection, audit = build_allocation_ranking_selection(
+            self.source,
+            allocation_plan_path=self.source_path,
+            allocation_source="fixed_plan",
+            ranking_source="fixed_plan",
+            pruning_mode="packed_same_channel",
+            channel_alignment=2,
+            max_layer_frac=0.5,
+            max_expert_frac=0.5,
+            target_pct=2.0,
+            scores_by_layer={0: range(8), 1: range(8)},
+            layer_sizes={0: 8, 1: 8},
+            num_experts_by_layer={0: 4, 1: 4},
+            total_expert_neurons=64,
+            experiment_name="fixed_alloc__fixed_rank",
+            ranking_plan=ranking_plan,
+            ranking_plan_path=ranking_path,
+        )
+        self.assertEqual(selection[(0, -1)], [6, 7])
+        self.assertEqual(audit["allocation_source"], "fixed_plan")
+        self.assertEqual(audit["ranking_source"], "fixed_plan")
+
     def test_missing_source_plan_fails(self):
         with self.assertRaises(FileNotFoundError):
             self._build(source_plan_path=os.path.join(self.tempdir.name, "missing.json"))
@@ -111,6 +204,24 @@ class FixedAllocationReplayTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--source", completed.stdout)
+
+    def test_allocation_ranking_cli_entrypoints_start_directly(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for script in (
+            "generate_moe_allocation_ranking_configs.py",
+            "validate_moe_allocation_ranking.py",
+            "summarize_moe_allocation_ranking.py",
+            "compare_moe_hybrid_replication.py",
+        ):
+            completed = subprocess.run(
+                [sys.executable, os.path.join("scripts", script), "--help"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("usage:", completed.stdout)
 
     def test_alignment_violation_fails(self):
         bad = copy.deepcopy(self.source)
@@ -210,6 +321,57 @@ class ConfigGeneratorTests(unittest.TestCase):
                 "rmsnorm_ellipsoid_bound",
             )
             self.assertEqual(cfg_d["moe_selector"], "rmsnorm_bound")
+
+    def test_general_matrix_exposes_independent_allocation_and_ranking(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            baseline = os.path.join(tempdir, "baseline")
+            trusted = os.path.join(tempdir, "trusted")
+            for run_dir, selector, target in (
+                (baseline, "rmsnorm_bound", 4),
+                (baseline, "down_norm", 4),
+                (baseline, "down_norm", 2),
+                (trusted, "rmsnorm_bound", 2),
+            ):
+                plan_dir = os.path.join(
+                    run_dir, f"{selector}_target{target}", "pruning_plans"
+                )
+                os.makedirs(plan_dir, exist_ok=True)
+                plan = {
+                    "selector": selector,
+                    "target_pct": float(target),
+                    "actual_pct": float(target),
+                    "pruning_mode": "packed_same_channel",
+                    "aggregation_mode": "p95",
+                    "channel_alignment": 16,
+                    "max_layer_frac": 0.1,
+                    "total_selected_layer_channels": 16,
+                    "layers": [{
+                        "layer_idx": 0,
+                        "old_intermediate": 768,
+                        "new_intermediate": 752,
+                        "pruned_channels": 16,
+                        "prune_idx": list(range(16)),
+                    }],
+                }
+                with open(os.path.join(plan_dir, "plan.json"), "w") as handle:
+                    json.dump(plan, handle)
+            configs = build_matrix_configs(
+                profile="target4",
+                baseline_run_dir=baseline,
+                target2_rmsnorm_run_dir=trusted,
+                results_dir=os.path.join(tempdir, "results"),
+                n_eval=1024,
+                eval_datasets=["wikitext2", "c4"],
+            )
+            self.assertEqual(len(configs), 4)
+            mapping = {name: cfg for name, cfg in configs}
+            hybrid = mapping["downnorm_alloc__ellipsoid_rank"]
+            self.assertEqual(hybrid["allocation_source"], "down_norm")
+            self.assertEqual(
+                hybrid["ranking_source"], "rmsnorm_ellipsoid_bound"
+            )
+            self.assertEqual(hybrid["eval_datasets"], ["wikitext2", "c4"])
+            self.assertEqual(hybrid["reconstruction_eval_samples"], 1024)
 
 
 class PlanComparisonTests(unittest.TestCase):

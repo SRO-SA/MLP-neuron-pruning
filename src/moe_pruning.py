@@ -41,11 +41,16 @@ Config keys (in YAML)
     min_expert_tokens: 128
     reconstruction_eval_samples: 64
     eval_datasets: ["wikitext2"]
+    allocation_source: rmsnorm_bound       # optional plan-anchored interface
+    ranking_source: rmsnorm_ellipsoid_bound
+    moe_allocation_plan: results/.../plan.json
+    moe_ranking_plan: null                 # required only for fixed_plan ranking
     moe_smoke_test: true   # if true: run only first 4 layers to verify correctness
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -71,6 +76,8 @@ from .rmsnorm_geometry import (
     compute_rmsnorm_sphere_bound_from_weights,
 )
 from .moe_plan_replay import (
+    SUPPORTED_ALLOCATION_RANKING_SOURCES,
+    build_allocation_ranking_selection,
     build_fixed_allocation_selection,
     validate_fixed_allocation_source_plan_static,
 )
@@ -141,6 +148,25 @@ MOE_SUMMARY_CSV_KEYS = [
     "source_allocation_selector",
     "alternate_channel_selector",
     "replay_source_overlap_channels",
+    "allocation_source",
+    "ranking_source",
+    "allocation_plan_path",
+    "ranking_plan_path",
+    "evaluation_max_seq_len",
+    "evaluation_batch_size",
+    "evaluation_num_texts",
+    "evaluation_corpus_sha256",
+    "evaluation_preprocessing",
+    "evaluation_protocol_label",
+    "seed",
+    "baseline_eval_tokens",
+    "pruned_eval_tokens",
+    "evaluation_token_count_match",
+    "fresh_model_process_required",
+    "process_id",
+    "model_load_instance_id",
+    "score_comparison_csv_path",
+    "score_comparison_json_path",
     # ── Results ───────────────────────────────────────────────────────────────
     "baseline_ppl",
     "compressed_ppl",
@@ -201,6 +227,8 @@ MOE_DRYRUN_CSV_KEYS = [
 
 MOE_PER_LAYER_CSV_KEYS = [
     "layer_idx",
+    "allocation_source",
+    "ranking_source",
     "num_experts",
     "old_intermediate",
     "new_intermediate",
@@ -216,6 +244,11 @@ MOE_PER_LAYER_CSV_KEYS = [
     "score_median",
     "score_p95",
     "score_max",
+    "score_scale_abs_max",
+    "allocation_reference_channel_ids",
+    "selected_channel_ids",
+    "ranking_overlap_count",
+    "ranking_jaccard_with_allocation",
     "expert_params_before",
     "expert_params_after",
     "removed_expert_params",
@@ -1575,6 +1608,47 @@ def _bottom_selection_details(
     return result
 
 
+def _cross_layer_bound_scale_summary(
+    json_layers: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """Summarize how bound magnitudes vary from layer to layer."""
+    legacy_medians = np.asarray([
+        float(row["metrics"]["legacy_median"]) for row in json_layers
+    ], dtype=np.float64)
+    ellipsoid_medians = np.asarray([
+        float(row["metrics"]["ellipsoid_median"]) for row in json_layers
+    ], dtype=np.float64)
+
+    def _layer_spread(prefix: str, values: np.ndarray) -> Dict[str, object]:
+        positive = values[values > 0.0]
+        result: Dict[str, object] = _distribution_fields(prefix, values)
+        result[f"{prefix}_cross_layer_max_to_min_positive"] = (
+            float(positive.max() / positive.min()) if len(positive) else None
+        )
+        mean = float(values.mean())
+        result[f"{prefix}_cross_layer_cv"] = (
+            float(values.std() / mean) if mean != 0.0 else None
+        )
+        return result
+
+    summary: Dict[str, object] = {}
+    summary.update(_layer_spread("legacy_layer_median", legacy_medians))
+    summary.update(_layer_spread("ellipsoid_layer_median", ellipsoid_medians))
+    positive = legacy_medians > 0.0
+    layer_ratios = ellipsoid_medians[positive] / legacy_medians[positive]
+    if len(layer_ratios):
+        summary.update(
+            _distribution_fields(
+                "ellipsoid_to_legacy_layer_median_ratio", layer_ratios
+            )
+        )
+    summary["interpretation"] = (
+        "These are raw bound magnitudes across layers. A certified local bound "
+        "does not by itself establish cross-layer comparability."
+    )
+    return summary
+
+
 def collect_moe_bound_comparison_scores(
     moe_layers: List[MoELayerInfo],
     aggregation: str = "p95",
@@ -1701,6 +1775,7 @@ def save_moe_bound_comparison_diagnostics(
                 global_identities, legacy_all, sphere_all, ellipsoid_all
             ),
         },
+        "cross_layer_scale": _cross_layer_bound_scale_summary(json_layers),
         "layers": json_layers,
     }
     with open(json_path, "w") as fh:
@@ -2350,6 +2425,88 @@ def run_moe_target_pruning_mode(
     fixed_allocation_selector_cfg = cfg.get(
         "moe_fixed_allocation_selector", None
     )
+    allocation_source_cfg = cfg.get("allocation_source", None)
+    ranking_source_cfg = cfg.get("ranking_source", None)
+    allocation_plan_cfg = cfg.get("moe_allocation_plan", None)
+    ranking_plan_cfg = cfg.get("moe_ranking_plan", None)
+    allocation_ranking_name_cfg = str(
+        cfg.get("allocation_ranking_experiment_name", "")
+    )
+    allocation_ranking_enabled = bool(
+        allocation_source_cfg or ranking_source_cfg or allocation_plan_cfg
+        or ranking_plan_cfg
+    )
+    if allocation_ranking_enabled:
+        if score_comparison_only:
+            raise ValueError(
+                "allocation/ranking experiments cannot use score-comparison-only mode"
+            )
+        if not save_plan_cfg:
+            raise ValueError(
+                "allocation/ranking experiments require save_pruning_plan: true"
+            )
+        if fixed_allocation_plan_cfg or fixed_allocation_selector_cfg:
+            raise ValueError(
+                "allocation_source/ranking_source cannot be combined with the "
+                "legacy moe_fixed_allocation_* interface"
+            )
+        if not allocation_source_cfg or not ranking_source_cfg:
+            raise ValueError(
+                "allocation_source and ranking_source must be provided together"
+            )
+        if allocation_source_cfg not in SUPPORTED_ALLOCATION_RANKING_SOURCES:
+            raise ValueError(
+                f"unsupported allocation_source={allocation_source_cfg!r}"
+            )
+        if ranking_source_cfg not in SUPPORTED_ALLOCATION_RANKING_SOURCES:
+            raise ValueError(f"unsupported ranking_source={ranking_source_cfg!r}")
+        if not allocation_plan_cfg or not os.path.isfile(str(allocation_plan_cfg)):
+            raise FileNotFoundError(
+                f"allocation plan not found: {allocation_plan_cfg!r}"
+            )
+        if ranking_source_cfg != "fixed_plan" and moe_selector != ranking_source_cfg:
+            raise ValueError(
+                "moe_selector must equal ranking_source for selector-ranked "
+                f"experiments: {moe_selector!r} != {ranking_source_cfg!r}"
+            )
+        if ranking_source_cfg == "fixed_plan":
+            if not ranking_plan_cfg or not os.path.isfile(str(ranking_plan_cfg)):
+                raise FileNotFoundError(
+                    f"ranking_source='fixed_plan' plan not found: {ranking_plan_cfg!r}"
+                )
+            _ranking_plan = load_pruning_plan(str(ranking_plan_cfg))
+        else:
+            _ranking_plan = None
+        if pruning_mode != "packed_same_channel" or moe_budget_mode != "global":
+            raise ValueError(
+                "allocation/ranking experiments require global "
+                "packed_same_channel pruning"
+            )
+        if chan_agg != "p95":
+            raise ValueError("allocation/ranking experiments require p95 aggregation")
+        if len(TARGET_PCTS) != 1:
+            raise ValueError("allocation/ranking experiments require one target")
+        _allocation_plan = load_pruning_plan(str(allocation_plan_cfg))
+        _expected_allocation_selector = (
+            str(_allocation_plan.get("selector", ""))
+            if allocation_source_cfg == "fixed_plan"
+            else str(allocation_source_cfg)
+        )
+        validate_fixed_allocation_source_plan_static(
+            _allocation_plan,
+            source_plan_path=str(allocation_plan_cfg),
+            expected_source_selector=_expected_allocation_selector,
+            alternate_selector=str(ranking_source_cfg),
+            pruning_mode=pruning_mode,
+            channel_alignment=chan_align,
+            max_layer_frac=max_layer_frac,
+            max_expert_frac=max_exp_frac,
+            target_pct=float(TARGET_PCTS[0]),
+            allow_same_selector=True,
+        )
+    else:
+        _allocation_plan = None
+        _ranking_plan = None
     if bool(fixed_allocation_plan_cfg) != bool(fixed_allocation_selector_cfg):
         raise ValueError(
             "moe_fixed_allocation_plan and moe_fixed_allocation_selector must "
@@ -2431,6 +2588,13 @@ def run_moe_target_pruning_mode(
     print(f"  pruning_mode   : {pruning_mode}")
     print(f"  moe_selector   : {moe_selector}")
     print(f"  moe_budget_mode: {moe_budget_mode}")
+    if allocation_ranking_enabled:
+        print(
+            "  ALLOC/RANK     : "
+            f"allocation_source={allocation_source_cfg}  "
+            f"ranking_source={ranking_source_cfg}"
+        )
+        print(f"  ALLOCATION PLAN: {allocation_plan_cfg}")
     if fixed_allocation_plan_cfg:
         print(
             "  FIXED ALLOCATION: "
@@ -2465,12 +2629,17 @@ def run_moe_target_pruning_mode(
     # A weight-only comparison does not need evaluation text or PPL.
     if score_comparison_only:
         all_eval_corpora = {}
+        eval_corpus_sha256 = {}
         print("Skipping evaluation dataset loading (score-comparison-only mode).")
     else:
         print(f"Loading evaluation datasets: {EVAL_DATASETS} ...")
         all_eval_corpora = load_all_eval_datasets(
             EVAL_DATASETS, max_samples=n_eval, use_fallback_corpus=use_fb,
         )
+        eval_corpus_sha256 = {
+            _dn: hashlib.sha256("\0".join(_txts).encode("utf-8")).hexdigest()
+            for _dn, _txts in all_eval_corpora.items()
+        }
         for _dn, _txts in all_eval_corpora.items():
             print(f"  {_dn}: {len(_txts)} samples")
 
@@ -2500,6 +2669,9 @@ def run_moe_target_pruning_mode(
                 model_name=model_name, fallback_name=None,
                 device=device, dtype_str=dtype_str,
                 device_map=_dmap,
+            )
+            _model_load_instance_id = (
+                f"pid={os.getpid()};loaded_ns={time.time_ns()};model={model_name}"
             )
             model.eval()
             _log_gpu_memory("after model load")
@@ -2630,15 +2802,21 @@ def run_moe_target_pruning_mode(
             # Per-dataset baselines (skipped for dry-run)
             if dry_run:
                 baseline_ppl_per_ds = {_ds: float("nan") for _ds in EVAL_DATASETS}
+                baseline_eval_info_per_ds = {
+                    _ds: {"perplexity": float("nan"), "n_tokens": 0}
+                    for _ds in EVAL_DATASETS
+                }
                 print("  [dry-run] Skipping baseline PPL evaluation.")
             else:
                 baseline_ppl_per_ds = {}
+                baseline_eval_info_per_ds = {}
                 for _ds in EVAL_DATASETS:
                     _bp = evaluate_perplexity(
                         model, tokenizer, texts=all_eval_corpora[_ds],
                         max_seq_len=max_seq, batch_size=batch_sz, device=device,
                     )
                     baseline_ppl_per_ds[_ds] = _bp["perplexity"]
+                    baseline_eval_info_per_ds[_ds] = dict(_bp)
                     print(f"  Baseline PPL ({_ds}): {_bp['perplexity']:.4f}")
 
             baseline_params_raw = count_parameters(model)
@@ -2677,6 +2855,8 @@ def run_moe_target_pruning_mode(
             # ── Per-target loop ──────────────────────────────────────────────
             for target_pct in TARGET_PCTS:
                 target_n = round(target_pct / 100.0 * total_expert_neurons)
+                _target_score_comparison_csv = ""
+                _target_score_comparison_json = ""
                 print(f"\n  Target: {target_pct:.1f}%  →  {target_n:,} neurons")
 
                 # ── Score all experts ────────────────────────────────────────
@@ -2791,6 +2971,8 @@ def run_moe_target_pruning_mode(
                         model_name,
                         chan_agg,
                     )
+                    _target_score_comparison_csv = _cmp_csv
+                    _target_score_comparison_json = _cmp_json
                     print(f"  [score-compare] CSV : {_cmp_csv}")
                     print(f"  [score-compare] JSON: {_cmp_json}")
 
@@ -2837,8 +3019,61 @@ def run_moe_target_pruning_mode(
                 removed_expert_neurons = 0
                 selected_layer_channels = 0
                 _fixed_replay_audit: Optional[Dict[str, object]] = None
+                _allocation_ranking_audit: Optional[Dict[str, object]] = None
 
-                if fixed_allocation_plan_cfg:
+                if allocation_ranking_enabled:
+                    per_expert_pruned, _allocation_ranking_audit = (
+                        build_allocation_ranking_selection(
+                            _allocation_plan,
+                            allocation_plan_path=str(allocation_plan_cfg),
+                            allocation_source=str(allocation_source_cfg),
+                            ranking_source=str(ranking_source_cfg),
+                            pruning_mode=pruning_mode,
+                            channel_alignment=chan_align,
+                            max_layer_frac=max_layer_frac,
+                            max_expert_frac=max_exp_frac,
+                            target_pct=target_pct,
+                            scores_by_layer={
+                                li: scores.tolist()
+                                for li, scores in layer_avg_scores.items()
+                            },
+                            layer_sizes={
+                                li: expert_sizes[(li, -1)]
+                                for li in layer_avg_scores
+                            },
+                            num_experts_by_layer={
+                                li: layer_idx_to_info[li].num_experts
+                                for li in layer_avg_scores
+                            },
+                            total_expert_neurons=total_expert_neurons,
+                            experiment_name=(
+                                allocation_ranking_name_cfg
+                                or f"{allocation_source_cfg}_alloc__"
+                                   f"{ranking_source_cfg}_rank"
+                            ),
+                            ranking_plan=_ranking_plan,
+                            ranking_plan_path=(
+                                str(ranking_plan_cfg) if ranking_plan_cfg else None
+                            ),
+                        )
+                    )
+                    selected_layer_channels = int(
+                        _allocation_ranking_audit[
+                            "total_selected_layer_channels"
+                        ]
+                    )
+                    removed_expert_neurons = int(
+                        _allocation_ranking_audit[
+                            "total_removed_expert_neurons"
+                        ]
+                    )
+                    print(
+                        "    [allocation-ranking] "
+                        f"allocation_source={allocation_source_cfg}  "
+                        f"ranking_source={ranking_source_cfg}  "
+                        f"layer_channels={selected_layer_channels:,}"
+                    )
+                elif fixed_allocation_plan_cfg:
                     # ── Fixed-layer-allocation replay ───────────────────────
                     # Reuse the normal p95-aggregated score vectors, but take
                     # every layer's channel count from the source plan.  The
@@ -3035,6 +3270,16 @@ def run_moe_target_pruning_mode(
                         )
                         _plan["alternate_channel_selector"] = moe_selector
                         _plan["max_expert_frac"] = max_exp_frac
+                    if _allocation_ranking_audit is not None:
+                        _plan["plan_kind"] = "allocation_ranking_experiment"
+                        _plan["allocation_ranking"] = _allocation_ranking_audit
+                        _plan["allocation_source"] = str(allocation_source_cfg)
+                        _plan["ranking_source"] = str(ranking_source_cfg)
+                        _plan["allocation_plan_path"] = str(allocation_plan_cfg)
+                        _plan["ranking_plan_path"] = (
+                            str(ranking_plan_cfg) if ranking_plan_cfg else ""
+                        )
+                        _plan["max_expert_frac"] = max_exp_frac
                     _plan_path = make_pruning_plan_path(
                         output_dir, model_name, moe_calib_dataset,
                         n_eval, moe_calib_samples, moe_selector,
@@ -3045,6 +3290,11 @@ def run_moe_target_pruning_mode(
                             ".json",
                             f"_fixedalloc_{fixed_allocation_selector_cfg}"
                             f"_rank_{moe_selector}.json",
+                        )
+                    if _allocation_ranking_audit is not None:
+                        _plan_path = _plan_path.replace(
+                            ".json",
+                            f"_{allocation_ranking_name_cfg or allocation_source_cfg + '_alloc__' + ranking_source_cfg + '_rank'}.json",
                         )
                     save_pruning_plan(_plan, _plan_path)
                     print(f"    [plan] saved  → {_plan_path}")
@@ -3081,6 +3331,14 @@ def run_moe_target_pruning_mode(
                     )
                     if _fixed_replay_audit is not None else 0
                 )
+                _selection_audit = (
+                    _allocation_ranking_audit or _fixed_replay_audit
+                )
+                if _allocation_ranking_audit is not None:
+                    _replay_overlap_channels = sum(
+                        int(layer["overlap_count"])
+                        for layer in _allocation_ranking_audit["layers"]
+                    )
                 _replay_result_fields = {
                     "fixed_allocation_replay": _fixed_replay_audit is not None,
                     "experiment_label": (
@@ -3100,7 +3358,38 @@ def run_moe_target_pruning_mode(
                         moe_selector if _fixed_replay_audit is not None else ""
                     ),
                     "replay_source_overlap_channels": _replay_overlap_channels,
+                    "allocation_source": (
+                        str(allocation_source_cfg)
+                        if _allocation_ranking_audit is not None
+                        else str(fixed_allocation_selector_cfg or moe_selector)
+                    ),
+                    "ranking_source": (
+                        str(ranking_source_cfg)
+                        if _allocation_ranking_audit is not None
+                        else moe_selector
+                    ),
+                    "allocation_plan_path": (
+                        str(allocation_plan_cfg)
+                        if _allocation_ranking_audit is not None else ""
+                    ),
+                    "ranking_plan_path": (
+                        str(ranking_plan_cfg)
+                        if (_allocation_ranking_audit is not None and ranking_plan_cfg)
+                        else ""
+                    ),
                 }
+                if _allocation_ranking_audit is not None:
+                    _replay_result_fields.update({
+                        "fixed_allocation_replay": False,
+                        "experiment_label": str(
+                            _allocation_ranking_audit["experiment_name"]
+                        ),
+                        "source_plan_path": str(allocation_plan_cfg),
+                        "source_allocation_selector": str(
+                            allocation_source_cfg
+                        ),
+                        "alternate_channel_selector": str(ranking_source_cfg),
+                    })
 
                 # ── Fail-fast: verify packed_same_channel used (li,-1) keys ─
                 if pruning_mode == "packed_same_channel" and target_pct > 0:
@@ -3136,6 +3425,36 @@ def run_moe_target_pruning_mode(
                     per_expert_pruned, expert_sizes, moe_layers,
                     all_expert_scores, routed_counts, pruning_mode,
                 )
+                if _selection_audit is not None:
+                    _audit_by_layer = {
+                        int(row["layer_idx"]): row
+                        for row in _selection_audit["layers"]
+                    }
+                    for _layer_row in _per_layer_rows:
+                        _audit_row = _audit_by_layer[int(_layer_row["layer_idx"])]
+                        _layer_row.update({
+                            "allocation_source": _replay_result_fields[
+                                "allocation_source"
+                            ],
+                            "ranking_source": _replay_result_fields[
+                                "ranking_source"
+                            ],
+                            "score_scale_abs_max": _audit_row.get(
+                                "ranking_score_scale_abs_max", ""
+                            ),
+                            "allocation_reference_channel_ids": _audit_row[
+                                "source_indices"
+                            ],
+                            "selected_channel_ids": _audit_row[
+                                "selected_indices"
+                            ],
+                            "ranking_overlap_count": _audit_row[
+                                "overlap_count"
+                            ],
+                            "ranking_jaccard_with_allocation": _audit_row[
+                                "jaccard"
+                            ],
+                        })
                 _pruned_ep = sum(
                     r.get("removed_expert_params", 0) for r in _per_layer_rows
                 )
@@ -3969,6 +4288,16 @@ def run_moe_target_pruning_mode(
                             device=device,
                         )
                         ppl   = ppl_info["perplexity"]
+                        _baseline_tokens = int(
+                            baseline_eval_info_per_ds[_ds]["n_tokens"]
+                        )
+                        _pruned_tokens = int(ppl_info["n_tokens"])
+                        if _baseline_tokens != _pruned_tokens:
+                            raise AssertionError(
+                                f"evaluation token count changed for {_ds}: "
+                                f"baseline={_baseline_tokens}, "
+                                f"pruned={_pruned_tokens}"
+                            )
                         delta = ppl - cur_bppl
                         rel   = 100.0 * delta / cur_bppl if cur_bppl > 0 else 0.0
                         if torch.cuda.is_available():
@@ -4026,6 +4355,26 @@ def run_moe_target_pruning_mode(
                             "notes": "",
                             "csv_path": main_csv_path,
                             "json_path": json_path,
+                            "evaluation_max_seq_len": max_seq,
+                            "evaluation_batch_size": batch_sz,
+                            "evaluation_num_texts": len(all_eval_corpora[_ds]),
+                            "evaluation_corpus_sha256": eval_corpus_sha256[_ds],
+                            "evaluation_preprocessing": (
+                                "same_text_list; tokenizer padding+truncation; "
+                                "padding labels=-100; shifted nonpadding token NLL"
+                            ),
+                            "evaluation_protocol_label": str(
+                                cfg.get("evaluation_protocol_label", "")
+                            ),
+                            "seed": int(cfg.get("seed", 42)),
+                            "baseline_eval_tokens": _baseline_tokens,
+                            "pruned_eval_tokens": _pruned_tokens,
+                            "evaluation_token_count_match": True,
+                            "fresh_model_process_required": True,
+                            "process_id": os.getpid(),
+                            "model_load_instance_id": _model_load_instance_id,
+                            "score_comparison_csv_path": _target_score_comparison_csv,
+                            "score_comparison_json_path": _target_score_comparison_json,
                         }
                         summary.update({
                             "target_pct": target_pct,
@@ -4124,6 +4473,14 @@ def run_moe_target_pruning_mode(
         "min_expert_tokens": min_exp_tokens,
         "note": "Router weights and expert routing are NOT modified. "
                 "Only MLP channels within each expert are pruned.",
+        "method_framing": (
+            "Global layer-budget allocation followed by certified "
+            "ellipsoid-based within-layer channel selection. Raw certified "
+            "bounds are not assumed comparable across layers."
+            if ranking_source_cfg == "rmsnorm_ellipsoid_bound"
+            else "Allocation/ranking control experiment; existing selector "
+                 "definitions are unchanged."
+        ),
         "results": all_results,
     }
     with open(json_path, "w") as fh:

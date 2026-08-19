@@ -7,11 +7,19 @@ count exactly.  Physical pruning remains in the existing pipeline.
 """
 from __future__ import annotations
 
+import math
 import os
+import statistics
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
 PACKED_PRUNING_MODE = "packed_same_channel"
+SUPPORTED_ALLOCATION_RANKING_SOURCES = {
+    "rmsnorm_bound",
+    "rmsnorm_ellipsoid_bound",
+    "down_norm",
+    "fixed_plan",
+}
 
 
 def _as_int_list(values: Iterable[object]) -> List[int]:
@@ -44,6 +52,7 @@ def validate_fixed_allocation_source_plan_static(
     max_layer_frac: float,
     max_expert_frac: float,
     target_pct: float,
+    allow_same_selector: bool = False,
 ) -> Dict[int, Mapping[str, object]]:
     """Validate every source/config invariant that needs no loaded model."""
     if not source_plan_path or not os.path.isfile(source_plan_path):
@@ -75,7 +84,7 @@ def validate_fixed_allocation_source_plan_static(
             "source selector mismatch: "
             f"plan={source_selector!r}, expected={expected_source_selector!r}"
         )
-    if alternate_selector == source_selector:
+    if alternate_selector == source_selector and not allow_same_selector:
         raise ValueError(
             "alternate channel selector must differ from the source allocation "
             f"selector; both are {source_selector!r}"
@@ -165,6 +174,7 @@ def validate_fixed_allocation_request(
     max_expert_frac: float,
     target_pct: float,
     layer_sizes: Mapping[int, int],
+    allow_same_selector: bool = False,
 ) -> Dict[int, Mapping[str, object]]:
     """Validate source/config and loaded-model replay invariants."""
     source_layers = validate_fixed_allocation_source_plan_static(
@@ -177,6 +187,7 @@ def validate_fixed_allocation_request(
         max_layer_frac=max_layer_frac,
         max_expert_frac=max_expert_frac,
         target_pct=target_pct,
+        allow_same_selector=allow_same_selector,
     )
     current_layer_ids = {int(layer_idx) for layer_idx in layer_sizes}
     if set(source_layers) != current_layer_ids:
@@ -212,6 +223,7 @@ def build_fixed_allocation_selection(
     layer_sizes: Mapping[int, int],
     num_experts_by_layer: Mapping[int, int],
     total_expert_neurons: int,
+    allow_same_selector: bool = False,
 ) -> Tuple[Dict[Tuple[int, int], List[int]], Dict[str, object]]:
     """Select alternate-ranked channels with source per-layer counts fixed."""
     source_layers = validate_fixed_allocation_request(
@@ -225,6 +237,7 @@ def build_fixed_allocation_selection(
         max_expert_frac=max_expert_frac,
         target_pct=target_pct,
         layer_sizes=layer_sizes,
+        allow_same_selector=allow_same_selector,
     )
     if set(int(key) for key in scores_by_layer) != set(source_layers):
         raise ValueError("alternate score layers do not match source plan layers")
@@ -306,6 +319,131 @@ def build_fixed_allocation_selection(
     return selection, audit
 
 
+def build_allocation_ranking_selection(
+    allocation_plan: Mapping[str, object],
+    *,
+    allocation_plan_path: str,
+    allocation_source: str,
+    ranking_source: str,
+    pruning_mode: str,
+    channel_alignment: int,
+    max_layer_frac: float,
+    max_expert_frac: float,
+    target_pct: float,
+    scores_by_layer: Mapping[int, Sequence[float]],
+    layer_sizes: Mapping[int, int],
+    num_experts_by_layer: Mapping[int, int],
+    total_expert_neurons: int,
+    experiment_name: str,
+    ranking_plan: Mapping[str, object] | None = None,
+    ranking_plan_path: str | None = None,
+) -> Tuple[Dict[Tuple[int, int], List[int]], Dict[str, object]]:
+    """Apply plan-derived layer counts and an independent within-layer ranking.
+
+    Named allocation sources require a plan created by that selector.  The
+    special ``fixed_plan`` source accepts any valid plan and uses only its count
+    vector.  ``fixed_plan`` may also be used as the ranking source, in which case
+    a second plan supplies channel identities and must have identical counts.
+    """
+    if allocation_source not in SUPPORTED_ALLOCATION_RANKING_SOURCES:
+        raise ValueError(f"unsupported allocation_source={allocation_source!r}")
+    if ranking_source not in SUPPORTED_ALLOCATION_RANKING_SOURCES:
+        raise ValueError(f"unsupported ranking_source={ranking_source!r}")
+    plan_selector = str(allocation_plan.get("selector", ""))
+    expected_allocation_selector = (
+        plan_selector if allocation_source == "fixed_plan" else allocation_source
+    )
+
+    effective_scores: Mapping[int, Sequence[float]] = scores_by_layer
+    if ranking_source == "fixed_plan":
+        if ranking_plan is None or not ranking_plan_path:
+            raise ValueError("ranking_source='fixed_plan' requires moe_ranking_plan")
+        ranking_layers = _source_layers_by_index(ranking_plan)
+        allocation_layers = _source_layers_by_index(allocation_plan)
+        if set(ranking_layers) != set(allocation_layers):
+            raise ValueError("ranking/allocation fixed plans have different layers")
+        synthetic_scores: Dict[int, List[float]] = {}
+        for layer_idx, allocation_layer in allocation_layers.items():
+            required = len(allocation_layer.get("prune_idx", []))
+            ranking_indices = _as_int_list(
+                ranking_layers[layer_idx].get("prune_idx", [])
+            )
+            if len(ranking_indices) != required:
+                raise ValueError(
+                    f"layer {layer_idx} fixed ranking count {len(ranking_indices)} "
+                    f"does not match allocation count {required}"
+                )
+            width = int(layer_sizes[layer_idx])
+            if len(set(ranking_indices)) != len(ranking_indices) or any(
+                index < 0 or index >= width for index in ranking_indices
+            ):
+                raise ValueError(f"layer {layer_idx} fixed ranking indices invalid")
+            selected_set = set(ranking_indices)
+            synthetic_scores[layer_idx] = [
+                float(index - width) if index in selected_set else float(index + width)
+                for index in range(width)
+            ]
+        effective_scores = synthetic_scores
+
+    selection, audit = build_fixed_allocation_selection(
+        allocation_plan,
+        source_plan_path=allocation_plan_path,
+        expected_source_selector=expected_allocation_selector,
+        alternate_selector=ranking_source,
+        pruning_mode=pruning_mode,
+        channel_alignment=channel_alignment,
+        max_layer_frac=max_layer_frac,
+        max_expert_frac=max_expert_frac,
+        target_pct=target_pct,
+        scores_by_layer=effective_scores,
+        layer_sizes=layer_sizes,
+        num_experts_by_layer=num_experts_by_layer,
+        total_expert_neurons=total_expert_neurons,
+        allow_same_selector=True,
+    )
+    audit.update({
+        "plan_kind": "allocation_ranking_experiment",
+        "experiment_name": experiment_name,
+        "allocation_source": allocation_source,
+        "ranking_source": ranking_source,
+        "allocation_plan_path": allocation_plan_path,
+        "ranking_plan_path": ranking_plan_path or "",
+    })
+    audit.pop("fixed_allocation", None)
+    audit.pop("channel_selector", None)
+
+    score_lookup = {
+        int(layer_idx): [float(value) for value in values]
+        for layer_idx, values in effective_scores.items()
+    }
+    for row in audit["layers"]:
+        layer_idx = int(row["layer_idx"])
+        values = score_lookup[layer_idx]
+        abs_max = max(abs(value) for value in values) if values else 0.0
+        median = statistics.median(values) if values else float("nan")
+        row.update({
+            "allocation_source": allocation_source,
+            "ranking_source": ranking_source,
+            "ranking_score_min": min(values) if values else None,
+            "ranking_score_median": median if math.isfinite(median) else None,
+            "ranking_score_max": max(values) if values else None,
+            "ranking_score_scale_abs_max": abs_max,
+        })
+
+    if allocation_source == ranking_source and allocation_source != "fixed_plan":
+        changed_layers = [
+            int(row["layer_idx"])
+            for row in audit["layers"]
+            if row["source_indices"] != row["selected_indices"]
+        ]
+        if changed_layers:
+            raise AssertionError(
+                "same allocation/ranking source failed to reproduce source plan "
+                f"indices in layers {changed_layers}"
+            )
+    return selection, audit
+
+
 def validate_derived_replay_plan(
     derived_plan: Mapping[str, object],
     source_plan: Mapping[str, object],
@@ -336,3 +474,62 @@ def validate_derived_replay_plan(
         )
     if int(replay.get("total_selected_layer_channels", -1)) != source_total:
         raise ValueError("derived replay audit total differs from source")
+
+
+def validate_derived_allocation_ranking_plan(
+    derived_plan: Mapping[str, object],
+    allocation_plan: Mapping[str, object],
+) -> None:
+    """Validate a saved allocation/ranking plan against its allocation plan."""
+    audit = derived_plan.get("allocation_ranking")
+    if not isinstance(audit, Mapping):
+        raise ValueError("derived plan has no allocation_ranking audit block")
+    derived_layers = _source_layers_by_index(derived_plan)
+    allocation_layers = _source_layers_by_index(allocation_plan)
+    audit_layers = {
+        int(row["layer_idx"]): row for row in audit.get("layers", [])
+    }
+    if not (
+        set(derived_layers) == set(allocation_layers) == set(audit_layers)
+    ):
+        raise ValueError("derived/allocation/audit layer sets differ")
+    for layer_idx in sorted(allocation_layers):
+        allocation_indices = _as_int_list(
+            allocation_layers[layer_idx].get("prune_idx", [])
+        )
+        derived_indices = _as_int_list(
+            derived_layers[layer_idx].get("prune_idx", [])
+        )
+        audit_row = audit_layers[layer_idx]
+        if len(derived_indices) != len(allocation_indices):
+            raise ValueError(
+                f"layer {layer_idx} allocation count changed: "
+                f"source={len(allocation_indices)}, derived={len(derived_indices)}"
+            )
+        if sorted(derived_indices) != sorted(audit_row.get("selected_indices", [])):
+            raise ValueError(f"layer {layer_idx} derived/audit indices differ")
+        if sorted(allocation_indices) != sorted(audit_row.get("source_indices", [])):
+            raise ValueError(f"layer {layer_idx} source/audit indices differ")
+    source_total = int(allocation_plan.get("total_selected_layer_channels", -1))
+    derived_total = sum(
+        len(layer.get("prune_idx", [])) for layer in derived_layers.values()
+    )
+    if derived_total != source_total:
+        raise ValueError(
+            f"derived total {derived_total} differs from allocation {source_total}"
+        )
+    if int(audit.get("total_selected_layer_channels", -1)) != source_total:
+        raise ValueError("allocation/ranking audit total differs from source")
+    if (
+        audit.get("allocation_source") == audit.get("ranking_source")
+        and audit.get("allocation_source") != "fixed_plan"
+    ):
+        changed = [
+            layer_idx for layer_idx in audit_layers
+            if sorted(audit_layers[layer_idx]["source_indices"])
+            != sorted(audit_layers[layer_idx]["selected_indices"])
+        ]
+        if changed:
+            raise ValueError(
+                f"same-source allocation/ranking changed channels: {changed}"
+            )
