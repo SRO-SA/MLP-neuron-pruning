@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.compare_moe_pruning_plans import compare_plans
 from scripts.generate_moe_plan_replay_configs import build_replay_configs
@@ -423,16 +424,63 @@ class ConfigGeneratorTests(unittest.TestCase):
             ))
 
     def test_target4_ranking_profile_adds_activation_and_cross_ranking(self):
+        profiles = __import__(
+            "scripts.generate_moe_allocation_ranking_configs",
+            fromlist=["PROFILE_EXPERIMENTS"],
+        ).PROFILE_EXPERIMENTS
         names = {
             cell["name"]
-            for cell in __import__(
-                "scripts.generate_moe_allocation_ranking_configs",
-                fromlist=["PROFILE_EXPERIMENTS"],
-            ).PROFILE_EXPERIMENTS["target4_rankings"]
+            for cell in profiles["target4_rankings"]
         }
         self.assertIn("rmsnorm_alloc__activation_rank", names)
         self.assertIn("downnorm_alloc__activation_rank", names)
         self.assertIn("rmsnorm_alloc__downnorm_rank", names)
+
+    def test_version3_profiles_are_bounded_and_exact(self):
+        profiles = __import__(
+            "scripts.generate_moe_allocation_ranking_configs",
+            fromlist=["PROFILE_EXPERIMENTS"],
+        ).PROFILE_EXPERIMENTS
+        target8 = profiles["target8_rmsnorm_primary"]
+        self.assertEqual(len(target8), 4)
+        self.assertEqual({cell["target"] for cell in target8}, {8})
+        self.assertEqual(
+            {cell["name"] for cell in target8},
+            {
+                "rmsnorm_alloc__rmsnorm_rank",
+                "rmsnorm_alloc__activation_rank",
+                "rmsnorm_alloc__ellipsoid_rank",
+                "downnorm_alloc__ellipsoid_rank",
+            },
+        )
+        aggregation = profiles["target6_aggregation_rmsnorm"]
+        self.assertEqual({cell["aggregation"] for cell in aggregation}, {"p95", "max"})
+        self.assertEqual({cell["exact_total"] for cell in aggregation}, {2288})
+        target4_aggregation = profiles["target4_aggregation_rmsnorm"]
+        self.assertEqual(
+            {cell["exact_total"] for cell in target4_aggregation}, {1600}
+        )
+        exact = profiles["target6_exact_budget"]
+        self.assertEqual({cell["allocation"] for cell in exact}, {
+            "rmsnorm_bound", "down_norm"
+        })
+        self.assertEqual({cell["exact_total"] for cell in exact}, {2256})
+
+    def test_target2_freeze_contains_all_validated_allocation_ranking_cells(self):
+        profile = __import__(
+            "scripts.generate_moe_allocation_ranking_configs",
+            fromlist=["PROFILE_EXPERIMENTS"],
+        ).PROFILE_EXPERIMENTS["target2_paper_freeze"]
+        self.assertEqual(len(profile), 6)
+        self.assertTrue(all(cell["target"] == 2 for cell in profile))
+        self.assertTrue(all(cell["aggregation"] == "p95" for cell in profile))
+
+    def test_matrix_runner_refuses_implicit_result_overwrite(self):
+        runner = Path("scripts/run_moe_allocation_ranking_matrix.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("refusing to overwrite existing RUN_DIR", runner)
+        self.assertIn("ALLOW_EXISTING_RUN_DIR", runner)
 
 
 class ExactAllocationBudgetTests(unittest.TestCase):

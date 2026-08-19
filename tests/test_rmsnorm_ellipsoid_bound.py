@@ -318,12 +318,48 @@ class RMSNormEllipsoidIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(payload["global"]["sphere_numerical_violations"], 0)
             self.assertLessEqual(payload["global"]["ellipsoid_all"]["max"], 1.0001)
+            self.assertEqual(payload["sampled_routed_inputs"], 16)
+            self.assertEqual(
+                payload["expert_channel_pairs_evaluated"], 2 * self.d_ff
+            )
+            self.assertEqual(
+                payload["routed_input_channel_contributions_evaluated"],
+                16 * self.d_ff,
+            )
+            self.assertIn("sphere_to_ellipsoid_bound", payload["global"])
+            self.assertIn("ellipsoid_pruned", payload["global"])
+            self.assertEqual(
+                payload["tolerance_rule"],
+                "observed <= bound * (1 + relative_tolerance) + absolute_tolerance",
+            )
             archive = dict(__import__("numpy").load(npz_path))
             self.assertEqual(
                 archive["layer_0_ellipsoid_bound"].shape,
                 (2, self.d_ff),
             )
             self.assertEqual(archive["layer_0_pruned_mask"].tolist(), [True, False, False, False])
+
+    def test_bound_tightness_fails_on_a_sampled_violation(self) -> None:
+        layer = ToyLayer(self.gamma)
+        info = MoELayerInfo(0, layer)
+        info.is_moe = True
+        info.num_experts = 1
+        expert = ToyExpert(self.d_model, self.d_ff)
+        gate = torch.ones_like(self.gate)
+        up = torch.ones_like(self.up)
+        down = torch.ones_like(self.down)
+        _copy_expert_weights(expert, gate, up, down)
+        info.expert_modules = [expert]
+        # Deliberately bypass RMSNorm with an invalid large-norm input. The
+        # audit must reject it rather than merely reporting the violation.
+        invalid_routed = torch.full((1, self.d_model), 100.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(AssertionError, "exceeded"):
+                save_moe_bound_tightness_diagnostics(
+                    [info], {(0, 0): invalid_routed}, {(0, -1): [0]},
+                    output_dir=tmp, timestamp="violation", model_name="toy/model",
+                    aggregation="p95", save_expert_scores=False,
+                )
 
 
 if __name__ == "__main__":

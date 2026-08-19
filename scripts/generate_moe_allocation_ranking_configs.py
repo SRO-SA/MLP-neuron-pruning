@@ -36,6 +36,20 @@ PROFILE_EXPERIMENTS = {
         _cell(2, "down_norm", "rmsnorm_ellipsoid_bound",
               "downnorm_alloc__ellipsoid_rank"),
     ],
+    "target2_paper_freeze": [
+        _cell(2, "rmsnorm_bound", "rmsnorm_bound",
+              "rmsnorm_alloc__rmsnorm_rank"),
+        _cell(2, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(2, "down_norm", "down_norm",
+              "downnorm_alloc__downnorm_rank"),
+        _cell(2, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+        _cell(2, "rmsnorm_ellipsoid_bound", "rmsnorm_ellipsoid_bound",
+              "ellipsoid_alloc__ellipsoid_rank"),
+        _cell(2, "rmsnorm_ellipsoid_bound", "rmsnorm_bound",
+              "ellipsoid_alloc__rmsnorm_rank"),
+    ],
     "target4": [
         _cell(4, "rmsnorm_bound", "rmsnorm_bound",
               "rmsnorm_alloc__rmsnorm_rank"),
@@ -72,9 +86,9 @@ PROFILE_EXPERIMENTS = {
     ],
     "target4_aggregation_rmsnorm": [
         _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
-              "rmsnorm_alloc1536__ellipsoid_rank__p95", "p95", 1536),
+              "rmsnorm_alloc1600__ellipsoid_rank__p95", "p95", 1600),
         _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
-              "rmsnorm_alloc1536__ellipsoid_rank__max", "max", 1536),
+              "rmsnorm_alloc1600__ellipsoid_rank__max", "max", 1600),
     ],
     "target4_aggregation_downnorm": [
         _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
@@ -102,6 +116,28 @@ PROFILE_EXPERIMENTS = {
         _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
               "rmsnorm_alloc__ellipsoid_rank"),
     ],
+    "target6_exact_budget": [
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2256__ellipsoid_rank", exact_total=2256),
+        _cell(6, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc2256__ellipsoid_rank", exact_total=2256),
+    ],
+    "target6_aggregation_rmsnorm": [
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__p95", "p95", 2288),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__max", "max", 2288),
+    ],
+    "target8_rmsnorm_primary": [
+        _cell(8, "rmsnorm_bound", "rmsnorm_bound",
+              "rmsnorm_alloc__rmsnorm_rank"),
+        _cell(8, "rmsnorm_bound", "activation_score",
+              "rmsnorm_alloc__activation_rank"),
+        _cell(8, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(8, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+    ],
 }
 
 
@@ -127,7 +163,7 @@ def _validated_plan_path(
 ) -> str:
     run_dir = (
         target2_rmsnorm_run_dir
-        if selector == "rmsnorm_bound" and target == 2
+        if selector in {"rmsnorm_bound", "rmsnorm_ellipsoid_bound"} and target == 2
         else baseline_run_dir
     )
     path = _find_plan(run_dir, selector, target)

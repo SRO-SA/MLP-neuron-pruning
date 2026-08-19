@@ -82,6 +82,13 @@ from .moe_plan_replay import (
     build_fixed_allocation_selection,
     validate_fixed_allocation_source_plan_static,
 )
+from .experiment_provenance import (
+    assert_calibration_evaluation_disjoint,
+    build_text_manifest,
+    extract_loaded_revision_metadata,
+    file_sha256,
+    save_text_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +126,8 @@ MOE_SUMMARY_CSV_KEYS = [
     # ── Identity ──────────────────────────────────────────────────────────────
     "model",
     "model_revision",
+    "tokenizer_revision",
+    "tokenizer_name_or_path",
     "transformers_version",
     "torch_version",
     "expert_layout",
@@ -140,8 +149,13 @@ MOE_SUMMARY_CSV_KEYS = [
     "eval_dataset",
     "n_eval",
     "moe_calib_samples",
+    "calibration_actual_num_prompts",
+    "calibration_corpus_sha256",
+    "calibration_sample_manifest_path",
+    "calibration_eval_disjoint_verified",
     # ── Pruning plan ──────────────────────────────────────────────────────────
     "pruning_plan_path",
+    "pruning_plan_sha256",
     "loaded_pruning_plan",
     "fixed_allocation_replay",
     "experiment_label",
@@ -160,6 +174,7 @@ MOE_SUMMARY_CSV_KEYS = [
     "evaluation_batch_size",
     "evaluation_num_texts",
     "evaluation_corpus_sha256",
+    "evaluation_sample_manifest_path",
     "evaluation_preprocessing",
     "evaluation_protocol_label",
     "seed",
@@ -1840,6 +1855,7 @@ def save_moe_bound_tightness_diagnostics(
     all_values: Dict[str, List[np.ndarray]] = {
         "ellipsoid_all": [], "ellipsoid_pruned": [], "ellipsoid_retained": [],
         "sphere_all": [], "sphere_pruned": [], "sphere_retained": [],
+        "sphere_to_ellipsoid_bound": [],
     }
     npz_arrays: Dict[str, np.ndarray] = {}
     layers_payload: List[Dict[str, object]] = []
@@ -1847,6 +1863,10 @@ def save_moe_bound_tightness_diagnostics(
     total_sphere_violations = 0
     sampled_experts = 0
     sampled_routed_inputs = 0
+    expert_channel_pairs_evaluated = 0
+    routed_input_channel_contributions_evaluated = 0
+    ellipsoid_violation_excesses: List[np.ndarray] = []
+    sphere_violation_excesses: List[np.ndarray] = []
 
     for info in moe_layers:
         gamma = get_moe_input_rmsnorm_weight(info)
@@ -1860,6 +1880,8 @@ def save_moe_bound_tightness_diagnostics(
         layer_sphere_violations = 0
         layer_input_count = 0
         layer_expert_indices: List[int] = []
+        layer_ellipsoid_excesses: List[np.ndarray] = []
+        layer_sphere_excesses: List[np.ndarray] = []
         for expert_idx, expert in enumerate(info.expert_modules):
             routed = expert_activations.get((info.layer_idx, expert_idx))
             if routed is None or routed.shape[0] == 0:
@@ -1900,9 +1922,19 @@ def save_moe_bound_tightness_diagnostics(
             )
             layer_ellipsoid_violations += int(ellipsoid_violation.sum())
             layer_sphere_violations += int(sphere_violation.sum())
+            layer_ellipsoid_excesses.append(
+                (observed_np - ellipsoid_np)[ellipsoid_violation]
+            )
+            layer_sphere_excesses.append(
+                (observed_np - sphere_np)[sphere_violation]
+            )
             layer_input_count += int(routed.shape[0])
             sampled_experts += 1
             sampled_routed_inputs += int(routed.shape[0])
+            expert_channel_pairs_evaluated += int(len(observed_np))
+            routed_input_channel_contributions_evaluated += int(
+                routed.shape[0] * len(observed_np)
+            )
             layer_expert_indices.append(expert_idx)
             layer_ellipsoid.append(ellipsoid_np)
             layer_sphere.append(sphere_np)
@@ -1917,6 +1949,12 @@ def save_moe_bound_tightness_diagnostics(
         observed_stack = np.stack(layer_observed)
         ellipsoid_ratio_stack = np.stack(layer_ellipsoid_ratios)
         sphere_ratio_stack = np.stack(layer_sphere_ratios)
+        sphere_to_ellipsoid = np.divide(
+            sphere_stack,
+            ellipsoid_stack,
+            out=np.full_like(sphere_stack, np.inf),
+            where=ellipsoid_stack > 0.0,
+        )
         pruned_mask = np.zeros(ellipsoid_stack.shape[1], dtype=bool)
         if selected:
             pruned_mask[list(selected)] = True
@@ -1927,8 +1965,13 @@ def save_moe_bound_tightness_diagnostics(
             all_values[f"{name}_all"].append(values.reshape(-1))
             all_values[f"{name}_pruned"].append(values[:, pruned_mask].reshape(-1))
             all_values[f"{name}_retained"].append(values[:, ~pruned_mask].reshape(-1))
+        all_values["sphere_to_ellipsoid_bound"].append(
+            sphere_to_ellipsoid.reshape(-1)
+        )
         total_ellipsoid_violations += layer_ellipsoid_violations
         total_sphere_violations += layer_sphere_violations
+        ellipsoid_violation_excesses.extend(layer_ellipsoid_excesses)
+        sphere_violation_excesses.extend(layer_sphere_excesses)
         layer_key = f"layer_{info.layer_idx}"
         if save_expert_scores:
             npz_arrays[f"{layer_key}_ellipsoid_bound"] = ellipsoid_stack
@@ -1957,8 +2000,19 @@ def save_moe_bound_tightness_diagnostics(
             "sphere_retained": _tightness_distribution(
                 sphere_ratio_stack[:, ~pruned_mask]
             ),
+            "sphere_to_ellipsoid_bound": _tightness_distribution(
+                sphere_to_ellipsoid
+            ),
             "ellipsoid_numerical_violations": layer_ellipsoid_violations,
             "sphere_numerical_violations": layer_sphere_violations,
+            "ellipsoid_max_violation_magnitude": float(max(
+                (float(values.max()) for values in layer_ellipsoid_excesses if len(values)),
+                default=0.0,
+            )),
+            "sphere_max_violation_magnitude": float(max(
+                (float(values.max()) for values in layer_sphere_excesses if len(values)),
+                default=0.0,
+            )),
         })
 
     if not layers_payload:
@@ -1974,6 +2028,14 @@ def save_moe_bound_tightness_diagnostics(
     global_payload.update({
         "ellipsoid_numerical_violations": total_ellipsoid_violations,
         "sphere_numerical_violations": total_sphere_violations,
+        "ellipsoid_max_violation_magnitude": float(max(
+            (float(values.max()) for values in ellipsoid_violation_excesses if len(values)),
+            default=0.0,
+        )),
+        "sphere_max_violation_magnitude": float(max(
+            (float(values.max()) for values in sphere_violation_excesses if len(values)),
+            default=0.0,
+        )),
     })
     payload = {
         "timestamp": timestamp,
@@ -1991,8 +2053,15 @@ def save_moe_bound_tightness_diagnostics(
         ),
         "absolute_tolerance": absolute_tolerance,
         "relative_tolerance": relative_tolerance,
+        "tolerance_rule": (
+            "observed <= bound * (1 + relative_tolerance) + absolute_tolerance"
+        ),
         "sampled_experts": sampled_experts,
         "sampled_routed_inputs": sampled_routed_inputs,
+        "expert_channel_pairs_evaluated": expert_channel_pairs_evaluated,
+        "routed_input_channel_contributions_evaluated": (
+            routed_input_channel_contributions_evaluated
+        ),
         "max_inputs_per_expert": max_inputs_per_expert,
         "input_sampling": (
             "deterministic evenly spaced routed inputs per expert, capped at "
@@ -2004,6 +2073,13 @@ def save_moe_bound_tightness_diagnostics(
     }
     with open(json_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+    if total_ellipsoid_violations or total_sphere_violations:
+        raise AssertionError(
+            "sampled observed channel contribution exceeded an expert-specific "
+            "bound beyond tolerance; "
+            f"ellipsoid={total_ellipsoid_violations}, "
+            f"sphere={total_sphere_violations}; audit={json_path}"
+        )
     return json_path, npz_path
 
 
@@ -2909,6 +2985,19 @@ def run_moe_target_pruning_mode(
         for _dn, _txts in all_eval_corpora.items():
             print(f"  {_dn}: {len(_txts)} samples")
 
+    _text_provenance_path = ""
+    _text_provenance: Dict[str, object] = {}
+    if not score_comparison_only:
+        _text_provenance = build_text_manifest(
+            all_eval_corpora, list(RECONSTRUCTION_TRAIN_PROMPTS)
+        )
+        if moe_selector == "activation_score":
+            assert_calibration_evaluation_disjoint(_text_provenance)
+        _text_provenance_path = os.path.join(
+            output_dir, f"experiment_text_provenance_{ts}.json"
+        )
+        save_text_manifest(_text_provenance_path, _text_provenance)
+
     all_results: List[Dict] = []
     comparison_output_paths: List[Tuple[str, str]] = []
 
@@ -2931,7 +3020,7 @@ def run_moe_target_pruning_mode(
         try:
             dtype_str = _auto_dtype(device) if dtype_cfg == "auto" else dtype_cfg
             _dmap = device_map_cfg if device_map_cfg != "none" else None
-            model, tokenizer, _ = load_model_and_tokenizer(
+            model, tokenizer, _resolved_model_name = load_model_and_tokenizer(
                 model_name=model_name, fallback_name=None,
                 device=device, dtype_str=dtype_str,
                 device_map=_dmap,
@@ -2939,6 +3028,14 @@ def run_moe_target_pruning_mode(
             _model_load_instance_id = (
                 f"pid={os.getpid()};loaded_ns={time.time_ns()};model={model_name}"
             )
+            _revision_metadata = extract_loaded_revision_metadata(
+                model, tokenizer, _resolved_model_name
+            )
+            if _text_provenance:
+                _text_provenance.setdefault("loaded_models", {})[model_name] = (
+                    _revision_metadata
+                )
+                save_text_manifest(_text_provenance_path, _text_provenance)
             model.eval()
             _log_gpu_memory("after model load")
 
@@ -4702,6 +4799,9 @@ def run_moe_target_pruning_mode(
                             "evaluation_batch_size": batch_sz,
                             "evaluation_num_texts": len(all_eval_corpora[_ds]),
                             "evaluation_corpus_sha256": eval_corpus_sha256[_ds],
+                            "evaluation_sample_manifest_path": (
+                                _text_provenance_path
+                            ),
                             "evaluation_preprocessing": (
                                 "same_text_list; tokenizer padding+truncation; "
                                 "padding labels=-100; shifted nonpadding token NLL"
@@ -4734,6 +4834,22 @@ def run_moe_target_pruning_mode(
                             "bound_tightness_json_path": (
                                 _target_bound_tightness_json
                             ),
+                            "calibration_actual_num_prompts": len(
+                                RECONSTRUCTION_TRAIN_PROMPTS
+                            ),
+                            "calibration_corpus_sha256": (
+                                _text_provenance.get("calibration", {}).get(
+                                    "corpus_sha256", ""
+                                )
+                            ),
+                            "calibration_sample_manifest_path": (
+                                _text_provenance_path
+                            ),
+                            "calibration_eval_disjoint_verified": bool(
+                                _text_provenance.get("disjointness", {}).get(
+                                    "verified_disjoint", False
+                                )
+                            ),
                             "expert_bound_scores_npz_path": (
                                 _target_expert_bound_scores_npz
                             ),
@@ -4764,10 +4880,25 @@ def run_moe_target_pruning_mode(
                             "residual_rejected_experts": _resid_rejected,
                             "residual_time_sec":      round(t_recon_total, 2),
                             "expert_layout":          "unpacked",
-                            "model_revision":         "",
-                            "transformers_version":   "",
+                            "model_revision": _revision_metadata[
+                                "model_revision"
+                            ],
+                            "tokenizer_revision": _revision_metadata[
+                                "tokenizer_revision"
+                            ],
+                            "tokenizer_name_or_path": _revision_metadata[
+                                "tokenizer_name_or_path"
+                            ],
+                            "transformers_version": _revision_metadata[
+                                "transformers_version"
+                            ],
                             "torch_version":          torch.__version__,
                             "pruning_plan_path":      _plan_path,
+                            "pruning_plan_sha256": (
+                                file_sha256(_plan_path)
+                                if _plan_path and os.path.isfile(_plan_path)
+                                else ""
+                            ),
                             "loaded_pruning_plan":    _loaded_plan_flag,
                             "residual_total_candidate_experts": _resid_total_cand,
                             "residual_attempted_experts": _resid_attempted,

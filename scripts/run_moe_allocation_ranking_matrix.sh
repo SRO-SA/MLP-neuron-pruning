@@ -14,6 +14,7 @@ TARGET2_RMSNORM_RUN_DIR="${TARGET2_RMSNORM_RUN_DIR:-results/moe_selector_baselin
 RESULTS_BASE="${RESULTS_BASE:-results/moe_allocation_ranking}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 DRY_RUN="${DRY_RUN:-0}"
+ALLOW_EXISTING_RUN_DIR="${ALLOW_EXISTING_RUN_DIR:-0}"
 REFERENCE_HYBRID_DIR="${REFERENCE_HYBRID_DIR:-results/moe_plan_replay/20260818_233748_n512/original_allocation_ellipsoid_ranking}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
@@ -22,7 +23,7 @@ case "${PROFILE}" in
         N_EVAL="${N_EVAL:-512}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2}"
         ;;
-    target2_extended|target4|target4_rankings|target4_exact_budget|target4_aggregation_rmsnorm|target4_aggregation_downnorm|target6_rmsnorm_primary|target6_downnorm_primary)
+    target2_extended|target2_paper_freeze|target4|target4_rankings|target4_exact_budget|target4_aggregation_rmsnorm|target4_aggregation_downnorm|target6_rmsnorm_primary|target6_downnorm_primary|target6_exact_budget|target6_aggregation_rmsnorm|target8_rmsnorm_primary)
         N_EVAL="${N_EVAL:-1024}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2,c4}"
         ;;
@@ -35,6 +36,13 @@ esac
 RUN_DIR="${RUN_DIR:-${RESULTS_BASE}/${RUN_ID}_${PROFILE}_n${N_EVAL}}"
 CONFIG_DIR="${RUN_DIR}/configs"
 MANIFEST="${CONFIG_DIR}/matrix_manifest.json"
+
+if [ "${DRY_RUN}" != "1" ] && [ -e "${RUN_DIR}" ] && \
+   [ "${ALLOW_EXISTING_RUN_DIR}" != "1" ]; then
+    echo "[alloc-rank] ERROR: refusing to overwrite existing RUN_DIR=${RUN_DIR}"
+    echo "[alloc-rank] Use a new RUN_DIR (recommended), or set ALLOW_EXISTING_RUN_DIR=1 to resume intentionally."
+    exit 1
+fi
 
 if [ ! -d "${BASELINE_RUN_DIR}" ]; then
     echo "[alloc-rank] ERROR: baseline run not found: ${BASELINE_RUN_DIR}"
