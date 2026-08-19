@@ -223,6 +223,22 @@ class FixedAllocationReplayTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("usage:", completed.stdout)
 
+    def test_matrix_runner_defaults_to_full_selector_baseline(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        runner_path = os.path.join(
+            repo_root, "scripts", "run_moe_allocation_ranking_matrix.sh"
+        )
+        with open(runner_path, encoding="utf-8") as handle:
+            runner = handle.read()
+        self.assertIn(
+            "results/moe_selector_baselines/20260818_203025", runner
+        )
+        self.assertNotIn(
+            'BASELINE_RUN_DIR="${BASELINE_RUN_DIR:-results/'
+            'moe_selector_baselines/20260818_190239}"',
+            runner,
+        )
+
     def test_alignment_violation_fails(self):
         bad = copy.deepcopy(self.source)
         bad["layers"][0]["prune_idx"] = [0]

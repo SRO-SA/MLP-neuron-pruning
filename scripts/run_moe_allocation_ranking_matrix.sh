@@ -7,7 +7,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 PROFILE="${PROFILE:-replicate2}"
-BASELINE_RUN_DIR="${BASELINE_RUN_DIR:-results/moe_selector_baselines/20260818_190239}"
+# Full 2/4/6/8 selector baseline run.  The earlier 20260818_190239 run is
+# partial and does not contain the down_norm allocation plans.
+BASELINE_RUN_DIR="${BASELINE_RUN_DIR:-results/moe_selector_baselines/20260818_203025}"
 TARGET2_RMSNORM_RUN_DIR="${TARGET2_RMSNORM_RUN_DIR:-results/moe_selector_baselines/20260818_222729}"
 RESULTS_BASE="${RESULTS_BASE:-results/moe_allocation_ranking}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
