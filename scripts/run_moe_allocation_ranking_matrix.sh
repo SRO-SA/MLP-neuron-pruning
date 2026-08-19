@@ -22,12 +22,12 @@ case "${PROFILE}" in
         N_EVAL="${N_EVAL:-512}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2}"
         ;;
-    target2_extended|target4)
+    target2_extended|target4|target4_rankings|target4_exact_budget|target4_aggregation_rmsnorm|target4_aggregation_downnorm|target6_rmsnorm_primary|target6_downnorm_primary)
         N_EVAL="${N_EVAL:-1024}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2,c4}"
         ;;
     *)
-        echo "[alloc-rank] ERROR: PROFILE must be replicate2, target2_extended, or target4"
+        echo "[alloc-rank] ERROR: unsupported PROFILE=${PROFILE}"
         exit 1
         ;;
 esac
@@ -48,8 +48,6 @@ if [ -f "${VENV}/bin/activate" ]; then
     # shellcheck source=/dev/null
     source "${VENV}/bin/activate"
 fi
-python3 -c "import torch; assert torch.cuda.is_available(); print('[alloc-rank] torch', torch.__version__, 'CUDA OK')"
-
 echo "[alloc-rank] ======================================================="
 echo "[alloc-rank] Profile       : ${PROFILE}"
 echo "[alloc-rank] Evaluation    : ${EVAL_DATASETS}, n_eval=${N_EVAL}, max_seq=512"
@@ -74,6 +72,7 @@ if [ "${DRY_RUN}" = "1" ]; then
     exit 0
 fi
 
+python3 -c "import torch; assert torch.cuda.is_available(); print('[alloc-rank] torch', torch.__version__, 'CUDA OK')"
 mkdir -p "${RUN_DIR}"
 python3 scripts/generate_moe_allocation_ranking_configs.py "${generate_args[@]}"
 

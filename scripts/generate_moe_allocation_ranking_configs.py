@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the bounded 2%/4% allocation-versus-ranking experiment matrix."""
+"""Generate bounded allocation-versus-ranking diagnostic experiment profiles."""
 from __future__ import annotations
 
 import argparse
@@ -14,26 +14,93 @@ except ImportError:
     from scripts.generate_moe_selector_baseline_configs import _build_config, _write_yaml
 
 
+def _cell(target, allocation, ranking, name, aggregation="p95", exact_total=None):
+    return {
+        "target": target,
+        "allocation": allocation,
+        "ranking": ranking,
+        "name": name,
+        "aggregation": aggregation,
+        "exact_total": exact_total,
+    }
+
+
 PROFILE_EXPERIMENTS = {
     "replicate2": [
-        (2, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
-         "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(2, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
     ],
     "target2_extended": [
-        (2, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
-         "rmsnorm_alloc__ellipsoid_rank"),
-        (2, "down_norm", "rmsnorm_ellipsoid_bound",
-         "downnorm_alloc__ellipsoid_rank"),
+        _cell(2, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(2, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
     ],
     "target4": [
-        (4, "rmsnorm_bound", "rmsnorm_bound",
-         "rmsnorm_alloc__rmsnorm_rank"),
-        (4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
-         "rmsnorm_alloc__ellipsoid_rank"),
-        (4, "down_norm", "down_norm",
-         "downnorm_alloc__downnorm_rank"),
-        (4, "down_norm", "rmsnorm_ellipsoid_bound",
-         "downnorm_alloc__ellipsoid_rank"),
+        _cell(4, "rmsnorm_bound", "rmsnorm_bound",
+              "rmsnorm_alloc__rmsnorm_rank"),
+        _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(4, "down_norm", "down_norm",
+              "downnorm_alloc__downnorm_rank"),
+        _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+    ],
+    # Reruns the complete paired set because the earlier 4% run did not save
+    # document-level NLL sufficient statistics.
+    "target4_rankings": [
+        _cell(4, "rmsnorm_bound", "rmsnorm_bound",
+              "rmsnorm_alloc__rmsnorm_rank"),
+        _cell(4, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank"),
+        _cell(4, "rmsnorm_bound", "activation_score",
+              "rmsnorm_alloc__activation_rank"),
+        _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(4, "down_norm", "down_norm",
+              "downnorm_alloc__downnorm_rank"),
+        _cell(4, "down_norm", "activation_score",
+              "downnorm_alloc__activation_rank"),
+        _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+    ],
+    "target4_exact_budget": [
+        _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc1536__ellipsoid_rank", exact_total=1536),
+        _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc1536__ellipsoid_rank", exact_total=1536),
+    ],
+    "target4_aggregation_rmsnorm": [
+        _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc1536__ellipsoid_rank__p95", "p95", 1536),
+        _cell(4, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc1536__ellipsoid_rank__max", "max", 1536),
+    ],
+    "target4_aggregation_downnorm": [
+        _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc1536__ellipsoid_rank__p95", "p95", 1536),
+        _cell(4, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc1536__ellipsoid_rank__max", "max", 1536),
+    ],
+    "target6_rmsnorm_primary": [
+        _cell(6, "rmsnorm_bound", "rmsnorm_bound",
+              "rmsnorm_alloc__rmsnorm_rank"),
+        _cell(6, "rmsnorm_bound", "activation_score",
+              "rmsnorm_alloc__activation_rank"),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
+        _cell(6, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+    ],
+    "target6_downnorm_primary": [
+        _cell(6, "down_norm", "rmsnorm_bound",
+              "downnorm_alloc__rmsnorm_rank"),
+        _cell(6, "down_norm", "activation_score",
+              "downnorm_alloc__activation_rank"),
+        _cell(6, "down_norm", "rmsnorm_ellipsoid_bound",
+              "downnorm_alloc__ellipsoid_rank"),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc__ellipsoid_rank"),
     ],
 }
 
@@ -98,7 +165,14 @@ def build_matrix_configs(
     if profile not in PROFILE_EXPERIMENTS:
         raise ValueError(f"unknown profile {profile!r}")
     configs: list[tuple[str, dict]] = []
-    for target, allocation, ranking, name in PROFILE_EXPERIMENTS[profile]:
+    paired_enabled = profile not in {"replicate2", "target2_extended", "target4"}
+    for cell in PROFILE_EXPERIMENTS[profile]:
+        target = int(cell["target"])
+        allocation = str(cell["allocation"])
+        ranking = str(cell["ranking"])
+        name = str(cell["name"])
+        aggregation = str(cell["aggregation"])
+        exact_total = cell["exact_total"]
         plan_path = _validated_plan_path(
             selector=allocation,
             target=target,
@@ -129,9 +203,19 @@ def build_matrix_configs(
             "moe_fixed_allocation_selector": None,
             "moe_budget_mode": "global",
             "moe_pruning_mode": "packed_same_channel",
-            "moe_same_channel_aggregation": "p95",
+            "moe_same_channel_aggregation": aggregation,
             "moe_channel_alignment": 16,
             "max_expert_frac": 0.2,
+            "exact_total_layer_channels": exact_total,
+            "collect_per_example_nll": paired_enabled,
+            "paired_bootstrap_resamples": 10000,
+            "save_bound_tightness": (
+                paired_enabled and ranking == "rmsnorm_ellipsoid_bound"
+            ),
+            "save_expert_bound_scores": (
+                paired_enabled and ranking == "rmsnorm_ellipsoid_bound"
+            ),
+            "bound_tightness_max_inputs_per_expert": 8,
             "save_pruning_plan": True,
             "load_pruning_plan": None,
             "evaluation_protocol_label": (
@@ -186,11 +270,15 @@ def main() -> None:
             "allocation_source": cfg["allocation_source"],
             "ranking_source": cfg["ranking_source"],
             "allocation_plan": cfg["moe_allocation_plan"],
+            "aggregation_mode": cfg["moe_same_channel_aggregation"],
+            "exact_total_layer_channels": cfg["exact_total_layer_channels"],
             "target_pct": cfg["target_pruning_percents"][0],
         })
         print(
             f"[alloc-rank-config] {name}: allocation={cfg['allocation_source']} "
             f"ranking={cfg['ranking_source']} target={cfg['target_pruning_percents'][0]} "
+            f"aggregation={cfg['moe_same_channel_aggregation']} "
+            f"exact_total={cfg['exact_total_layer_channels']} "
             f"datasets={datasets} n_eval={args.n_eval}"
         )
         if args.dry_run:

@@ -14,6 +14,7 @@ from scripts.generate_moe_allocation_ranking_configs import build_matrix_configs
 from src.moe_plan_replay import (
     build_allocation_ranking_selection,
     build_fixed_allocation_selection,
+    normalize_aligned_allocation_counts,
     validate_derived_replay_plan,
     validate_derived_allocation_ranking_plan,
 )
@@ -388,6 +389,102 @@ class ConfigGeneratorTests(unittest.TestCase):
             )
             self.assertEqual(hybrid["eval_datasets"], ["wikitext2", "c4"])
             self.assertEqual(hybrid["reconstruction_eval_samples"], 1024)
+            ranking_configs = build_matrix_configs(
+                profile="target4_rankings",
+                baseline_run_dir=baseline,
+                target2_rmsnorm_run_dir=trusted,
+                results_dir=os.path.join(tempdir, "ranking-results"),
+                n_eval=1024,
+                eval_datasets=["wikitext2", "c4"],
+            )
+            self.assertEqual(len(ranking_configs), 7)
+            ranking_mapping = dict(ranking_configs)
+            self.assertTrue(
+                ranking_mapping["rmsnorm_alloc__activation_rank"][
+                    "collect_per_example_nll"
+                ]
+            )
+            self.assertEqual(
+                ranking_mapping["rmsnorm_alloc__activation_rank"]["moe_selector"],
+                "activation_score",
+            )
+            exact_configs = build_matrix_configs(
+                profile="target4_exact_budget",
+                baseline_run_dir=baseline,
+                target2_rmsnorm_run_dir=trusted,
+                results_dir=os.path.join(tempdir, "exact-results"),
+                n_eval=1024,
+                eval_datasets=["wikitext2", "c4"],
+            )
+            self.assertEqual(len(exact_configs), 2)
+            self.assertTrue(all(
+                cfg["exact_total_layer_channels"] == 1536
+                for _, cfg in exact_configs
+            ))
+
+    def test_target4_ranking_profile_adds_activation_and_cross_ranking(self):
+        names = {
+            cell["name"]
+            for cell in __import__(
+                "scripts.generate_moe_allocation_ranking_configs",
+                fromlist=["PROFILE_EXPERIMENTS"],
+            ).PROFILE_EXPERIMENTS["target4_rankings"]
+        }
+        self.assertIn("rmsnorm_alloc__activation_rank", names)
+        self.assertIn("downnorm_alloc__activation_rank", names)
+        self.assertIn("rmsnorm_alloc__downnorm_rank", names)
+
+
+class ExactAllocationBudgetTests(unittest.TestCase):
+    def test_hamilton_normalization_is_aligned_exact_and_downward(self):
+        source = {0: 64, 1: 64, 2: 32}
+        result = normalize_aligned_allocation_counts(
+            source, exact_total_layer_channels=144, channel_alignment=16
+        )
+        self.assertEqual(result, {0: 64, 1: 48, 2: 32})
+        self.assertEqual(sum(result.values()), 144)
+        self.assertTrue(all(result[layer] <= source[layer] for layer in source))
+
+    def test_unaligned_and_upward_exact_totals_fail(self):
+        with self.assertRaisesRegex(ValueError, "aligned"):
+            normalize_aligned_allocation_counts(
+                {0: 16}, exact_total_layer_channels=15, channel_alignment=16
+            )
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            normalize_aligned_allocation_counts(
+                {0: 16}, exact_total_layer_channels=32, channel_alignment=16
+            )
+
+    def test_exact_total_selection_changes_counts_not_physical_mode(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "plan.json")
+            plan = _plan("rmsnorm_bound", counts=(4, 2))
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(plan, handle)
+            selection, audit = build_allocation_ranking_selection(
+                plan,
+                allocation_plan_path=path,
+                allocation_source="rmsnorm_bound",
+                ranking_source="rmsnorm_ellipsoid_bound",
+                pruning_mode="packed_same_channel",
+                channel_alignment=2,
+                max_layer_frac=0.5,
+                max_expert_frac=0.5,
+                target_pct=2.0,
+                scores_by_layer={0: list(range(8)), 1: list(range(8))},
+                layer_sizes={0: 8, 1: 8},
+                num_experts_by_layer={0: 4, 1: 4},
+                total_expert_neurons=64,
+                experiment_name="exact",
+                exact_total_layer_channels=4,
+            )
+            self.assertEqual(sum(len(value) for value in selection.values()), 4)
+            self.assertEqual(audit["total_selected_layer_channels"], 4)
+            self.assertEqual(audit["exact_total_layer_channels"], 4)
+            self.assertEqual(
+                audit["allocation_count_normalization"],
+                "hamilton_largest_remainder_aligned_downscale",
+            )
 
 
 class PlanComparisonTests(unittest.TestCase):

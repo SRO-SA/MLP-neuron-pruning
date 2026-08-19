@@ -18,6 +18,7 @@ SUPPORTED_ALLOCATION_RANKING_SOURCES = {
     "rmsnorm_bound",
     "rmsnorm_ellipsoid_bound",
     "down_norm",
+    "activation_score",
     "fixed_plan",
 }
 
@@ -39,6 +40,83 @@ def _source_layers_by_index(plan: Mapping[str, object]) -> Dict[int, Mapping[str
             raise ValueError(f"source plan repeats layer {layer_idx}")
         layers[layer_idx] = raw
     return layers
+
+
+def normalize_aligned_allocation_counts(
+    counts_by_layer: Mapping[int, int],
+    *,
+    exact_total_layer_channels: int,
+    channel_alignment: int,
+) -> Dict[int, int]:
+    """Scale an existing aligned count vector down to an exact aligned total.
+
+    Hamilton (largest-remainder) apportionment is applied in units of aligned
+    channel blocks.  This preserves the source vector's relative layer shape
+    as closely as possible without inventing a new cross-layer score scale.
+    The operation is deliberately downward-only for this diagnostic.
+    """
+    if channel_alignment <= 0:
+        raise ValueError("channel_alignment must be positive")
+    target = int(exact_total_layer_channels)
+    if target < 0 or target % channel_alignment:
+        raise ValueError(
+            f"exact total {target} must be non-negative and aligned to "
+            f"{channel_alignment}"
+        )
+    counts = {int(layer): int(count) for layer, count in counts_by_layer.items()}
+    if not counts:
+        raise ValueError("allocation count vector must not be empty")
+    if any(count < 0 or count % channel_alignment for count in counts.values()):
+        raise ValueError("all source allocation counts must be non-negative/aligned")
+    source_total = sum(counts.values())
+    if target > source_total:
+        raise ValueError(
+            f"exact total {target} exceeds source allocation total {source_total}; "
+            "upward extrapolation is not supported"
+        )
+    if target == source_total:
+        return dict(counts)
+    source_blocks = {
+        layer: count // channel_alignment for layer, count in counts.items()
+    }
+    source_block_total = sum(source_blocks.values())
+    target_blocks = target // channel_alignment
+    ideals = {
+        layer: blocks * target_blocks / source_block_total
+        for layer, blocks in source_blocks.items()
+    }
+    allocated = {
+        layer: min(source_blocks[layer], int(math.floor(ideals[layer])))
+        for layer in source_blocks
+    }
+    remaining = target_blocks - sum(allocated.values())
+    order = sorted(
+        source_blocks,
+        key=lambda layer: (
+            -(ideals[layer] - math.floor(ideals[layer])),
+            -source_blocks[layer],
+            layer,
+        ),
+    )
+    while remaining:
+        progressed = False
+        for layer in order:
+            if allocated[layer] < source_blocks[layer]:
+                allocated[layer] += 1
+                remaining -= 1
+                progressed = True
+                if not remaining:
+                    break
+        if not progressed:
+            raise AssertionError("unable to apportion requested exact total")
+    result = {
+        layer: allocated[layer] * channel_alignment for layer in allocated
+    }
+    if sum(result.values()) != target:
+        raise AssertionError("normalized allocation total does not match request")
+    if any(result[layer] > counts[layer] for layer in result):
+        raise AssertionError("normalized allocation exceeded a source layer count")
+    return result
 
 
 def validate_fixed_allocation_source_plan_static(
@@ -224,6 +302,7 @@ def build_fixed_allocation_selection(
     num_experts_by_layer: Mapping[int, int],
     total_expert_neurons: int,
     allow_same_selector: bool = False,
+    exact_total_layer_channels: int | None = None,
 ) -> Tuple[Dict[Tuple[int, int], List[int]], Dict[str, object]]:
     """Select alternate-ranked channels with source per-layer counts fixed."""
     source_layers = validate_fixed_allocation_request(
@@ -246,14 +325,33 @@ def build_fixed_allocation_selection(
     if total_expert_neurons <= 0:
         raise ValueError("total_expert_neurons must be positive")
 
+    source_counts = {
+        layer_idx: len(source_layer.get("prune_idx", []))
+        for layer_idx, source_layer in source_layers.items()
+    }
+    effective_counts = (
+        normalize_aligned_allocation_counts(
+            source_counts,
+            exact_total_layer_channels=int(exact_total_layer_channels),
+            channel_alignment=channel_alignment,
+        )
+        if exact_total_layer_channels is not None else source_counts
+    )
+
     selection: Dict[Tuple[int, int], List[int]] = {}
     layer_audit: List[Dict[str, object]] = []
     total_layer_channels = 0
     total_removed_expert_neurons = 0
     for layer_idx in sorted(source_layers):
         source_layer = source_layers[layer_idx]
-        source_indices = sorted(_as_int_list(source_layer.get("prune_idx", [])))
-        required_count = len(source_indices)
+        original_source_indices = sorted(
+            _as_int_list(source_layer.get("prune_idx", []))
+        )
+        required_count = effective_counts[layer_idx]
+        # The exact-total diagnostic uses only the normalized count vector.
+        # This truncated reference is retained solely for overlap bookkeeping;
+        # it is not presented as a recomputed source-selector ranking.
+        source_indices = original_source_indices[:required_count]
         scores = [float(value) for value in scores_by_layer[layer_idx]]
         if len(scores) != int(layer_sizes[layer_idx]):
             raise ValueError(
@@ -276,7 +374,9 @@ def build_fixed_allocation_selection(
         layer_audit.append({
             "layer_idx": layer_idx,
             "required_pruned_channels": required_count,
+            "source_plan_pruned_channels": len(original_source_indices),
             "source_indices": source_indices,
+            "source_plan_indices": original_source_indices,
             "selected_indices": selected,
             "overlap_indices": overlap,
             "overlap_count": len(overlap),
@@ -285,7 +385,8 @@ def build_fixed_allocation_selection(
             "removed_expert_neurons": removed_expert_neurons,
         })
 
-    expected_total = int(source_plan["total_selected_layer_channels"])
+    source_total = int(source_plan["total_selected_layer_channels"])
+    expected_total = sum(effective_counts.values())
     if total_layer_channels != expected_total:
         raise AssertionError(
             f"replay selected {total_layer_channels} layer-channels; "
@@ -293,9 +394,10 @@ def build_fixed_allocation_selection(
         )
     for row in layer_audit:
         layer_idx = int(row["layer_idx"])
-        source_count = len(source_layers[layer_idx].get("prune_idx", []))
-        if int(row["required_pruned_channels"]) != source_count:
-            raise AssertionError(f"layer {layer_idx} allocation changed during replay")
+        if int(row["required_pruned_channels"]) != effective_counts[layer_idx]:
+            raise AssertionError(
+                f"layer {layer_idx} allocation changed during replay"
+            )
 
     actual_pct = 100.0 * total_removed_expert_neurons / total_expert_neurons
     audit: Dict[str, object] = {
@@ -309,7 +411,17 @@ def build_fixed_allocation_selection(
         "channel_alignment": channel_alignment,
         "max_expert_frac": float(max_expert_frac),
         "target_pct": float(target_pct),
-        "source_total_layer_channels": expected_total,
+        "source_total_layer_channels": source_total,
+        "source_plan_total_layer_channels": source_total,
+        "effective_allocation_total_layer_channels": expected_total,
+        "exact_total_layer_channels": (
+            int(exact_total_layer_channels)
+            if exact_total_layer_channels is not None else None
+        ),
+        "allocation_count_normalization": (
+            "hamilton_largest_remainder_aligned_downscale"
+            if exact_total_layer_channels is not None else "none"
+        ),
         "total_selected_layer_channels": total_layer_channels,
         "total_removed_expert_neurons": total_removed_expert_neurons,
         "actual_pct": round(actual_pct, 6),
@@ -337,6 +449,7 @@ def build_allocation_ranking_selection(
     experiment_name: str,
     ranking_plan: Mapping[str, object] | None = None,
     ranking_plan_path: str | None = None,
+    exact_total_layer_channels: int | None = None,
 ) -> Tuple[Dict[Tuple[int, int], List[int]], Dict[str, object]]:
     """Apply plan-derived layer counts and an independent within-layer ranking.
 
@@ -400,6 +513,7 @@ def build_allocation_ranking_selection(
         num_experts_by_layer=num_experts_by_layer,
         total_expert_neurons=total_expert_neurons,
         allow_same_selector=True,
+        exact_total_layer_channels=exact_total_layer_channels,
     )
     audit.update({
         "plan_kind": "allocation_ranking_experiment",
@@ -430,7 +544,11 @@ def build_allocation_ranking_selection(
             "ranking_score_scale_abs_max": abs_max,
         })
 
-    if allocation_source == ranking_source and allocation_source != "fixed_plan":
+    if (
+        allocation_source == ranking_source
+        and allocation_source != "fixed_plan"
+        and exact_total_layer_channels is None
+    ):
         changed_layers = [
             int(row["layer_idx"])
             for row in audit["layers"]
@@ -501,28 +619,36 @@ def validate_derived_allocation_ranking_plan(
             derived_layers[layer_idx].get("prune_idx", [])
         )
         audit_row = audit_layers[layer_idx]
-        if len(derived_indices) != len(allocation_indices):
+        expected_count = int(audit_row["required_pruned_channels"])
+        if len(derived_indices) != expected_count:
             raise ValueError(
                 f"layer {layer_idx} allocation count changed: "
-                f"source={len(allocation_indices)}, derived={len(derived_indices)}"
+                f"expected={expected_count}, derived={len(derived_indices)}"
             )
         if sorted(derived_indices) != sorted(audit_row.get("selected_indices", [])):
             raise ValueError(f"layer {layer_idx} derived/audit indices differ")
-        if sorted(allocation_indices) != sorted(audit_row.get("source_indices", [])):
+        if sorted(allocation_indices)[:expected_count] != sorted(
+            audit_row.get("source_indices", [])
+        ):
             raise ValueError(f"layer {layer_idx} source/audit indices differ")
     source_total = int(allocation_plan.get("total_selected_layer_channels", -1))
+    expected_total = int(audit.get("total_selected_layer_channels", -1))
     derived_total = sum(
         len(layer.get("prune_idx", [])) for layer in derived_layers.values()
     )
-    if derived_total != source_total:
+    if derived_total != expected_total:
         raise ValueError(
-            f"derived total {derived_total} differs from allocation {source_total}"
+            f"derived total {derived_total} differs from expected {expected_total}"
         )
-    if int(audit.get("total_selected_layer_channels", -1)) != source_total:
+    declared_exact = audit.get("exact_total_layer_channels")
+    if declared_exact is None and expected_total != source_total:
         raise ValueError("allocation/ranking audit total differs from source")
+    if declared_exact is not None and expected_total != int(declared_exact):
+        raise ValueError("allocation/ranking audit total differs from exact total")
     if (
         audit.get("allocation_source") == audit.get("ranking_source")
         and audit.get("allocation_source") != "fixed_plan"
+        and audit.get("exact_total_layer_channels") is None
     ):
         changed = [
             layer_idx for layer_idx in audit_layers

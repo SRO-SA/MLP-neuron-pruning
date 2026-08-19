@@ -71,6 +71,7 @@ from .moe_residual_methods import (  # noqa: E402
     apply_residual_dispatch_unpacked,
 )
 from .rmsnorm_geometry import (
+    compute_observed_channel_contribution_max_from_weights,
     compute_rmsnorm_bound_triplet_from_weights,
     compute_rmsnorm_ellipsoid_bound_from_weights,
     compute_rmsnorm_sphere_bound_from_weights,
@@ -150,6 +151,9 @@ MOE_SUMMARY_CSV_KEYS = [
     "replay_source_overlap_channels",
     "allocation_source",
     "ranking_source",
+    "allocation_aggregation_mode",
+    "ranking_aggregation_mode",
+    "exact_total_layer_channels",
     "allocation_plan_path",
     "ranking_plan_path",
     "evaluation_max_seq_len",
@@ -167,6 +171,13 @@ MOE_SUMMARY_CSV_KEYS = [
     "model_load_instance_id",
     "score_comparison_csv_path",
     "score_comparison_json_path",
+    "per_example_nll_path",
+    "mean_nll_difference",
+    "mean_nll_difference_ci95_lower",
+    "mean_nll_difference_ci95_upper",
+    "paired_bootstrap_resamples",
+    "bound_tightness_json_path",
+    "expert_bound_scores_npz_path",
     # ── Results ───────────────────────────────────────────────────────────────
     "baseline_ppl",
     "compressed_ppl",
@@ -1783,6 +1794,219 @@ def save_moe_bound_comparison_diagnostics(
     return csv_path, json_path
 
 
+def _tightness_distribution(values: np.ndarray) -> Dict[str, object]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if not len(finite):
+        return {"count": 0, "median": None, "p95": None, "p99": None, "max": None}
+    return {
+        "count": int(len(finite)),
+        "median": float(np.median(finite)),
+        "p95": float(np.quantile(finite, 0.95)),
+        "p99": float(np.quantile(finite, 0.99)),
+        "max": float(np.max(finite)),
+    }
+
+
+def save_moe_bound_tightness_diagnostics(
+    moe_layers: List[MoELayerInfo],
+    expert_activations: Dict[Tuple[int, int], torch.Tensor],
+    per_expert_pruned: Dict[Tuple[int, int], List[int]],
+    *,
+    output_dir: str,
+    timestamp: str,
+    model_name: str,
+    aggregation: str,
+    save_expert_scores: bool,
+    max_inputs_per_expert: int = 8,
+    absolute_tolerance: float = 1e-5,
+    relative_tolerance: float = 1e-5,
+) -> Tuple[str, str]:
+    """Measure sampled expert-channel tightness before physical pruning.
+
+    One ratio is retained per expert-channel: the maximum observed routed-input
+    contribution norm divided by that expert-specific bound.  The compressed
+    NPZ keeps the pre-aggregation expert bounds and observations; the JSON is a
+    compact statistical report.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if max_inputs_per_expert <= 0:
+        raise ValueError("max_inputs_per_expert must be positive")
+    json_path = os.path.join(output_dir, f"moe_bound_tightness_{timestamp}.json")
+    npz_path = (
+        os.path.join(output_dir, f"moe_expert_bounds_{timestamp}.npz")
+        if save_expert_scores else ""
+    )
+    all_values: Dict[str, List[np.ndarray]] = {
+        "ellipsoid_all": [], "ellipsoid_pruned": [], "ellipsoid_retained": [],
+        "sphere_all": [], "sphere_pruned": [], "sphere_retained": [],
+    }
+    npz_arrays: Dict[str, np.ndarray] = {}
+    layers_payload: List[Dict[str, object]] = []
+    total_ellipsoid_violations = 0
+    total_sphere_violations = 0
+    sampled_experts = 0
+    sampled_routed_inputs = 0
+
+    for info in moe_layers:
+        gamma = get_moe_input_rmsnorm_weight(info)
+        selected = set(per_expert_pruned.get((info.layer_idx, -1), []))
+        layer_ellipsoid: List[np.ndarray] = []
+        layer_sphere: List[np.ndarray] = []
+        layer_observed: List[np.ndarray] = []
+        layer_ellipsoid_ratios: List[np.ndarray] = []
+        layer_sphere_ratios: List[np.ndarray] = []
+        layer_ellipsoid_violations = 0
+        layer_sphere_violations = 0
+        layer_input_count = 0
+        layer_expert_indices: List[int] = []
+        for expert_idx, expert in enumerate(info.expert_modules):
+            routed = expert_activations.get((info.layer_idx, expert_idx))
+            if routed is None or routed.shape[0] == 0:
+                continue
+            if routed.shape[0] > max_inputs_per_expert:
+                sample_indices = torch.linspace(
+                    0, routed.shape[0] - 1,
+                    steps=max_inputs_per_expert,
+                ).round().long()
+                routed = routed.index_select(0, sample_indices)
+            weights = get_expert_weights(expert)
+            _, sphere, ellipsoid = compute_rmsnorm_bound_triplet_from_weights(
+                weights["gate_proj"], weights["up_proj"],
+                weights["down_proj"], gamma,
+            )
+            observed = compute_observed_channel_contribution_max_from_weights(
+                weights["gate_proj"], weights["up_proj"],
+                weights["down_proj"], routed,
+            )
+            observed_np = observed.numpy().astype(np.float32, copy=False)
+            sphere_np = sphere.numpy().astype(np.float32, copy=False)
+            ellipsoid_np = ellipsoid.numpy().astype(np.float32, copy=False)
+
+            def _ratio(bound: np.ndarray) -> np.ndarray:
+                ratio = np.zeros_like(observed_np, dtype=np.float32)
+                positive = bound > 0.0
+                ratio[positive] = observed_np[positive] / bound[positive]
+                ratio[~positive & (observed_np > absolute_tolerance)] = np.inf
+                return ratio
+
+            ellipsoid_ratio = _ratio(ellipsoid_np)
+            sphere_ratio = _ratio(sphere_np)
+            ellipsoid_violation = observed_np > (
+                ellipsoid_np * (1.0 + relative_tolerance) + absolute_tolerance
+            )
+            sphere_violation = observed_np > (
+                sphere_np * (1.0 + relative_tolerance) + absolute_tolerance
+            )
+            layer_ellipsoid_violations += int(ellipsoid_violation.sum())
+            layer_sphere_violations += int(sphere_violation.sum())
+            layer_input_count += int(routed.shape[0])
+            sampled_experts += 1
+            sampled_routed_inputs += int(routed.shape[0])
+            layer_expert_indices.append(expert_idx)
+            layer_ellipsoid.append(ellipsoid_np)
+            layer_sphere.append(sphere_np)
+            layer_observed.append(observed_np)
+            layer_ellipsoid_ratios.append(ellipsoid_ratio)
+            layer_sphere_ratios.append(sphere_ratio)
+
+        if not layer_ellipsoid:
+            continue
+        ellipsoid_stack = np.stack(layer_ellipsoid)
+        sphere_stack = np.stack(layer_sphere)
+        observed_stack = np.stack(layer_observed)
+        ellipsoid_ratio_stack = np.stack(layer_ellipsoid_ratios)
+        sphere_ratio_stack = np.stack(layer_sphere_ratios)
+        pruned_mask = np.zeros(ellipsoid_stack.shape[1], dtype=bool)
+        if selected:
+            pruned_mask[list(selected)] = True
+        for name, values in (
+            ("ellipsoid", ellipsoid_ratio_stack),
+            ("sphere", sphere_ratio_stack),
+        ):
+            all_values[f"{name}_all"].append(values.reshape(-1))
+            all_values[f"{name}_pruned"].append(values[:, pruned_mask].reshape(-1))
+            all_values[f"{name}_retained"].append(values[:, ~pruned_mask].reshape(-1))
+        total_ellipsoid_violations += layer_ellipsoid_violations
+        total_sphere_violations += layer_sphere_violations
+        layer_key = f"layer_{info.layer_idx}"
+        if save_expert_scores:
+            npz_arrays[f"{layer_key}_ellipsoid_bound"] = ellipsoid_stack
+            npz_arrays[f"{layer_key}_sphere_bound"] = sphere_stack
+            npz_arrays[f"{layer_key}_observed_max"] = observed_stack
+            npz_arrays[f"{layer_key}_pruned_mask"] = pruned_mask
+            npz_arrays[f"{layer_key}_expert_indices"] = np.asarray(
+                layer_expert_indices, dtype=np.int32
+            )
+        layers_payload.append({
+            "layer_idx": info.layer_idx,
+            "sampled_experts": int(ellipsoid_stack.shape[0]),
+            "sampled_routed_inputs": layer_input_count,
+            "pruned_channels": len(selected),
+            "ellipsoid": _tightness_distribution(ellipsoid_ratio_stack),
+            "ellipsoid_pruned": _tightness_distribution(
+                ellipsoid_ratio_stack[:, pruned_mask]
+            ),
+            "ellipsoid_retained": _tightness_distribution(
+                ellipsoid_ratio_stack[:, ~pruned_mask]
+            ),
+            "sphere": _tightness_distribution(sphere_ratio_stack),
+            "sphere_pruned": _tightness_distribution(
+                sphere_ratio_stack[:, pruned_mask]
+            ),
+            "sphere_retained": _tightness_distribution(
+                sphere_ratio_stack[:, ~pruned_mask]
+            ),
+            "ellipsoid_numerical_violations": layer_ellipsoid_violations,
+            "sphere_numerical_violations": layer_sphere_violations,
+        })
+
+    if not layers_payload:
+        raise AssertionError("no routed expert inputs were available for tightness")
+    if save_expert_scores:
+        np.savez_compressed(npz_path, **npz_arrays)
+    global_payload: Dict[str, object] = {}
+    for name, chunks in all_values.items():
+        nonempty = [chunk for chunk in chunks if len(chunk)]
+        global_payload[name] = _tightness_distribution(
+            np.concatenate(nonempty) if nonempty else np.asarray([])
+        )
+    global_payload.update({
+        "ellipsoid_numerical_violations": total_ellipsoid_violations,
+        "sphere_numerical_violations": total_sphere_violations,
+    })
+    payload = {
+        "timestamp": timestamp,
+        "model": model_name,
+        "observed_ratio_definition": (
+            "per expert-channel max over sampled routed inputs of "
+            "||SiLU(r.g_i)(r.u_i)d_i||_2 divided by the expert-specific bound"
+        ),
+        "expert_aggregation_for_ranking": aggregation,
+        "certificate_scope": (
+            "Expert-specific sphere and ellipsoid scores are valid sampled-input "
+            "upper bounds. p95 aggregation is a channel-selection heuristic, not "
+            "a worst-case certificate across every expert; max is the conservative "
+            "all-expert aggregation."
+        ),
+        "absolute_tolerance": absolute_tolerance,
+        "relative_tolerance": relative_tolerance,
+        "sampled_experts": sampled_experts,
+        "sampled_routed_inputs": sampled_routed_inputs,
+        "max_inputs_per_expert": max_inputs_per_expert,
+        "input_sampling": (
+            "deterministic evenly spaced routed inputs per expert, capped at "
+            f"{max_inputs_per_expert}"
+        ),
+        "expert_scores_npz_path": npz_path,
+        "global": global_payload,
+        "layers": layers_payload,
+    }
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return json_path, npz_path
+
+
 def _print_per_layer_distribution(
     per_expert_pruned: Dict,
     expert_sizes: Dict,
@@ -2347,6 +2571,10 @@ def run_moe_target_pruning_mode(
     """
     import gc
     from .evaluation import evaluate_perplexity, load_all_eval_datasets
+    from .paired_bootstrap import (
+        paired_bootstrap_nll_difference,
+        write_paired_nll_csv,
+    )
     from .flops import estimate_mlp_flops
     from .model_utils import (
         count_parameters,
@@ -2432,6 +2660,32 @@ def run_moe_target_pruning_mode(
     allocation_ranking_name_cfg = str(
         cfg.get("allocation_ranking_experiment_name", "")
     )
+    exact_total_layer_channels_cfg = cfg.get(
+        "exact_total_layer_channels", None
+    )
+    if exact_total_layer_channels_cfg is not None:
+        exact_total_layer_channels_cfg = int(exact_total_layer_channels_cfg)
+        if exact_total_layer_channels_cfg <= 0:
+            raise ValueError("exact_total_layer_channels must be positive")
+        if exact_total_layer_channels_cfg % chan_align:
+            raise ValueError(
+                "exact_total_layer_channels must respect channel alignment: "
+                f"{exact_total_layer_channels_cfg} % {chan_align} != 0"
+            )
+    collect_per_example_nll = bool(cfg.get("collect_per_example_nll", False))
+    paired_bootstrap_resamples = int(cfg.get("paired_bootstrap_resamples", 10000))
+    save_bound_tightness = bool(cfg.get("save_bound_tightness", False))
+    save_expert_bound_scores = bool(cfg.get("save_expert_bound_scores", False))
+    bound_tightness_max_inputs = int(
+        cfg.get("bound_tightness_max_inputs_per_expert", 8)
+    )
+    if (save_bound_tightness or save_expert_bound_scores) and (
+        moe_selector != "rmsnorm_ellipsoid_bound"
+    ):
+        raise ValueError(
+            "bound tightness/expert-score capture requires "
+            "moe_selector=rmsnorm_ellipsoid_bound"
+        )
     allocation_ranking_enabled = bool(
         allocation_source_cfg or ranking_source_cfg or allocation_plan_cfg
         or ranking_plan_cfg
@@ -2482,11 +2736,23 @@ def run_moe_target_pruning_mode(
                 "allocation/ranking experiments require global "
                 "packed_same_channel pruning"
             )
-        if chan_agg != "p95":
-            raise ValueError("allocation/ranking experiments require p95 aggregation")
+        if chan_agg not in {"p95", "max"}:
+            raise ValueError(
+                "allocation/ranking experiments require p95 or max aggregation"
+            )
+        if chan_agg == "max" and ranking_source_cfg != "rmsnorm_ellipsoid_bound":
+            raise ValueError(
+                "the bounded aggregation ablation permits max only for "
+                "rmsnorm_ellipsoid_bound ranking"
+            )
         if len(TARGET_PCTS) != 1:
             raise ValueError("allocation/ranking experiments require one target")
         _allocation_plan = load_pruning_plan(str(allocation_plan_cfg))
+        if str(_allocation_plan.get("aggregation_mode", "")) != "p95":
+            raise ValueError(
+                "allocation plan must use the preserved p95 aggregation; got "
+                f"{_allocation_plan.get('aggregation_mode')!r}"
+            )
         _expected_allocation_selector = (
             str(_allocation_plan.get("selector", ""))
             if allocation_source_cfg == "fixed_plan"
@@ -2814,6 +3080,7 @@ def run_moe_target_pruning_mode(
                     _bp = evaluate_perplexity(
                         model, tokenizer, texts=all_eval_corpora[_ds],
                         max_seq_len=max_seq, batch_size=batch_sz, device=device,
+                        collect_per_example=collect_per_example_nll,
                     )
                     baseline_ppl_per_ds[_ds] = _bp["perplexity"]
                     baseline_eval_info_per_ds[_ds] = dict(_bp)
@@ -2857,6 +3124,8 @@ def run_moe_target_pruning_mode(
                 target_n = round(target_pct / 100.0 * total_expert_neurons)
                 _target_score_comparison_csv = ""
                 _target_score_comparison_json = ""
+                _target_bound_tightness_json = ""
+                _target_expert_bound_scores_npz = ""
                 print(f"\n  Target: {target_pct:.1f}%  →  {target_n:,} neurons")
 
                 # ── Score all experts ────────────────────────────────────────
@@ -3055,6 +3324,9 @@ def run_moe_target_pruning_mode(
                             ranking_plan_path=(
                                 str(ranking_plan_cfg) if ranking_plan_cfg else None
                             ),
+                            exact_total_layer_channels=(
+                                exact_total_layer_channels_cfg
+                            ),
                         )
                     )
                     selected_layer_channels = int(
@@ -3067,6 +3339,10 @@ def run_moe_target_pruning_mode(
                             "total_removed_expert_neurons"
                         ]
                     )
+                    _allocation_ranking_audit.update({
+                        "allocation_aggregation_mode": "p95",
+                        "ranking_aggregation_mode": chan_agg,
+                    })
                     print(
                         "    [allocation-ranking] "
                         f"allocation_source={allocation_source_cfg}  "
@@ -3377,6 +3653,11 @@ def run_moe_target_pruning_mode(
                         if (_allocation_ranking_audit is not None and ranking_plan_cfg)
                         else ""
                     ),
+                    "allocation_aggregation_mode": "p95",
+                    "ranking_aggregation_mode": chan_agg,
+                    "exact_total_layer_channels": (
+                        exact_total_layer_channels_cfg or ""
+                    ),
                 }
                 if _allocation_ranking_audit is not None:
                     _replay_result_fields.update({
@@ -3413,6 +3694,31 @@ def run_moe_target_pruning_mode(
                         f"selected_layer_channels={selected_layer_channels}  "
                         f"removed_expert_neurons={actual_pruned}"
                     )
+
+                if save_bound_tightness:
+                    (
+                        _target_bound_tightness_json,
+                        _target_expert_bound_scores_npz,
+                    ) = save_moe_bound_tightness_diagnostics(
+                        moe_layers,
+                        expert_activations,
+                        per_expert_pruned,
+                        output_dir=output_dir,
+                        timestamp=ts,
+                        model_name=model_name,
+                        aggregation=chan_agg,
+                        save_expert_scores=save_expert_bound_scores,
+                        max_inputs_per_expert=bound_tightness_max_inputs,
+                    )
+                    print(
+                        "    [bound-tightness] JSON: "
+                        f"{_target_bound_tightness_json}"
+                    )
+                    if _target_expert_bound_scores_npz:
+                        print(
+                            "    [bound-tightness] expert scores: "
+                            f"{_target_expert_bound_scores_npz}"
+                        )
 
                 _print_per_layer_distribution(
                     per_expert_pruned, expert_sizes, moe_layers,
@@ -4286,6 +4592,7 @@ def run_moe_target_pruning_mode(
                             texts=all_eval_corpora[_ds],
                             max_seq_len=max_seq, batch_size=batch_sz,
                             device=device,
+                            collect_per_example=collect_per_example_nll,
                         )
                         ppl   = ppl_info["perplexity"]
                         _baseline_tokens = int(
@@ -4300,6 +4607,42 @@ def run_moe_target_pruning_mode(
                             )
                         delta = ppl - cur_bppl
                         rel   = 100.0 * delta / cur_bppl if cur_bppl > 0 else 0.0
+                        _paired_nll_path = ""
+                        _paired_nll_stats = {
+                            "mean_nll_difference": float("nan"),
+                            "ci_lower": float("nan"),
+                            "ci_upper": float("nan"),
+                            "n_resamples": 0,
+                        }
+                        if collect_per_example_nll:
+                            _baseline_examples = baseline_eval_info_per_ds[_ds].get(
+                                "per_example"
+                            )
+                            _pruned_examples = ppl_info.get("per_example")
+                            if not isinstance(_baseline_examples, list) or not isinstance(
+                                _pruned_examples, list
+                            ):
+                                raise AssertionError(
+                                    "paired NLL collection requested but per-example "
+                                    "records are missing"
+                                )
+                            _paired_nll_path = os.path.join(
+                                output_dir, f"paired_nll_{_ds}_{ts}.csv"
+                            )
+                            write_paired_nll_csv(
+                                _paired_nll_path,
+                                dataset=_ds,
+                                corpus_sha256=eval_corpus_sha256[_ds],
+                                baseline_examples=_baseline_examples,
+                                pruned_examples=_pruned_examples,
+                            )
+                            _paired_nll_stats = paired_bootstrap_nll_difference(
+                                [float(row["nll_sum"]) for row in _pruned_examples],
+                                [float(row["nll_sum"]) for row in _baseline_examples],
+                                [int(row["n_tokens"]) for row in _baseline_examples],
+                                n_resamples=paired_bootstrap_resamples,
+                                seed=int(cfg.get("seed", 42)),
+                            )
                         if torch.cuda.is_available():
                             peak_gpu_mb = (
                                 torch.cuda.max_memory_allocated() / 1024**2
@@ -4375,6 +4718,25 @@ def run_moe_target_pruning_mode(
                             "model_load_instance_id": _model_load_instance_id,
                             "score_comparison_csv_path": _target_score_comparison_csv,
                             "score_comparison_json_path": _target_score_comparison_json,
+                            "per_example_nll_path": _paired_nll_path,
+                            "mean_nll_difference": _paired_nll_stats[
+                                "mean_nll_difference"
+                            ],
+                            "mean_nll_difference_ci95_lower": _paired_nll_stats[
+                                "ci_lower"
+                            ],
+                            "mean_nll_difference_ci95_upper": _paired_nll_stats[
+                                "ci_upper"
+                            ],
+                            "paired_bootstrap_resamples": _paired_nll_stats[
+                                "n_resamples"
+                            ],
+                            "bound_tightness_json_path": (
+                                _target_bound_tightness_json
+                            ),
+                            "expert_bound_scores_npz_path": (
+                                _target_expert_bound_scores_npz
+                            ),
                         }
                         summary.update({
                             "target_pct": target_pct,

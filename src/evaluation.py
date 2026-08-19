@@ -243,13 +243,18 @@ def evaluate_perplexity(
     max_seq_len: int = 512,
     batch_size: int = 4,
     device: Optional[str] = None,
-) -> Dict[str, float]:
+    collect_per_example: bool = False,
+) -> Dict[str, object]:
     """
     Evaluate per-token cross-entropy perplexity.
 
     Correctly masks padding tokens so they are excluded from the loss.
 
-    Returns dict with keys: 'perplexity', 'nll_mean', 'n_tokens'.
+    Returns dict with keys: 'perplexity', 'nll_mean', 'n_tokens'.  When
+    ``collect_per_example`` is true, it also returns ``per_example`` with one
+    NLL sum/token-count record per input document.  This mode computes the
+    same causal next-token cross entropy separately for each sequence so the
+    observations can be paired across models without rerunning evaluation.
     """
     if texts is None:
         texts = load_eval_dataset(max_samples)
@@ -260,6 +265,7 @@ def evaluate_perplexity(
     model.eval()
     total_nll    = 0.0
     total_tokens = 0
+    per_example: List[Dict[str, object]] = []
 
     with torch.no_grad():
         for i in tqdm(range(0, len(texts), batch_size), desc="Evaluating perplexity"):
@@ -279,24 +285,50 @@ def evaluate_perplexity(
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100   # ignore_index for HF cross-entropy
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
-            # outputs.loss = mean NLL over the non-(-100) shifted positions
-            loss = outputs.loss
-
-            # Count non-padding prediction targets (positions 1..T, where label != -100)
-            # HF shifts by 1 internally: labels[..., 1:] are the targets.
-            # After our masking, padding positions in labels[..., 1:] are -100.
-            n_tokens = (labels[:, 1:] != -100).sum().item()
-
-            if n_tokens == 0:
-                continue
-
-            total_nll    += loss.item() * n_tokens
-            total_tokens += n_tokens
+            if collect_per_example:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                shifted_labels = labels[:, 1:]
+                shifted_logits = outputs.logits[:, :-1, :]
+                for batch_index in range(len(batch_texts)):
+                    valid = shifted_labels[batch_index] != -100
+                    n_tokens = int(valid.sum().item())
+                    if n_tokens <= 0:
+                        raise ValueError(
+                            "paired PPL evaluation encountered a document with "
+                            f"no prediction targets at sample {i + batch_index}"
+                        )
+                    # Keep logits in their model dtype.  cross_entropy performs
+                    # its stable internal accumulation without materializing a
+                    # full-vocabulary FP32 copy, which is important for 30B runs.
+                    nll_sum = torch.nn.functional.cross_entropy(
+                        shifted_logits[batch_index][valid],
+                        shifted_labels[batch_index][valid],
+                        reduction="sum",
+                    ).item()
+                    total_nll += nll_sum
+                    total_tokens += n_tokens
+                    per_example.append({
+                        "sample_index": i + batch_index,
+                        "n_tokens": n_tokens,
+                        "nll_sum": float(nll_sum),
+                        "nll_mean": float(nll_sum / n_tokens),
+                    })
+            else:
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                # outputs.loss = mean NLL over non-(-100) shifted positions.
+                loss = outputs.loss
+                n_tokens = (labels[:, 1:] != -100).sum().item()
+                if n_tokens == 0:
+                    continue
+                total_nll += loss.item() * n_tokens
+                total_tokens += n_tokens
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -311,7 +343,19 @@ def evaluate_perplexity(
     logger.info(
         "Perplexity: %.4f  (NLL=%.4f, tokens=%d)", perplexity, nll_mean, total_tokens
     )
-    return {"perplexity": perplexity, "nll_mean": nll_mean, "n_tokens": total_tokens}
+    result: Dict[str, object] = {
+        "perplexity": perplexity,
+        "nll_mean": nll_mean,
+        "n_tokens": total_tokens,
+    }
+    if collect_per_example:
+        if len(per_example) != len(texts):
+            raise AssertionError(
+                f"per-example evaluation produced {len(per_example)} rows for "
+                f"{len(texts)} input documents"
+            )
+        result["per_example"] = per_example
+    return result
 
 
 # ---------------------------------------------------------------------------

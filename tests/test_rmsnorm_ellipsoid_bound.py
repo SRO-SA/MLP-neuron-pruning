@@ -20,8 +20,10 @@ from src.moe_pruning import (
     get_expert_scores,
     get_moe_input_rmsnorm_weight,
     save_moe_bound_comparison_diagnostics,
+    save_moe_bound_tightness_diagnostics,
 )
 from src.rmsnorm_geometry import (
+    compute_observed_channel_contribution_max_from_weights,
     compute_rmsnorm_bound_triplet_from_weights,
     compute_rmsnorm_ellipsoid_bound_from_weights,
     compute_rmsnorm_sphere_bound_from_weights,
@@ -93,6 +95,11 @@ class RMSNormEllipsoidMathTests(unittest.TestCase):
         actual = activations.abs() * down.norm(dim=0).unsqueeze(0)
         tolerance = 5e-5 * torch.maximum(torch.ones_like(bound), bound)
         self.assertTrue(torch.all(actual <= bound.unsqueeze(0) + tolerance))
+        observed_max = compute_observed_channel_contribution_max_from_weights(
+            gate, up, down, r
+        )
+        torch.testing.assert_close(observed_max, actual.amax(dim=0))
+        self.assertTrue(torch.all(observed_max <= bound + tolerance))
 
     def test_zero_gate_up_and_down_channels_have_zero_score(self) -> None:
         torch.manual_seed(11)
@@ -280,6 +287,43 @@ class RMSNormEllipsoidIntegrationTests(unittest.TestCase):
                 payload["cross_layer_scale"],
             )
             self.assertIn("does not by itself", payload["cross_layer_scale"]["interpretation"])
+
+    def test_bound_tightness_saves_preaggregation_expert_scores(self) -> None:
+        layer = ToyLayer(self.gamma)
+        info = MoELayerInfo(0, layer)
+        info.is_moe = True
+        info.num_experts = 2
+        info.expert_modules = []
+        activations = {}
+        for expert_idx, scale in enumerate((1.0, 1.1)):
+            expert = ToyExpert(self.d_model, self.d_ff)
+            _copy_expert_weights(
+                expert, self.gate * scale, self.up / scale, self.down
+            )
+            info.expert_modules.append(expert)
+            raw = torch.randn(32, self.d_model)
+            activations[(0, expert_idx)] = layer.post_attention_layernorm(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path, npz_path = save_moe_bound_tightness_diagnostics(
+                [info], activations, {(0, -1): [0]},
+                output_dir=tmp,
+                timestamp="test",
+                model_name="toy/model",
+                aggregation="p95",
+                save_expert_scores=True,
+            )
+            payload = json.loads(Path(json_path).read_text())
+            self.assertEqual(
+                payload["global"]["ellipsoid_numerical_violations"], 0
+            )
+            self.assertEqual(payload["global"]["sphere_numerical_violations"], 0)
+            self.assertLessEqual(payload["global"]["ellipsoid_all"]["max"], 1.0001)
+            archive = dict(__import__("numpy").load(npz_path))
+            self.assertEqual(
+                archive["layer_0_ellipsoid_bound"].shape,
+                (2, self.d_ff),
+            )
+            self.assertEqual(archive["layer_0_pruned_mask"].tolist(), [True, False, False, False])
 
 
 if __name__ == "__main__":

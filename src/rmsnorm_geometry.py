@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def _validated_float32_inputs(
@@ -165,3 +166,42 @@ def compute_rmsnorm_sphere_bound_from_weights(
     if not torch.isfinite(scores).all():
         raise FloatingPointError("sphere score computation produced non-finite values")
     return scores
+
+
+def compute_observed_channel_contribution_max_from_weights(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    routed_inputs: torch.Tensor,
+) -> torch.Tensor:
+    """Return each channel's maximum observed output-vector contribution norm.
+
+    For routed normalized inputs ``r``, channel ``i`` contributes
+    ``SiLU(r·g_i) (r·u_i) d_i``.  Its vector 2-norm is therefore the absolute
+    scalar activation times ``||d_i||_2``.  Maxima are taken over the supplied
+    routed-input sample and accumulated in float32 on CPU.
+    """
+    if gate.ndim != 2 or up.ndim != 2 or down.ndim != 2:
+        raise AssertionError("gate/up/down must be rank-2")
+    if tuple(gate.shape) != tuple(up.shape):
+        raise AssertionError("gate/up shapes differ")
+    d_ff, d_model = gate.shape
+    if tuple(down.shape) != (d_model, d_ff):
+        raise AssertionError("down shape is incompatible with gate/up")
+    if routed_inputs is None or routed_inputs.ndim != 2:
+        raise AssertionError("routed_inputs must have shape [n_samples, d_model]")
+    if routed_inputs.shape[0] <= 0 or routed_inputs.shape[1] != d_model:
+        raise AssertionError(
+            f"routed_inputs shape {tuple(routed_inputs.shape)} is incompatible "
+            f"with d_model={d_model}"
+        )
+    gate32 = gate.detach().to(device="cpu", dtype=torch.float32)
+    up32 = up.detach().to(device="cpu", dtype=torch.float32)
+    down32 = down.detach().to(device="cpu", dtype=torch.float32)
+    inputs32 = routed_inputs.detach().to(device="cpu", dtype=torch.float32)
+    with torch.no_grad():
+        activations = F.silu(inputs32 @ gate32.T) * (inputs32 @ up32.T)
+        observed = activations.abs().amax(dim=0) * down32.norm(dim=0)
+    if tuple(observed.shape) != (d_ff,) or not torch.isfinite(observed).all():
+        raise FloatingPointError("observed channel contributions are invalid")
+    return observed
