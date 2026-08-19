@@ -14,13 +14,26 @@ class PaperV3EvidenceTests(unittest.TestCase):
             run_dir = os.path.join(tempdir, "run")
             experiment_dir = os.path.join(run_dir, "cell")
             os.makedirs(experiment_dir)
-            plan_path = os.path.join(experiment_dir, "plan.json")
+            plan_dir = os.path.join(experiment_dir, "pruning_plans")
+            os.makedirs(plan_dir)
+            plan_path = os.path.join(plan_dir, "plan.json")
             with open(plan_path, "w", encoding="utf-8") as handle:
                 json.dump({
+                    "target_pct": 2.0,
+                    "selector": "rmsnorm_ellipsoid_bound",
+                    "pruning_mode": "packed_same_channel",
+                    "aggregation_mode": "p95",
                     "layers": [
                         {"layer_idx": 0, "prune_idx": list(range(16))},
                         {"layer_idx": 1, "prune_idx": []},
-                    ]
+                    ],
+                    "allocation_ranking": {
+                        "allocation_source": "rmsnorm_bound",
+                        "ranking_source": "rmsnorm_ellipsoid_bound",
+                        "experiment_name": "rmsnorm_alloc__ellipsoid_rank",
+                        "total_selected_layer_channels": 16,
+                        "total_removed_expert_neurons": 128,
+                    },
                 }, handle)
             nll_path = os.path.join(experiment_dir, "paired.csv")
             with open(nll_path, "w", newline="", encoding="utf-8") as handle:
@@ -41,6 +54,7 @@ class PaperV3EvidenceTests(unittest.TestCase):
                 "evaluation_batch_size": "4", "evaluation_preprocessing": "fixed",
                 "seed": "42", "allocation_source": "rmsnorm_bound",
                 "ranking_source": "rmsnorm_ellipsoid_bound",
+                "pruning_mode": "packed_same_channel",
                 "ranking_aggregation_mode": "p95", "selected_layer_channels": "16",
                 "removed_expert_neurons": "128", "expert_param_reduction_pct": "2.1",
                 "total_model_param_reduction_pct": "2.0", "baseline_ppl": "12.0",
@@ -50,7 +64,8 @@ class PaperV3EvidenceTests(unittest.TestCase):
                 "mean_nll_difference_ci95_upper": "0.02",
                 "paired_bootstrap_resamples": "10000", "pruned_eval_tokens": "100",
                 "baseline_eval_tokens": "100",
-                "pruning_plan_path": plan_path, "pruning_plan_sha256": "",
+                "experiment_label": "rmsnorm_alloc__ellipsoid_rank",
+                "pruning_plan_path": "", "pruning_plan_sha256": "",
                 "per_example_nll_path": nll_path, "process_id": "1",
                 "model_load_instance_id": "fresh-1",
             }
@@ -71,6 +86,10 @@ class PaperV3EvidenceTests(unittest.TestCase):
                 record = json.load(handle)["records"][0]
             self.assertEqual(record["model_revision"], "model-sha")
             self.assertEqual(len(record["pruning_plan_sha256"]), 64)
+            self.assertEqual(
+                record["pruning_plan_path_resolution"],
+                "recovered_unique_validated_experiment_plan",
+            )
             with self.assertRaises(FileExistsError):
                 build_evidence(
                     run_dirs=[run_dir], output_dir=output_dir,

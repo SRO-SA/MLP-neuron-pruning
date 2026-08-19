@@ -34,7 +34,8 @@ EVIDENCE_FIELDS = [
     "baseline_ppl", "pruned_ppl", "relative_ppl_change_pct",
     "mean_nll_difference", "mean_nll_ci95_lower", "mean_nll_ci95_upper",
     "paired_bootstrap_resamples", "result_directory", "result_csv",
-    "pruning_plan_path", "pruning_plan_sha256", "per_example_nll_path",
+    "pruning_plan_path", "pruning_plan_path_resolution", "pruning_plan_sha256",
+    "per_example_nll_path",
     "per_example_nll_sha256", "process_id", "model_load_instance_id",
 ]
 
@@ -98,6 +99,95 @@ def _plan_counts(path: str) -> dict[int, int]:
         int(layer["layer_idx"]): len(layer.get("prune_idx", []))
         for layer in plan["layers"]
     }
+
+
+def _plan_matches_result(path: str, row: dict) -> tuple[bool, str]:
+    """Verify that a candidate is the derived plan for one result row."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"cannot read plan: {exc}"
+    counts = _plan_counts(path)
+    checks = {
+        "target_pct": (
+            float(plan.get("target_pct", -1)), float(row["target_pct"])
+        ),
+        "selector": (
+            str(plan.get("selector", "")), str(row.get("ranking_source", ""))
+        ),
+        "pruning_mode": (
+            str(plan.get("pruning_mode", "")), str(row.get("pruning_mode", ""))
+        ),
+        "aggregation_mode": (
+            str(plan.get("aggregation_mode", "")),
+            str(row.get("ranking_aggregation_mode", row.get("aggregation_mode", ""))),
+        ),
+        "selected_layer_channels": (
+            sum(counts.values()), int(row["selected_layer_channels"])
+        ),
+    }
+    for field, (actual, expected) in checks.items():
+        if actual != expected:
+            return False, f"{field}={actual!r}, expected {expected!r}"
+    audit = plan.get("allocation_ranking")
+    if not isinstance(audit, dict):
+        return False, "missing allocation_ranking audit"
+    audit_checks = {
+        "allocation_source": row.get("allocation_source", ""),
+        "ranking_source": row.get("ranking_source", ""),
+    }
+    if row.get("experiment_label"):
+        audit_checks["experiment_name"] = row["experiment_label"]
+    for field, expected in audit_checks.items():
+        if str(audit.get(field, "")) != str(expected):
+            return False, (
+                f"allocation_ranking.{field}={audit.get(field)!r}, "
+                f"expected {expected!r}"
+            )
+    if int(audit.get("total_selected_layer_channels", -1)) != sum(counts.values()):
+        return False, "allocation_ranking total differs from plan layers"
+    if int(audit.get("total_removed_expert_neurons", -1)) != int(
+        row["removed_expert_neurons"]
+    ):
+        return False, "allocation_ranking expert-neuron total differs from result"
+    return True, "ok"
+
+
+def _resolve_pruning_plan(csv_path: str, row: dict) -> tuple[str, str]:
+    """Resolve a recorded path, or one uniquely matching derived local plan."""
+    recorded = row.get("pruning_plan_path", "").strip()
+    if recorded:
+        if not os.path.isfile(recorded):
+            raise FileNotFoundError(
+                f"recorded pruning plan does not exist for {csv_path}: {recorded}"
+            )
+        matches, reason = _plan_matches_result(recorded, row)
+        if not matches:
+            raise ValueError(
+                f"recorded pruning plan does not match {csv_path}: {reason}"
+            )
+        return recorded, "csv_recorded_and_validated"
+
+    experiment_dir = os.path.dirname(csv_path)
+    candidates = sorted(glob.glob(os.path.join(
+        experiment_dir, "pruning_plans", "*.json"
+    )))
+    valid = []
+    rejected = {}
+    for candidate in candidates:
+        matches, reason = _plan_matches_result(candidate, row)
+        if matches:
+            valid.append(candidate)
+        else:
+            rejected[candidate] = reason
+    if len(valid) != 1:
+        raise FileNotFoundError(
+            "CSV pruning_plan_path is blank and a unique matching derived plan "
+            f"could not be established for {csv_path}; valid={valid}; "
+            f"rejected={rejected}"
+        )
+    return valid[0], "recovered_unique_validated_experiment_plan"
 
 
 def _copy_comparison_tables(run_dirs: list[str], output_dir: str) -> list[str]:
@@ -236,9 +326,9 @@ def build_evidence(
         if key in seen:
             raise ValueError(f"duplicate evidence cell: {key}")
         seen.add(key)
-        plan_path = row.get("pruning_plan_path", "")
+        plan_path, plan_path_resolution = _resolve_pruning_plan(csv_path, row)
         nll_path = row.get("per_example_nll_path", "")
-        for required, label in ((plan_path, "pruning plan"), (nll_path, "paired NLL")):
+        for required, label in ((nll_path, "paired NLL"),):
             if not required or not os.path.isfile(required):
                 raise FileNotFoundError(f"{label} missing for {csv_path}: {required}")
         plan_hash = file_sha256(plan_path)
@@ -302,6 +392,7 @@ def build_evidence(
             "result_directory": os.path.dirname(csv_path),
             "result_csv": csv_path,
             "pruning_plan_path": plan_path,
+            "pruning_plan_path_resolution": plan_path_resolution,
             "pruning_plan_sha256": plan_hash,
             "per_example_nll_path": nll_path,
             "per_example_nll_sha256": file_sha256(nll_path),
