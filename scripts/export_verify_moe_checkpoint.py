@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ from src.heterogeneous_moe_checkpoint import (
     apply_plan_physical,
     count_parameters,
     inspect_plan_shapes,
+    inspect_plan_execution_devices,
     load_heterogeneous_checkpoint,
 )
 
@@ -80,6 +82,12 @@ def main() -> None:
         raise FileExistsError(
             f"refusing to overwrite checkpoint: {args.checkpoint_dir}"
         )
+    stale_temporary = sorted(glob.glob(f"{args.checkpoint_dir}.incomplete.*"))
+    if stale_temporary:
+        raise FileExistsError(
+            "stale incomplete checkpoint directories must be inspected and removed "
+            f"before retrying: {stale_temporary}"
+        )
     temporary = f"{args.checkpoint_dir}.incomplete.{os.getpid()}"
     if os.path.exists(temporary):
         raise FileExistsError(f"temporary checkpoint already exists: {temporary}")
@@ -119,7 +127,7 @@ def main() -> None:
     load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, device_map="auto", trust_remote_code=True,
+        args.model, dtype=dtype, device_map="auto", trust_remote_code=True,
     )
     model.eval()
     source_model_revision = str(getattr(model.config, "_commit_hash", "") or "")
@@ -165,7 +173,7 @@ def main() -> None:
     reload_started = time.perf_counter()
     if plan is None:
         reloaded = AutoModelForCausalLM.from_pretrained(
-            temporary, torch_dtype=dtype, device_map="auto", trust_remote_code=True,
+            temporary, dtype=dtype, device_map="auto", trust_remote_code=True,
         )
         reloaded_plan = None
     else:
@@ -196,8 +204,10 @@ def main() -> None:
         shape_audit_after = inspect_plan_shapes(reloaded, plan)
         if shape_audit_after != shape_audit_before:
             raise AssertionError("expert tensor shapes changed after reload")
+        execution_device_audit = inspect_plan_execution_devices(reloaded, plan)
     else:
         shape_audit_after = []
+        execution_device_audit = []
 
     weight_files = _weight_files(temporary)
     if not weight_files:
@@ -226,6 +236,14 @@ def main() -> None:
         "parameters_reloaded": reloaded_counts,
         "shape_audit_before_save": shape_audit_before,
         "shape_audit_after_reload": shape_audit_after,
+        "execution_device_audit_after_reload": execution_device_audit,
+        "dispatch_no_split_module_classes": list(getattr(
+            reloaded, "_heterogeneous_dispatch_no_split_classes", []
+        )),
+        "dispatch_device_map": {
+            str(key): str(value)
+            for key, value in (getattr(reloaded, "hf_device_map", {}) or {}).items()
+        },
         "serialized_weight_bytes": serialized_weight_bytes,
         "checkpoint_payload_bytes_excluding_verification_manifest": payload_bytes,
         "weight_file_count": len(weight_files),

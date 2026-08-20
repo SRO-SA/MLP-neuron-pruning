@@ -241,6 +241,47 @@ def count_parameters(model: Any) -> dict[str, int]:
     return {"total": int(total), "moe_experts": int(moe)}
 
 
+def dispatch_no_split_module_classes(model: Any) -> list[str]:
+    """Return module classes that must remain atomic during auto dispatch.
+
+    A packed MoE block computes routing indices and immediately uses them to
+    index its hidden states.  Splitting that block (or its decoder layer) across
+    devices can therefore put the indices and hidden states on different GPUs.
+    """
+    result: list[str] = []
+
+    def add(value: Any) -> None:
+        name = value if isinstance(value, str) else getattr(value, "__name__", "")
+        if name and name not in result:
+            result.append(name)
+
+    for value in getattr(model, "_no_split_modules", None) or []:
+        add(value)
+    for layer in find_decoder_layers(model):
+        add(layer.__class__)
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and hasattr(mlp, "gate") and hasattr(mlp, "experts"):
+            add(mlp.__class__)
+    return result
+
+
+def inspect_plan_execution_devices(model: Any, plan: dict) -> list[dict]:
+    """Assert that every packed MoE block is resident on one execution device."""
+    layers = find_decoder_layers(model)
+    audit = []
+    for row in plan["layers"]:
+        layer_idx = int(row["layer_idx"])
+        mlp = getattr(layers[layer_idx], "mlp")
+        devices = sorted({str(parameter.device) for parameter in mlp.parameters()})
+        if len(devices) != 1:
+            raise AssertionError(
+                f"layer {layer_idx} MoE block spans execution devices {devices}; "
+                "router indices and hidden states must remain colocated"
+            )
+        audit.append({"layer_idx": layer_idx, "mlp_devices": devices})
+    return audit
+
+
 def load_heterogeneous_checkpoint(
     checkpoint_dir: str, *, device_map: str | dict = "auto",
     dtype: torch.dtype | None = None,
@@ -258,13 +299,19 @@ def load_heterogeneous_checkpoint(
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
             config, trust_remote_code=True,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         resize_empty_model_to_plan(model, plan)
         model.tie_weights()
+    no_split_module_classes = dispatch_no_split_module_classes(model)
+    if not no_split_module_classes:
+        raise AssertionError("could not determine atomic classes for checkpoint dispatch")
     model = load_checkpoint_and_dispatch(
         model, checkpoint=checkpoint_dir, device_map=device_map, dtype=dtype,
+        no_split_module_classes=no_split_module_classes,
     )
+    model._heterogeneous_dispatch_no_split_classes = no_split_module_classes
     model.eval()
     inspect_plan_shapes(model, plan)
+    inspect_plan_execution_devices(model, plan)
     return model, plan

@@ -53,6 +53,24 @@ class HeterogeneousCheckpointTests(unittest.TestCase):
                 "layer_idx": 0, "old_intermediate": 4, "prune_idx": [4]
             }]})
 
+    def test_auto_dispatch_keeps_decoder_and_moe_classes_atomic(self):
+        from src.heterogeneous_moe_checkpoint import dispatch_no_split_module_classes
+
+        model = self._model()
+        model._no_split_modules = ["DeclaredAtomicLayer"]
+        classes = dispatch_no_split_module_classes(model)
+        self.assertIn("DeclaredAtomicLayer", classes)
+        self.assertIn(model.model.layers[0].__class__.__name__, classes)
+        self.assertIn(model.model.layers[0].mlp.__class__.__name__, classes)
+
+    def test_execution_device_audit_accepts_colocated_moe(self):
+        from src.heterogeneous_moe_checkpoint import inspect_plan_execution_devices
+
+        audit = inspect_plan_execution_devices(self._model(), {"layers": [{
+            "layer_idx": 0, "old_intermediate": 4, "prune_idx": [1]
+        }]})
+        self.assertEqual(audit, [{"layer_idx": 0, "mlp_devices": ["cpu"]}])
+
 
 if __name__ == "__main__":
     unittest.main()
