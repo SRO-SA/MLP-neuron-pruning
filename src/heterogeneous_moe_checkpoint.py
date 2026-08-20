@@ -260,7 +260,7 @@ def dispatch_no_split_module_classes(model: Any) -> list[str]:
     for layer in find_decoder_layers(model):
         add(layer.__class__)
         mlp = getattr(layer, "mlp", None)
-        if mlp is not None and hasattr(mlp, "gate") and hasattr(mlp, "experts"):
+        if mlp is not None and hasattr(mlp, "experts"):
             add(mlp.__class__)
     return result
 
