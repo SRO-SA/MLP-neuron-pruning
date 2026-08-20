@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MANIFEST="${MANIFEST:?set MANIFEST to checkpoint_specs.json}"
+TOKENIZER_AUDIT="${TOKENIZER_AUDIT:?set TOKENIZER_AUDIT to tokenizer_audit.json}"
 RUN_DIR="${RUN_DIR:?set a new RUN_DIR}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -13,6 +14,8 @@ SEED="${SEED:-42}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE_LIMIT="${SMOKE_LIMIT:-}"
 INCLUDE_OPTIONAL="${INCLUDE_OPTIONAL:-0}"
+ONLY_TARGETS="${ONLY_TARGETS:-}"
+SKIP_SUMMARY="${SKIP_SUMMARY:-0}"
 LM_EVAL_IDENTITY="${LM_EVAL_IDENTITY:?set the pinned lm-eval git commit or package version}"
 
 if [ -f "${VENV}/bin/activate" ]; then source "${VENV}/bin/activate"; fi
@@ -23,8 +26,16 @@ fi
 HARNESS_ID="${LM_EVAL_IDENTITY}"
 echo "[downstream] lm-eval identity: ${HARNESS_ID}"
 
-while IFS=$'\t' read -r label checkpoint; do
+while IFS=$'\t' read -r label checkpoint target; do
+  if [ -n "${ONLY_TARGETS}" ]; then
+    target_int="${target%%.*}"
+    case ",${ONLY_TARGETS}," in
+      *",${target_int},"*) ;;
+      *) continue ;;
+    esac
+  fi
   args=(--checkpoint "${checkpoint}" --label "${label}"
+        --tokenizer-audit "${TOKENIZER_AUDIT}"
         --output "${RUN_DIR}/${label}/lm_eval_results.json"
         --expected-harness-identity "${HARNESS_ID}"
         --batch-size "${BATCH_SIZE}" --dtype "${DTYPE}" --seed "${SEED}")
@@ -40,11 +51,15 @@ while IFS=$'\t' read -r label checkpoint; do
 done < <(python3 - "${MANIFEST}" <<'PY'
 import json, sys
 for row in json.load(open(sys.argv[1])):
-    print(f"{row['label']}\t{row['checkpoint_dir']}")
+    print(f"{row['label']}\t{row['checkpoint_dir']}\t{row['target_pct']}")
 PY
 )
 
 if [ "${DRY_RUN}" = "1" ]; then exit 0; fi
+if [ "${SKIP_SUMMARY}" = "1" ]; then
+  echo "[downstream] SKIP_SUMMARY=1; raw smoke outputs retained in ${RUN_DIR}"
+  exit 0
+fi
 python3 scripts/summarize_paper_v3_downstream.py \
   --checkpoint-manifest "${MANIFEST}" --run-dir "${RUN_DIR}" \
   --output-dir "${RUN_DIR}/paper_tables" --bootstrap-resamples 10000

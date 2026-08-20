@@ -9,7 +9,7 @@ import os
 import re
 
 
-REQUESTS = [
+COMPLETE_REQUESTS = [
     (2, "ranking", "rmsnorm_bound", "rmsnorm_bound"),
     (4, "ranking", "rmsnorm_bound", "activation_score"),
     (4, "ranking", "rmsnorm_bound", "down_norm"),
@@ -24,6 +24,19 @@ REQUESTS = [
     (8, "ranking", "rmsnorm_bound", "activation_score"),
     (8, "ranking", "rmsnorm_bound", "rmsnorm_bound"),
 ]
+
+PRIMARY_REQUESTS = [
+    (4, "ranking", "rmsnorm_bound", "activation_score"),
+    (4, "ranking", "rmsnorm_bound", "down_norm"),
+    (4, "ranking", "rmsnorm_bound", "rmsnorm_bound"),
+    (6, "ranking", "rmsnorm_bound", "activation_score"),
+    (6, "ranking", "rmsnorm_bound", "rmsnorm_bound"),
+    (8, "ranking", "rmsnorm_bound", "activation_score"),
+    (8, "ranking", "rmsnorm_bound", "rmsnorm_bound"),
+]
+
+# Backward-compatible public name used by earlier callers.
+REQUESTS = COMPLETE_REQUESTS
 
 FIELDS = [
     "target_pct", "comparison_type", "allocation_context", "dataset",
@@ -117,14 +130,17 @@ def normalize_comparison(row: dict) -> dict:
     }
 
 
-def build_requested_table(source_rows: list[dict]) -> list[dict]:
+def build_requested_table(
+    source_rows: list[dict], requests: list[tuple] | None = None,
+) -> list[dict]:
+    requests = COMPLETE_REQUESTS if requests is None else requests
     normalized = [normalize_comparison(row) for row in source_rows]
     by_key = {}
     for row in normalized:
         key = (*row["request_key"], row["dataset"])
         by_key.setdefault(key, []).append(row)
     output = []
-    for request in REQUESTS:
+    for request in requests:
         for dataset in ("wikitext2", "c4"):
             matches = by_key.get((*request, dataset), [])
             if len(matches) != 1:
@@ -186,11 +202,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--profile", choices=("primary", "complete"),
+                        default="complete")
     args = parser.parse_args()
     if os.path.exists(args.output_dir):
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.input, newline="", encoding="utf-8") as handle:
-        rows = build_requested_table(list(csv.DictReader(handle)))
+        requests = PRIMARY_REQUESTS if args.profile == "primary" else COMPLETE_REQUESTS
+        rows = build_requested_table(list(csv.DictReader(handle)), requests=requests)
     os.makedirs(args.output_dir)
     csv_path = os.path.join(args.output_dir, "paper_v3_paired_dnll_table.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:

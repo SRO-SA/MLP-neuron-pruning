@@ -1,9 +1,14 @@
 import unittest
 
-from scripts.build_paper_v3_paired_table import normalize_comparison
+from scripts.build_paper_v3_paired_table import PRIMARY_REQUESTS, normalize_comparison
 
 
 class PaperV3PairedTableTests(unittest.TestCase):
+    def test_primary_profile_is_only_ranking_at_4_6_8(self):
+        self.assertEqual({request[0] for request in PRIMARY_REQUESTS}, {4, 6, 8})
+        self.assertEqual({request[1] for request in PRIMARY_REQUESTS}, {"ranking"})
+        self.assertEqual(len(PRIMARY_REQUESTS), 7)
+
     def test_ranking_direction_and_significance(self):
         row = normalize_comparison({
             "comparison_type": "ranking", "source_group": "target8_n1024",

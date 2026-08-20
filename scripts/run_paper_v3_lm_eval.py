@@ -20,6 +20,7 @@ if REPO_ROOT not in sys.path:
 from src.heterogeneous_moe_checkpoint import (
     PLAN_FILENAME, inspect_plan_shapes, load_heterogeneous_checkpoint,
 )
+from src.tokenizer_policy import resolve_tokenizer_policy
 
 DEFAULT_TASKS = (
     "hellaswag,mathqa,openbookqa,piqa,winogrande,arc_easy,arc_challenge"
@@ -59,6 +60,13 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def load_checkpoint(path: str, dtype):
     if os.path.isfile(os.path.join(path, PLAN_FILENAME)):
         model, plan = load_heterogeneous_checkpoint(
@@ -69,7 +77,7 @@ def load_checkpoint(path: str, dtype):
             raise AssertionError("heterogeneous checkpoint contains width padding")
         return model, plan, shapes
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=dtype, device_map="auto", trust_remote_code=True,
+        path, dtype=dtype, device_map="auto", trust_remote_code=True,
     )
     model.eval()
     return model, None, []
@@ -79,6 +87,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--label", required=True)
+    parser.add_argument("--tokenizer-audit", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--expected-harness-identity", required=True,
                         help="Exact lm-eval git commit, or package version if not a git checkout")
@@ -114,8 +123,12 @@ def main() -> None:
     )
     with open(verification_path, encoding="utf-8") as handle:
         checkpoint_verification = json.load(handle)
+    tokenizer_policy = resolve_tokenizer_policy(
+        args.tokenizer_audit, args.checkpoint, label=args.label,
+    )
     tokenizer = AutoTokenizer.from_pretrained(
         args.checkpoint, trust_remote_code=True, use_fast=True,
+        fix_mistral_regex=tokenizer_policy["fix_mistral_regex"],
     )
     model, plan, shape_audit = load_checkpoint(args.checkpoint, dtype)
     lm = HFLM(
@@ -142,6 +155,11 @@ def main() -> None:
         "seed_fewshot": args.seed, "apply_chat_template": False,
         "tokenizer_name_or_path": tokenizer.name_or_path,
         "tokenizer_class": type(tokenizer).__name__,
+        "fix_mistral_regex": tokenizer_policy["fix_mistral_regex"],
+        "tokenizer_audit_sha256": tokenizer_policy["tokenizer_audit_sha256"],
+        "tokenizer_files_combined_sha256": tokenizer_policy[
+            "tokenizer_files_combined_sha256"
+        ],
         "source_model_revision": checkpoint_verification.get(
             "source_model_revision", ""
         ),
@@ -151,6 +169,7 @@ def main() -> None:
         "checkpoint_verification_sha256": _sha256(verification_path),
         "limit": args.limit, "heterogeneous_plan_present": plan is not None,
         "shape_audit": shape_audit,
+        "task_configs_sha256": _canonical_sha256(results.get("configs", {})),
     }
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "x", encoding="utf-8") as handle:

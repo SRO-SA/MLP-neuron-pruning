@@ -6,7 +6,10 @@ import subprocess
 import sys
 
 from scripts.build_paper_v3_release_manifest import index_paths
-from scripts.summarize_paper_v3_downstream import paired_bootstrap_accuracy
+from scripts.summarize_paper_v3_downstream import (
+    flatten_paired_comparison, paired_bootstrap_accuracy,
+)
+from scripts.summarize_paper_v3_systems import collect as collect_systems
 
 
 class PostMilestoneDryRunTests(unittest.TestCase):
@@ -30,6 +33,59 @@ class PostMilestoneDryRunTests(unittest.TestCase):
         self.assertAlmostEqual(result["task"]["difference"], 0.75)
         self.assertGreaterEqual(result["task"]["ci95_lower"], 0.0)
 
+    def test_flattened_paired_comparison_marks_direction(self):
+        rows = flatten_paired_comparison("ellipsoid", "activation", "selector", {
+            "piqa": {"difference": 0.02, "ci95_lower": 0.01,
+                     "ci95_upper": 0.03, "n_examples": 100},
+        })
+        self.assertTrue(rows[0]["significant_95pct"])
+        self.assertEqual(rows[0]["favored_label_if_significant"], "ellipsoid")
+
+    def test_systems_summary_computes_real_baseline_improvements(self):
+        with tempfile.TemporaryDirectory() as root:
+            for label, storage, latency, throughput in (
+                ("baseline_unpruned", 1000, 10.0, 100.0),
+                ("target6", 900, 9.0, 110.0),
+            ):
+                directory = os.path.join(root, label)
+                os.makedirs(directory)
+                payload = {
+                    "label": label, "dtype": "bfloat16",
+                    "checkpoint_storage_bytes": storage,
+                    "load_time_seconds": latency,
+                    "successful_load": True,
+                    "after_load_allocated_bytes_total": storage,
+                    "peak_inference_allocated_bytes_total": storage,
+                    "nvidia_smi": "gpu", "torch_version": "x",
+                    "cuda_runtime_version": "x", "transformers_version": "x",
+                    "inference_engine": "test",
+                    "reduced_intermediate_dimensions_executed": True,
+                    "runtime_moe_execution_evidence": {
+                        "all_packed_moe_layers_executed": True,
+                    },
+                    "cases": [{
+                        "batch_size": 1, "prompt_length_tokens": 128,
+                        "prefill_latency_median_ms": latency,
+                        "prefill_latency_stdev_ms": 0.1,
+                        "prefill_tokens_per_second_median": throughput,
+                        "decode_latency_per_token_median_ms": latency,
+                        "decode_latency_per_token_stdev_ms": 0.1,
+                        "decode_tokens_per_second_median": throughput,
+                        "warmup_repetitions": 3, "timed_repetitions": 10,
+                    }],
+                }
+                with open(os.path.join(directory, "systems.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+            rows, _ = collect_systems(root)
+            target = next(row for row in rows if row["label"] == "target6")
+            self.assertAlmostEqual(
+                target["prefill_latency_reduction_vs_baseline_pct"], 10.0
+            )
+            self.assertAlmostEqual(
+                target["prefill_throughput_gain_vs_baseline_pct"], 10.0
+            )
+
     def test_release_index_hashes_without_editing_source(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "evidence.csv")
@@ -52,6 +108,9 @@ class PostMilestoneDryRunTests(unittest.TestCase):
                 text = handle.read()
             self.assertIn("DRY_RUN", text, name)
             self.assertIn("refusing", text, name)
+        for name in ("run_paper_v3_downstream.sh", "run_paper_v3_systems.sh"):
+            with open(os.path.join("scripts", name), encoding="utf-8") as handle:
+                self.assertIn("TOKENIZER_AUDIT", handle.read(), name)
 
     def test_heapr_patch_changes_reporting_not_pruning_call(self):
         with tempfile.TemporaryDirectory() as root:

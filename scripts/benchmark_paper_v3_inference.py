@@ -18,8 +18,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 from src.heterogeneous_moe_checkpoint import (
-    PLAN_FILENAME, inspect_plan_shapes, load_heterogeneous_checkpoint,
+    PLAN_FILENAME, find_decoder_layers, inspect_plan_shapes,
+    load_heterogeneous_checkpoint,
 )
+from src.tokenizer_policy import resolve_tokenizer_policy
 
 
 def _dtype(name: str):
@@ -119,7 +121,94 @@ def benchmark_case(model, tokenizer, *, batch: int, prompt_len: int,
     result["decode_tokens_per_second_median"] = (
         batch * 1000.0 / result["decode_latency_per_token_median_ms"]
     )
+    result["prefill_latency_samples_ms"] = prefill
+    result["decode_latency_per_token_samples_ms"] = decode_steps
     return result
+
+
+def collect_moe_execution_evidence(model, tokenizer) -> dict:
+    """Run one untimed forward and record the packed tensors actually invoked."""
+    records: dict[int, dict] = {}
+    handles = []
+    for layer_idx, layer in enumerate(find_decoder_layers(model)):
+        mlp = getattr(layer, "mlp", None)
+        experts = getattr(mlp, "experts", None)
+        gate_up = getattr(experts, "gate_up_proj", None)
+        down = getattr(experts, "down_proj", None)
+        if not isinstance(gate_up, torch.Tensor) or not isinstance(down, torch.Tensor):
+            continue
+        width = int(down.shape[2])
+        record = {
+            "layer_idx": layer_idx, "module_class": type(experts).__name__,
+            "call_count": 0, "gate_up_proj_shape": list(gate_up.shape),
+            "down_proj_shape": list(down.shape), "intermediate_width": width,
+            "device": str(gate_up.device), "input_hidden_shapes": [],
+            "routing_count_summaries": [],
+        }
+        records[layer_idx] = record
+
+        def pre_hook(_module, inputs, *, target=record):
+            target["call_count"] += 1
+            tensor_inputs = [value for value in inputs if isinstance(value, torch.Tensor)]
+            if tensor_inputs:
+                target["input_hidden_shapes"].append(list(tensor_inputs[0].shape))
+            route = next((value for value in tensor_inputs[1:] if value.dtype in (
+                torch.int8, torch.int16, torch.int32, torch.int64,
+            )), None)
+            if route is not None:
+                counts = torch.bincount(
+                    route.reshape(-1).long(), minlength=target["gate_up_proj_shape"][0]
+                ).detach().cpu()
+                positive = counts[counts > 0].float()
+                target["routing_count_summaries"].append({
+                    "routed_assignments": int(counts.sum()),
+                    "active_experts": int((counts > 0).sum()),
+                    "tokens_per_active_expert_min": (
+                        int(positive.min()) if positive.numel() else 0
+                    ),
+                    "tokens_per_active_expert_median": (
+                        float(positive.median()) if positive.numel() else 0.0
+                    ),
+                    "tokens_per_active_expert_max": (
+                        int(positive.max()) if positive.numel() else 0
+                    ),
+                })
+
+        handles.append(experts.register_forward_pre_hook(pre_hook))
+    if not records:
+        raise RuntimeError("no packed MoE expert modules found for runtime evidence")
+    device = model.get_input_embeddings().weight.device
+    inputs = _exact_inputs(tokenizer, batch=1, length=128, device=device)
+    try:
+        with torch.inference_mode():
+            model(**inputs, use_cache=False)
+        _sync()
+    finally:
+        for handle in handles:
+            handle.remove()
+    for record in records.values():
+        if record["call_count"] <= 0:
+            raise AssertionError(
+                f"packed MoE layer {record['layer_idx']} was not executed"
+            )
+        experts, doubled_width, hidden = record["gate_up_proj_shape"]
+        down_experts, down_hidden, width = record["down_proj_shape"]
+        if experts != down_experts or hidden != down_hidden or doubled_width != 2 * width:
+            raise AssertionError(f"incompatible packed expert shapes: {record}")
+        record["inferred_executed_gemm_dimensions"] = {
+            "gate_up": {"M": "routed tokens per expert", "K": hidden,
+                        "N": doubled_width},
+            "down": {"M": "routed tokens per expert", "K": width,
+                     "N": hidden},
+        }
+    return {
+        "evidence_type": "runtime forward-pre-hook on executed packed expert module",
+        "probe_batch_size": 1, "probe_prompt_length_tokens": 128,
+        "all_packed_moe_layers_executed": all(
+            row["call_count"] > 0 for row in records.values()
+        ),
+        "layers": [records[key] for key in sorted(records)],
+    }
 
 
 def _nvidia_info() -> str:
@@ -135,6 +224,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--label", required=True)
+    parser.add_argument("--tokenizer-audit", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", default="bfloat16",
                         choices=("bfloat16", "float16", "float32"))
@@ -156,7 +246,13 @@ def main() -> None:
         raise ValueError("checkpoint has not passed reload/logit verification")
 
     started = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
+    tokenizer_policy = resolve_tokenizer_policy(
+        args.tokenizer_audit, args.checkpoint, label=args.label,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.checkpoint, trust_remote_code=True,
+        fix_mistral_regex=tokenizer_policy["fix_mistral_regex"],
+    )
     dtype = _dtype(args.dtype)
     plan_path = os.path.join(args.checkpoint, PLAN_FILENAME)
     if os.path.isfile(plan_path):
@@ -166,12 +262,29 @@ def main() -> None:
         shape_audit = inspect_plan_shapes(model, plan)
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            args.checkpoint, torch_dtype=dtype, device_map="auto",
+            args.checkpoint, dtype=dtype, device_map="auto",
             trust_remote_code=True,
         )
         model.eval(); shape_audit = []
     _sync(); load_seconds = time.perf_counter() - started
     after_load = _memory("after_load")
+    execution_evidence = collect_moe_execution_evidence(model, tokenizer)
+    expected_widths = {
+        int(row["layer_idx"]): int(row["expected_width"]) for row in shape_audit
+    }
+    runtime_widths = {
+        int(row["layer_idx"]): int(row["intermediate_width"])
+        for row in execution_evidence["layers"]
+    }
+    runtime_widths_match = (
+        not expected_widths
+        or (set(runtime_widths) == set(expected_widths) and all(
+            runtime_widths[layer_idx] == width
+            for layer_idx, width in expected_widths.items()
+        ))
+    )
+    if expected_widths and not runtime_widths_match:
+        raise AssertionError("runtime packed-MoE widths differ from pruning plan")
     _reset_peaks()
     cases = []
     for text in args.cases.split(","):
@@ -189,17 +302,26 @@ def main() -> None:
         )
     peak = _memory("peak_inference", peak=True)
     payload = {
-        "schema_version": 1, "label": args.label,
+        "schema_version": 2, "label": args.label,
         "checkpoint": os.path.realpath(args.checkpoint),
         "checkpoint_storage_bytes": verification["serialized_weight_bytes"],
         "checkpoint_payload_bytes": verification[
             "checkpoint_payload_bytes_excluding_verification_manifest"
         ],
         "load_time_seconds": load_seconds, **after_load, **peak,
+        "successful_load": True,
         "dtype": args.dtype, "torch_version": torch.__version__,
         "cuda_runtime_version": torch.version.cuda,
         "transformers_version": transformers.__version__,
         "inference_engine": "transformers eager/SDPA as configured by checkpoint",
+        "model_class": type(model).__name__,
+        "attention_implementation": str(
+            getattr(model.config, "_attn_implementation", "")
+        ),
+        "hf_device_map": {
+            str(key): str(value)
+            for key, value in (getattr(model, "hf_device_map", {}) or {}).items()
+        },
         "nvidia_smi": _nvidia_info(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "kernel_environment": {key: os.environ.get(key, "") for key in (
@@ -209,8 +331,15 @@ def main() -> None:
         "reduced_intermediate_dimensions_executed": (
             bool(shape_audit) and all(row["actual_width"] == row["expected_width"]
                                       for row in shape_audit)
-        ) if os.path.isfile(plan_path) else True,
-        "shape_audit": shape_audit, "cases": cases,
+            and runtime_widths_match
+            and execution_evidence["all_packed_moe_layers_executed"]
+        ) if os.path.isfile(plan_path) else execution_evidence[
+            "all_packed_moe_layers_executed"
+        ],
+        "tokenizer_policy": tokenizer_policy,
+        "shape_audit": shape_audit,
+        "runtime_moe_execution_evidence": execution_evidence,
+        "cases": cases,
         "moe_gemm_microbenchmark": {
             "available": False,
             "reason": "No architecture-stable isolated Qwen3 packed-MoE GEMM hook is present; end-to-end prefill/decode are reported.",

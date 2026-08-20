@@ -81,6 +81,33 @@ def paired_bootstrap_accuracy(
     return result
 
 
+def flatten_paired_comparison(
+    first_label: str, second_label: str, comparison_type: str,
+    paired: dict,
+) -> list[dict]:
+    rows = []
+    for task, stat in sorted(paired.items()):
+        lower, upper = stat["ci95_lower"], stat["ci95_upper"]
+        rows.append({
+            "comparison_type": comparison_type,
+            "first_label": first_label, "second_label": second_label,
+            "difference_definition": "first_label minus second_label accuracy",
+            "task": task,
+            "metric": (
+                "task_macro_average" if task == "macro_average"
+                else TASK_METRICS[task]
+            ),
+            "accuracy_difference": stat["difference"],
+            "ci95_lower": lower, "ci95_upper": upper,
+            "significant_95pct": bool(lower > 0 or upper < 0),
+            "favored_label_if_significant": (
+                first_label if lower > 0 else second_label if upper < 0 else ""
+            ),
+            "n_examples": stat["n_examples"],
+        })
+    return rows
+
+
 def load_run(path: str) -> dict:
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -138,6 +165,35 @@ def _write_latex(path: str, rows: list[dict]) -> None:
         handle.write("\\bottomrule\n\\end{tabular}\n")
 
 
+def _write_paired_markdown(path: str, rows: list[dict]) -> None:
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write("| Type | First | Second | Task | Accuracy difference | Paired 95% CI | Significant |\n")
+        handle.write("|---|---|---|---|---:|---|---|\n")
+        for row in rows:
+            handle.write(
+                f"| {row['comparison_type']} | {row['first_label']} | "
+                f"{row['second_label']} | {row['task']} | "
+                f"{float(row['accuracy_difference']):+.4f} | "
+                f"[{float(row['ci95_lower']):.4f}, {float(row['ci95_upper']):.4f}] | "
+                f"{row['significant_95pct']} |\n"
+            )
+
+
+def _write_paired_latex(path: str, rows: list[dict]) -> None:
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write("\\begin{tabular}{llllrrl}\n\\toprule\n")
+        handle.write("Type & First & Second & Task & $\\Delta$acc & 95\\% CI & Sig. \\\\\n\\midrule\n")
+        for row in rows:
+            values = (
+                row["comparison_type"], row["first_label"], row["second_label"],
+                row["task"], f"{float(row['accuracy_difference']):+.4f}",
+                f"[{float(row['ci95_lower']):.4f}, {float(row['ci95_upper']):.4f}]",
+                row["significant_95pct"],
+            )
+            handle.write(" & ".join(_latex(value) for value in values) + " \\\\\n")
+        handle.write("\\bottomrule\n\\end{tabular}\n")
+
+
 def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
     loaded = {}
     for spec in specs:
@@ -146,12 +202,13 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
     baseline_label = "baseline_unpruned"
     baseline = loaded[baseline_label]
     protocol_keys = (
-        "harness", "tasks", "num_fewshot", "batch_size", "dtype",
+        "harness", "tasks", "task_versions", "num_fewshot", "batch_size", "dtype",
         "seed_python", "seed_numpy", "seed_torch", "seed_fewshot",
         "apply_chat_template", "tokenizer_class", "source_model_revision",
-        "tokenizer_revision",
+        "tokenizer_revision", "fix_mistral_regex", "tokenizer_audit_sha256",
+        "tokenizer_files_combined_sha256", "task_configs_sha256",
     )
-    rows, comparisons = [], []
+    rows, comparisons, paired_rows = [], [], []
     for spec in specs:
         label = spec["label"]
         run = loaded[label]
@@ -206,7 +263,43 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
         if paired:
             comparisons.append({"label": label, "versus": baseline_label,
                                 "paired": paired})
-    return rows, comparisons, baseline["protocol"]
+            paired_rows.extend(flatten_paired_comparison(
+                label, baseline_label, "checkpoint_vs_baseline", paired
+            ))
+
+    target6 = [spec for spec in specs if int(round(float(spec["target_pct"]))) == 6]
+    ellipsoid = [spec for spec in target6 if spec.get("ranking_source") ==
+                 "rmsnorm_ellipsoid_bound"]
+    competitors = [spec for spec in target6 if spec.get("ranking_source") in
+                   ("activation_score", "rmsnorm_bound")]
+    if competitors:
+        if len(ellipsoid) != 1:
+            raise ValueError("target-6 selector attribution requires one ellipsoid checkpoint")
+        first_label = ellipsoid[0]["label"]
+        first = loaded[first_label]
+        for spec in competitors:
+            second_label = spec["label"]
+            second = loaded[second_label]
+            if set(first["samples"]) != set(second["samples"]):
+                raise ValueError(f"selector task sets differ: {first_label} {second_label}")
+            for task in first["samples"]:
+                if first["identities"][task] != second["identities"][task]:
+                    raise ValueError(
+                        f"selector paired identities differ: {task} "
+                        f"{first_label} {second_label}"
+                    )
+            paired = paired_bootstrap_accuracy(
+                first["samples"], second["samples"],
+                n_resamples=n_resamples, seed=42,
+            )
+            comparisons.append({
+                "label": first_label, "versus": second_label,
+                "comparison_type": "target6_selector_attribution", "paired": paired,
+            })
+            paired_rows.extend(flatten_paired_comparison(
+                first_label, second_label, "target6_selector_attribution", paired
+            ))
+    return rows, comparisons, paired_rows, baseline["protocol"]
 
 
 def main() -> None:
@@ -220,7 +313,7 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.checkpoint_manifest, encoding="utf-8") as handle:
         specs = json.load(handle)
-    rows, comparisons, protocol = summarize(
+    rows, comparisons, paired_rows, protocol = summarize(
         specs, args.run_dir, args.bootstrap_resamples
     )
     os.makedirs(args.output_dir)
@@ -231,9 +324,20 @@ def main() -> None:
     with open(os.path.join(args.output_dir, "downstream_benchmark_table.json"),
               "x", encoding="utf-8") as handle:
         json.dump({"protocol": protocol, "rows": rows,
-                   "paired_comparisons": comparisons}, handle, indent=2)
+                   "paired_comparisons": comparisons,
+                   "paired_comparison_rows": paired_rows}, handle, indent=2)
+    paired_csv = os.path.join(args.output_dir, "downstream_paired_comparisons.csv")
+    with open(paired_csv, "x", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(paired_rows[0]))
+        writer.writeheader(); writer.writerows(paired_rows)
     _write_markdown(os.path.join(args.output_dir, "downstream_benchmark_table.md"), rows)
     _write_latex(os.path.join(args.output_dir, "downstream_benchmark_table.tex"), rows)
+    _write_paired_markdown(
+        os.path.join(args.output_dir, "downstream_paired_comparisons.md"), paired_rows
+    )
+    _write_paired_latex(
+        os.path.join(args.output_dir, "downstream_paired_comparisons.tex"), paired_rows
+    )
     print(f"[downstream-summary] OK: {len(rows)} rows; {csv_path}")
 
 

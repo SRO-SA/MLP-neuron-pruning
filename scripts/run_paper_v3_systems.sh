@@ -4,11 +4,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MANIFEST="${MANIFEST:?set MANIFEST to checkpoint_specs.json}"
+TOKENIZER_AUDIT="${TOKENIZER_AUDIT:?set TOKENIZER_AUDIT to tokenizer_audit.json}"
 RUN_DIR="${RUN_DIR:?set a new RUN_DIR}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 INCLUDE8="${INCLUDE8:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 CASES="${CASES:-1x128,1x512,1x2048,2x512,4x512}"
+DECODE_TOKENS="${DECODE_TOKENS:-32}"
+WARMUPS="${WARMUPS:-3}"
+REPETITIONS="${REPETITIONS:-10}"
 ONLY_TARGETS="${ONLY_TARGETS:-}"
 if [ -f "${VENV}/bin/activate" ]; then source "${VENV}/bin/activate"; fi
 if [ "${DRY_RUN}" != "1" ] && [ -e "${RUN_DIR}" ]; then
@@ -31,7 +35,10 @@ while IFS=$'\t' read -r label checkpoint target comparator; do
     mkdir -p "${RUN_DIR}/${label}"
     python3 scripts/benchmark_paper_v3_inference.py \
       --checkpoint "${checkpoint}" --label "${label}" \
+      --tokenizer-audit "${TOKENIZER_AUDIT}" \
       --output "${RUN_DIR}/${label}/systems.json" --cases "${CASES}" \
+      --decode-tokens "${DECODE_TOKENS}" --warmups "${WARMUPS}" \
+      --repetitions "${REPETITIONS}" \
       2>&1 | tee "${RUN_DIR}/${label}/run.log"
   fi
 done < <(python3 - "${MANIFEST}" <<'PY'
