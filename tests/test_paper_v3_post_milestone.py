@@ -10,6 +10,19 @@ from scripts.summarize_paper_v3_downstream import paired_bootstrap_accuracy
 
 
 class PostMilestoneDryRunTests(unittest.TestCase):
+    def test_direct_reporting_entrypoints_can_import_repo_modules(self):
+        for name in (
+            "summarize_moe_aggregation_frontier.py",
+            "compare_heapr_downstream.py",
+        ):
+            completed = subprocess.run(
+                [sys.executable, os.path.join("scripts", name), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_paired_accuracy_uses_matched_examples(self):
         first = {"task": [1.0, 1.0, 0.0, 1.0]}
         second = {"task": [0.0, 0.0, 0.0, 0.0]}
