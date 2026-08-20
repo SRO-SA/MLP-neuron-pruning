@@ -27,6 +27,7 @@ DEFAULT_EVALUATION_CODE = (
     "scripts/summarize_paper_v3_downstream.py",
     "scripts/benchmark_paper_v3_inference.py",
     "scripts/summarize_paper_v3_systems.py",
+    "src/dataset_code_policy.py",
     "src/heterogeneous_moe_checkpoint.py",
     "src/evaluation.py",
 )

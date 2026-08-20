@@ -206,7 +206,7 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
         "seed_python", "seed_numpy", "seed_torch", "seed_fewshot",
         "apply_chat_template", "tokenizer_class", "source_model_revision",
         "tokenizer_revision", "selected_tokenizer_mode", "fix_mistral_regex",
-        "tokenizer_audit_sha256",
+        "tokenizer_audit_sha256", "trust_dataset_code", "dataset_code_tasks",
         "tokenizer_files_combined_sha256", "task_configs_sha256",
     )
     rows, comparisons, paired_rows = [], [], []

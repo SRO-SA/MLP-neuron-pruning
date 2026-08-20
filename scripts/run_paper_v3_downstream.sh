@@ -14,9 +14,15 @@ SEED="${SEED:-42}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE_LIMIT="${SMOKE_LIMIT:-}"
 INCLUDE_OPTIONAL="${INCLUDE_OPTIONAL:-0}"
+TRUST_DATASET_CODE="${TRUST_DATASET_CODE:?set TRUST_DATASET_CODE=1 to authorize the pinned MathQA dataset script}"
 ONLY_TARGETS="${ONLY_TARGETS:-}"
 SKIP_SUMMARY="${SKIP_SUMMARY:-0}"
 LM_EVAL_IDENTITY="${LM_EVAL_IDENTITY:?set the pinned lm-eval git commit or package version}"
+
+case "${TRUST_DATASET_CODE}" in
+  0|1) ;;
+  *) echo "[downstream] ERROR: TRUST_DATASET_CODE must be 0 or 1"; exit 1 ;;
+esac
 
 if [ -f "${VENV}/bin/activate" ]; then source "${VENV}/bin/activate"; fi
 if [ "${DRY_RUN}" != "1" ] && [ -e "${RUN_DIR}" ]; then
@@ -40,6 +46,7 @@ while IFS=$'\t' read -r label checkpoint target; do
         --expected-harness-identity "${HARNESS_ID}"
         --batch-size "${BATCH_SIZE}" --dtype "${DTYPE}" --seed "${SEED}")
   if [ "${INCLUDE_OPTIONAL}" = "1" ]; then args+=(--include-optional); fi
+  if [ "${TRUST_DATASET_CODE}" = "1" ]; then args+=(--trust-dataset-code); fi
   if [ -n "${SMOKE_LIMIT}" ]; then args+=(--limit "${SMOKE_LIMIT}"); fi
   if [ "${DRY_RUN}" = "1" ]; then
     echo "[downstream] WOULD RUN ${label}: ${checkpoint}"

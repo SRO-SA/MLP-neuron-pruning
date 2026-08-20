@@ -20,13 +20,12 @@ if REPO_ROOT not in sys.path:
 from src.heterogeneous_moe_checkpoint import (
     PLAN_FILENAME, inspect_plan_shapes, load_heterogeneous_checkpoint,
 )
+from src.dataset_code_policy import configure_dataset_code_trust
 from src.tokenizer_policy import resolve_tokenizer_policy
 
 DEFAULT_TASKS = (
     "hellaswag,mathqa,openbookqa,piqa,winogrande,arc_easy,arc_challenge"
 )
-
-
 def harness_identity() -> dict:
     import lm_eval
 
@@ -98,6 +97,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", default="bfloat16",
                         choices=("bfloat16", "float16", "float32"))
+    parser.add_argument(
+        "--trust-dataset-code", action="store_true",
+        help="Authorize pinned task dataset scripts (currently MathQA only)",
+    )
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
     if os.path.exists(args.output):
@@ -112,6 +115,9 @@ def main() -> None:
     tasks = [item.strip() for item in args.tasks.split(",") if item.strip()]
     if args.include_optional:
         tasks.extend(task for task in ("boolq", "rte") if task not in tasks)
+    dataset_code_policy = configure_dataset_code_trust(
+        tasks, allow=args.trust_dataset_code,
+    )
 
     import lm_eval
     from lm_eval.models.huggingface import HFLM
@@ -148,6 +154,7 @@ def main() -> None:
     results["paper_v3_protocol"] = {
         "schema_version": 1, "checkpoint": os.path.realpath(args.checkpoint),
         "label": args.label, "harness": identity, "tasks": tasks,
+        **dataset_code_policy,
         "task_versions": results.get("versions", {}),
         "num_fewshot": args.num_fewshot, "batch_size": args.batch_size,
         "dtype": args.dtype, "seed_python": args.seed,
