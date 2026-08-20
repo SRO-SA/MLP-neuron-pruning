@@ -1469,16 +1469,24 @@ def _aggregate_expert_scores(
 
     aggregation options
     -------------------
-    p95               : 95th-percentile over experts (conservative — channel
-                        must be weak for 95% of experts to be pruned)
+    p90/p95/p97.5/p99 : named percentiles over experts.  These are ranking
+                        heuristics, not uniform all-expert certificates.
     max               : maximum over experts (even more conservative)
     router_weighted_mean : route-traffic-weighted average
     mean              : plain average (fallback / least conservative)
     """
     if aggregation == "max":
         return stacked.max(dim=0).values
-    if aggregation == "p95":
-        return torch.quantile(stacked.float(), 0.95, dim=0)
+    percentile_aggregations = {
+        "p90": 0.90,
+        "p95": 0.95,
+        "p97.5": 0.975,
+        "p99": 0.99,
+    }
+    if aggregation in percentile_aggregations:
+        return torch.quantile(
+            stacked.float(), percentile_aggregations[aggregation], dim=0
+        )
     if aggregation == "router_weighted_mean" and routing_weights is not None:
         w = routing_weights.float()
         total = w.sum()
@@ -2812,13 +2820,14 @@ def run_moe_target_pruning_mode(
                 "allocation/ranking experiments require global "
                 "packed_same_channel pruning"
             )
-        if chan_agg not in {"p95", "max"}:
+        if chan_agg not in {"p90", "p95", "p97.5", "p99", "max"}:
             raise ValueError(
-                "allocation/ranking experiments require p95 or max aggregation"
+                "allocation/ranking experiments require one of "
+                "p90, p95, p97.5, p99, or max aggregation"
             )
-        if chan_agg == "max" and ranking_source_cfg != "rmsnorm_ellipsoid_bound":
+        if chan_agg != "p95" and ranking_source_cfg != "rmsnorm_ellipsoid_bound":
             raise ValueError(
-                "the bounded aggregation ablation permits max only for "
+                "the bounded aggregation ablation permits non-p95 aggregation only for "
                 "rmsnorm_ellipsoid_bound ranking"
             )
         if len(TARGET_PCTS) != 1:

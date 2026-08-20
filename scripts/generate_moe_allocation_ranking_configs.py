@@ -128,6 +128,18 @@ PROFILE_EXPERIMENTS = {
         _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
               "rmsnorm_alloc2288__ellipsoid_rank__max", "max", 2288),
     ],
+    "target6_aggregation_limited": [
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__p90", "p90", 2288),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__p95", "p95", 2288),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__p97p5", "p97.5", 2288),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__p99", "p99", 2288),
+        _cell(6, "rmsnorm_bound", "rmsnorm_ellipsoid_bound",
+              "rmsnorm_alloc2288__ellipsoid_rank__max", "max", 2288),
+    ],
     "target8_rmsnorm_primary": [
         _cell(8, "rmsnorm_bound", "rmsnorm_bound",
               "rmsnorm_alloc__rmsnorm_rank"),

@@ -456,6 +456,13 @@ class ConfigGeneratorTests(unittest.TestCase):
         aggregation = profiles["target6_aggregation_rmsnorm"]
         self.assertEqual({cell["aggregation"] for cell in aggregation}, {"p95", "max"})
         self.assertEqual({cell["exact_total"] for cell in aggregation}, {2288})
+        limited = profiles["target6_aggregation_limited"]
+        self.assertEqual(len(limited), 5)
+        self.assertEqual(
+            {cell["aggregation"] for cell in limited},
+            {"p90", "p95", "p97.5", "p99", "max"},
+        )
+        self.assertEqual({cell["exact_total"] for cell in limited}, {2288})
         target4_aggregation = profiles["target4_aggregation_rmsnorm"]
         self.assertEqual(
             {cell["exact_total"] for cell in target4_aggregation}, {1600}

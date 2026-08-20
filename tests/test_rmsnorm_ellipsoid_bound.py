@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from src.moe_pruning import (
     MoELayerInfo,
     PackedExpertView,
+    _aggregate_expert_scores,
     _score_expert_moe,
     collect_moe_bound_comparison_scores,
     compute_rmsnorm_ellipsoid_scores_for_expert,
@@ -77,6 +78,14 @@ def _copy_expert_weights(
 
 
 class RMSNormEllipsoidMathTests(unittest.TestCase):
+    def test_limited_percentile_aggregations_match_torch_quantile(self) -> None:
+        scores = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        for name, quantile in (("p90", 0.90), ("p95", 0.95),
+                               ("p97.5", 0.975), ("p99", 0.99)):
+            actual = _aggregate_expert_scores(scores, name)
+            expected = torch.quantile(scores, quantile, dim=0)
+            torch.testing.assert_close(actual, expected)
+
     def test_sampled_rmsnorm_contributions_are_bounded(self) -> None:
         torch.manual_seed(7)
         d_model, d_ff = 9, 6
