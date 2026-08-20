@@ -44,6 +44,52 @@ class TokenizerPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_tokenizer_policy(audit_path, root, label="missing")
 
+    def test_accepts_audited_current_mode_without_regex_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = os.path.join(root, "checkpoint")
+            os.makedirs(checkpoint)
+            audit_path = os.path.join(root, "audit.json")
+            with open(audit_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "decision": {
+                        "audit_passed_for_downstream": True,
+                        "selected_tokenizer_mode": "current",
+                        "use_fix_mistral_regex_for_future_evaluation": False,
+                        "previous_ppl_rerun_required": False,
+                    },
+                    "sources": [{
+                        "label": "frozen", "source": checkpoint,
+                        "tokenizer_files_combined_sha256": "files-hash",
+                    }],
+                }, handle)
+            policy = resolve_tokenizer_policy(
+                audit_path, checkpoint, label="frozen"
+            )
+            self.assertFalse(policy["fix_mistral_regex"])
+            self.assertEqual(policy["selected_tokenizer_mode"], "current")
+
+    def test_rejects_conflicting_selected_mode_and_boolean_policy(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = os.path.join(root, "checkpoint")
+            os.makedirs(checkpoint)
+            audit_path = os.path.join(root, "audit.json")
+            with open(audit_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "decision": {
+                        "audit_passed_for_downstream": True,
+                        "selected_tokenizer_mode": "fixed",
+                        "use_fix_mistral_regex_for_future_evaluation": False,
+                    },
+                    "sources": [{
+                        "label": "frozen", "source": checkpoint,
+                        "tokenizer_files_combined_sha256": "files-hash",
+                    }],
+                }, handle)
+            with self.assertRaisesRegex(ValueError, "mode/policy conflict"):
+                resolve_tokenizer_policy(
+                    audit_path, checkpoint, label="frozen"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

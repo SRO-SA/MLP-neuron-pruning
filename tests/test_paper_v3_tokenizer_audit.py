@@ -55,6 +55,58 @@ class PaperV3TokenizerAuditTests(unittest.TestCase):
         decision = build_decision(rows)
         self.assertFalse(decision["previous_ppl_rerun_required"])
         self.assertTrue(decision["audit_passed_for_downstream"])
+        self.assertTrue(decision["use_fix_mistral_regex_for_future_evaluation"])
+
+    def test_false_positive_local_warning_preserves_current_qwen_mode(self):
+        rows = []
+        for collection in ("canary", "wikitext2", "c4"):
+            rows.extend([{
+                "relation": "current_vs_fixed",
+                "left_source": "hub_original",
+                "left_mode": "current", "right_mode": "fixed",
+                "collection": collection,
+                "token_id_mismatches": 0, "decoded_mismatches": 0,
+            }, {
+                "relation": "current_vs_fixed",
+                "left_source": "baseline_unpruned",
+                "left_mode": "current", "right_mode": "fixed",
+                "collection": collection,
+                "token_id_mismatches": 1, "decoded_mismatches": 1,
+            }, {
+                "relation": "original_vs_export",
+                "left_source": "hub_original",
+                "left_mode": "current", "right_source": "baseline_unpruned",
+                "right_mode": "current", "collection": collection,
+                "token_id_mismatches": 0, "decoded_mismatches": 0,
+            }, {
+                "relation": "original_vs_export",
+                "left_source": "hub_original",
+                "left_mode": "fixed", "right_source": "baseline_unpruned",
+                "right_mode": "fixed", "collection": collection,
+                "token_id_mismatches": 1, "decoded_mismatches": 1,
+            }])
+        decision = build_decision(rows)
+        self.assertTrue(decision["audit_passed_for_downstream"])
+        self.assertEqual(decision["selected_tokenizer_mode"], "current")
+        self.assertFalse(decision["use_fix_mistral_regex_for_future_evaluation"])
+        self.assertTrue(
+            decision["local_mistral_warning_consistent_with_false_positive"]
+        )
+        self.assertFalse(decision["previous_ppl_rerun_required"])
+
+    def test_neither_matching_mode_fails_closed(self):
+        rows = [{
+            "relation": "original_vs_export", "left_source": "hub_original",
+            "left_mode": mode, "right_source": "baseline_unpruned",
+            "right_mode": mode, "collection": "canary",
+            "token_id_mismatches": 1, "decoded_mismatches": 0,
+        } for mode in ("current", "fixed")]
+        decision = build_decision(rows)
+        self.assertFalse(decision["audit_passed_for_downstream"])
+        self.assertIsNone(decision["selected_tokenizer_mode"])
+        self.assertIsNone(
+            decision["use_fix_mistral_regex_for_future_evaluation"]
+        )
 
 
 if __name__ == "__main__":

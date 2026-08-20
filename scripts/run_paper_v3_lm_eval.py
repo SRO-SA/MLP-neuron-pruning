@@ -155,6 +155,7 @@ def main() -> None:
         "seed_fewshot": args.seed, "apply_chat_template": False,
         "tokenizer_name_or_path": tokenizer.name_or_path,
         "tokenizer_class": type(tokenizer).__name__,
+        "selected_tokenizer_mode": tokenizer_policy["selected_tokenizer_mode"],
         "fix_mistral_regex": tokenizer_policy["fix_mistral_regex"],
         "tokenizer_audit_sha256": tokenizer_policy["tokenizer_audit_sha256"],
         "tokenizer_files_combined_sha256": tokenizer_policy[

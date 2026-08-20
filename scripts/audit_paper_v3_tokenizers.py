@@ -191,6 +191,40 @@ def compare_records(
 def build_decision(rows: list[dict]) -> dict:
     fix_rows = [row for row in rows if row["relation"] == "current_vs_fixed"]
     export_rows = [row for row in rows if row["relation"] == "original_vs_export"]
+    def exports_match(mode: str) -> bool:
+        mode_rows = [row for row in export_rows if row["right_mode"] == mode]
+        return bool(mode_rows) and all(
+            row["token_id_mismatches"] == 0 and row["decoded_mismatches"] == 0
+            for row in mode_rows
+        )
+
+    current_matches = exports_match("current")
+    fixed_matches = exports_match("fixed")
+    # Preserve the tokenizer behavior used by the validated PPL experiments when
+    # it is identical across all exported checkpoints.  The Mistral repair is a
+    # fallback only when it is the mode that restores that equivalence.
+    if current_matches:
+        selected_mode = "current"
+        use_fix = False
+        selection_reason = (
+            "All exported checkpoint tokenizers exactly match the pinned hub "
+            "tokenizer without the Mistral regex repair. The historical/current "
+            "loading path is preserved."
+        )
+    elif fixed_matches:
+        selected_mode = "fixed"
+        use_fix = True
+        selection_reason = (
+            "The exported checkpoint tokenizers match the pinned hub tokenizer "
+            "only when the Mistral regex repair is enabled."
+        )
+    else:
+        selected_mode = None
+        use_fix = None
+        selection_reason = (
+            "Neither tokenizer loading mode makes every exported checkpoint "
+            "exactly match the pinned hub tokenizer."
+        )
     original_eval_fix_mismatches = sum(
         row["token_id_mismatches"] for row in fix_rows
         if row["left_source"] == "hub_original"
@@ -201,19 +235,12 @@ def build_decision(rows: list[dict]) -> dict:
         if row["left_source"] != "hub_original"
         if row["collection"] in ("wikitext2", "c4")
     )
+    ppl_rerun_required = bool(use_fix and original_eval_fix_mismatches > 0)
     return {
-        "audit_passed_for_downstream": all(
-            row["token_id_mismatches"] == 0 and row["decoded_mismatches"] == 0
-            for row in export_rows if row["right_mode"] == "fixed"
-        ),
-        "all_exports_match_original_current": all(
-            row["token_id_mismatches"] == 0 and row["decoded_mismatches"] == 0
-            for row in export_rows if row["right_mode"] == "current"
-        ),
-        "all_exports_match_original_fixed": all(
-            row["token_id_mismatches"] == 0 and row["decoded_mismatches"] == 0
-            for row in export_rows if row["right_mode"] == "fixed"
-        ),
+        "audit_passed_for_downstream": selected_mode is not None,
+        "selected_tokenizer_mode": selected_mode,
+        "all_exports_match_original_current": current_matches,
+        "all_exports_match_original_fixed": fixed_matches,
         "fix_changes_any_audited_token_ids": any(
             row["token_id_mismatches"] > 0 for row in fix_rows
         ),
@@ -223,14 +250,18 @@ def build_decision(rows: list[dict]) -> dict:
         "fix_changes_exported_wikitext2_or_c4_token_ids": (
             exported_eval_fix_mismatches > 0
         ),
-        "use_fix_mistral_regex_for_future_evaluation": True,
-        "previous_ppl_rerun_required": original_eval_fix_mismatches > 0,
+        "use_fix_mistral_regex_for_future_evaluation": use_fix,
+        "selection_reason": selection_reason,
+        "local_mistral_warning_consistent_with_false_positive": bool(
+            current_matches and not fixed_matches
+        ),
+        "previous_ppl_rerun_required": ppl_rerun_required,
         "previous_ppl_rerun_reason": (
             "Required: the hub tokenizer used by prior PPL runs changes token IDs "
             "on audited WikiText2/C4 passages when the regex repair is enabled."
-            if original_eval_fix_mismatches > 0 else
-            "Not required by this audit: no default/fixed token-ID mismatch was observed "
-            "for the hub tokenizer used by prior PPL runs on audited WikiText2/C4 passages."
+            if ppl_rerun_required else
+            "Not required: the selected tokenizer policy preserves the tokenization "
+            "used by the validated PPL experiments."
         ),
     }
 
@@ -239,7 +270,12 @@ def _write_markdown(path: str, rows: list[dict], decision: dict) -> None:
     with open(path, "x", encoding="utf-8") as handle:
         handle.write("# Tokenizer audit\n\n")
         handle.write(f"Audit passed for downstream: `{decision['audit_passed_for_downstream']}`  \n")
-        handle.write(f"Use `fix_mistral_regex=True`: `{decision['use_fix_mistral_regex_for_future_evaluation']}`  \n")
+        handle.write(f"Selected tokenizer mode: `{decision['selected_tokenizer_mode']}`  \n")
+        handle.write(
+            "Use `fix_mistral_regex=True`: "
+            f"`{decision['use_fix_mistral_regex_for_future_evaluation']}`  \n"
+        )
+        handle.write(f"Selection reason: {decision['selection_reason']}  \n")
         handle.write(f"Previous PPL rerun required: `{decision['previous_ppl_rerun_required']}`\n\n")
         handle.write("| Relation | Left | Right | Collection | Examples | ID mismatches | Decode mismatches |\n")
         handle.write("|---|---|---|---|---:|---:|---:|\n")
@@ -387,7 +423,7 @@ def main() -> None:
 
     decision = build_decision(rows)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "model": args.model,
         "checkpoint_manifest": os.path.realpath(args.checkpoint_manifest),
@@ -424,10 +460,14 @@ def main() -> None:
     _write_latex(os.path.join(args.output_dir, "tokenizer_audit.tex"), rows)
     if not decision["audit_passed_for_downstream"]:
         raise RuntimeError(
-            f"tokenizer audit completed but exported fixed tokenizers differ; inspect {json_path}"
+            "tokenizer audit completed but neither loading mode makes every "
+            f"exported tokenizer match the pinned hub tokenizer; inspect {json_path}"
         )
     print(
         f"[tokenizer-audit] OK: comparisons={len(rows)} "
+        f"selected_mode={decision['selected_tokenizer_mode']} "
+        f"fix_mistral_regex="
+        f"{decision['use_fix_mistral_regex_for_future_evaluation']} "
         f"fix_changes_original_eval="
         f"{decision['fix_changes_original_wikitext2_or_c4_token_ids']} "
         f"ppl_rerun_required={decision['previous_ppl_rerun_required']} JSON={json_path}"
