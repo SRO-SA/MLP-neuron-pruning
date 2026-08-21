@@ -6,8 +6,15 @@ import argparse
 import csv
 import json
 import os
+import sys
 
 import numpy as np
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from src.task_config_fingerprint import FINGERPRINT_VERSION, task_config_sha256
 
 
 TASK_METRICS = {
@@ -114,6 +121,18 @@ def load_run(path: str) -> dict:
     protocol = payload.get("paper_v3_protocol")
     if not protocol:
         raise ValueError(f"missing paper_v3_protocol: {path}")
+    protocol = dict(protocol)
+    stable_config_hash = task_config_sha256(payload.get("configs", {}))
+    recorded_version = protocol.get("task_configs_fingerprint")
+    if recorded_version == FINGERPRINT_VERSION:
+        if protocol.get("task_configs_sha256") != stable_config_hash:
+            raise ValueError(f"stable task config hash mismatch: {path}")
+    else:
+        protocol["task_configs_process_raw_sha256"] = protocol.get(
+            "task_configs_sha256", ""
+        )
+    protocol["task_configs_sha256"] = stable_config_hash
+    protocol["task_configs_fingerprint"] = FINGERPRINT_VERSION
     values, samples, identities = {}, {}, {}
     for task, metric in TASK_METRICS.items():
         if task not in payload.get("results", {}):
@@ -208,6 +227,7 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
         "tokenizer_revision", "selected_tokenizer_mode", "fix_mistral_regex",
         "tokenizer_audit_sha256", "trust_dataset_code", "dataset_code_tasks",
         "tokenizer_files_combined_sha256", "task_configs_sha256",
+        "task_configs_fingerprint",
     )
     rows, comparisons, paired_rows = [], [], []
     for spec in specs:

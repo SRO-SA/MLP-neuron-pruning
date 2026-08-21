@@ -21,6 +21,7 @@ from src.heterogeneous_moe_checkpoint import (
     PLAN_FILENAME, inspect_plan_shapes, load_heterogeneous_checkpoint,
 )
 from src.dataset_code_policy import configure_dataset_code_trust
+from src.task_config_fingerprint import FINGERPRINT_VERSION, task_config_sha256
 from src.tokenizer_policy import resolve_tokenizer_policy
 
 DEFAULT_TASKS = (
@@ -177,7 +178,11 @@ def main() -> None:
         "checkpoint_verification_sha256": _sha256(verification_path),
         "limit": args.limit, "heterogeneous_plan_present": plan is not None,
         "shape_audit": shape_audit,
-        "task_configs_sha256": _canonical_sha256(results.get("configs", {})),
+        "task_configs_sha256": task_config_sha256(results.get("configs", {})),
+        "task_configs_process_raw_sha256": _canonical_sha256(
+            results.get("configs", {})
+        ),
+        "task_configs_fingerprint": FINGERPRINT_VERSION,
     }
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "x", encoding="utf-8") as handle:
