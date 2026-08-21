@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -22,6 +23,7 @@ from src.heterogeneous_moe_checkpoint import (
     load_heterogeneous_checkpoint,
 )
 from src.tokenizer_policy import resolve_tokenizer_policy
+from src.system_evidence import shape_integers
 
 
 def _dtype(name: str):
@@ -211,6 +213,59 @@ def collect_moe_execution_evidence(model, tokenizer) -> dict:
     }
 
 
+def collect_operator_profile(
+    model, tokenizer, *, expected_widths: dict[int, int], trace_path: str,
+) -> dict:
+    """Capture one CUDA operator trace and retain GEMM-like input shapes."""
+    from torch.profiler import ProfilerActivity, profile
+
+    device = model.get_input_embeddings().weight.device
+    inputs = _exact_inputs(tokenizer, batch=1, length=128, device=device)
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    _sync()
+    with profile(activities=activities, record_shapes=True) as prof:
+        with torch.inference_mode():
+            model(**inputs, use_cache=False)
+        _sync()
+    os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+    prof.export_chrome_trace(trace_path)
+    operation_rows = []
+    shape_values = set()
+    needles = ("mm", "matmul", "bmm", "addmm", "einsum", "linear")
+    for event in prof.key_averages(group_by_input_shape=True):
+        key = str(getattr(event, "key", ""))
+        if not any(needle in key.lower() for needle in needles):
+            continue
+        shapes = getattr(event, "input_shapes", [])
+        shape_values.update(shape_integers(shapes))
+        operation_rows.append({
+            "operator": key, "input_shapes": shapes,
+            "calls": int(getattr(event, "count", 0)),
+            "cpu_time_total_us": float(getattr(event, "cpu_time_total", 0.0)),
+            "device_time_total_us": float(
+                getattr(event, "device_time_total", 0.0)
+            ),
+        })
+    unique_expected = sorted(set(expected_widths.values()))
+    matched = sorted(width for width in unique_expected if width in shape_values)
+    hasher = hashlib.sha256()
+    with open(trace_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
+    return {
+        "evidence_type": "torch.profiler CUDA/CPU operator trace with input shapes",
+        "trace_path": os.path.realpath(trace_path),
+        "trace_sha256": digest, "trace_size_bytes": os.path.getsize(trace_path),
+        "gemm_like_operator_groups": operation_rows,
+        "expected_unique_pruned_widths": unique_expected,
+        "matched_unique_pruned_widths_in_operator_shapes": matched,
+        "all_expected_pruned_widths_observed": (
+            set(matched) == set(unique_expected) if unique_expected else True
+        ),
+    }
+
+
 def _nvidia_info() -> str:
     try:
         return subprocess.check_output([
@@ -232,6 +287,8 @@ def main() -> None:
     parser.add_argument("--decode-tokens", type=int, default=32)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
+    parser.add_argument("--profile-gemm-shapes", action="store_true")
+    parser.add_argument("--profiler-trace")
     args = parser.parse_args()
     if os.path.exists(args.output):
         raise FileExistsError(f"refusing to overwrite {args.output}")
@@ -285,6 +342,25 @@ def main() -> None:
     )
     if expected_widths and not runtime_widths_match:
         raise AssertionError("runtime packed-MoE widths differ from pruning plan")
+    operator_profile = {
+        "enabled": False,
+        "reason": "Pass --profile-gemm-shapes for a CUDA operator trace.",
+    }
+    if args.profile_gemm_shapes:
+        trace_path = args.profiler_trace or os.path.splitext(args.output)[0] + ".trace.json.gz"
+        operator_profile = collect_operator_profile(
+            model, tokenizer, expected_widths=expected_widths,
+            trace_path=trace_path,
+        )
+        operator_profile["enabled"] = True
+        if expected_widths and not operator_profile[
+            "all_expected_pruned_widths_observed"
+        ]:
+            print(
+                "[systems] WARNING: operator trace did not expose every pruned "
+                "width; runtime module shapes remain validated, but do not claim "
+                "kernel-profiler confirmation from this run."
+            )
     _reset_peaks()
     cases = []
     for text in args.cases.split(","):
@@ -339,6 +415,7 @@ def main() -> None:
         "tokenizer_policy": tokenizer_policy,
         "shape_audit": shape_audit,
         "runtime_moe_execution_evidence": execution_evidence,
+        "operator_profile_evidence": operator_profile,
         "cases": cases,
         "moe_gemm_microbenchmark": {
             "available": False,

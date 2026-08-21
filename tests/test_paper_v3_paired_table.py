@@ -1,6 +1,11 @@
+import csv
+import os
+import tempfile
 import unittest
 
-from scripts.build_paper_v3_paired_table import PRIMARY_REQUESTS, normalize_comparison
+from scripts.build_paper_v3_paired_table import (
+    PRIMARY_REQUESTS, add_paired_inference, normalize_comparison,
+)
 
 
 class PaperV3PairedTableTests(unittest.TestCase):
@@ -52,6 +57,52 @@ class PaperV3PairedTableTests(unittest.TestCase):
         })
         self.assertFalse(row["significant_95pct"])
         self.assertEqual(row["favored_method_if_significant"], "")
+
+    def test_raw_paired_audit_adds_adjusted_p_values_and_ids(self):
+        with tempfile.TemporaryDirectory() as root:
+            nll_paths = {}
+            for experiment, values in (("ellipsoid", [1.0, 1.0, 1.0, 1.0]),
+                                       ("activation", [2.0, 2.0, 2.0, 2.0])):
+                path = os.path.join(root, f"{experiment}.csv")
+                with open(path, "w", newline="", encoding="utf-8") as handle:
+                    fields = ("dataset", "corpus_sha256", "sample_index",
+                              "n_tokens", "pruned_nll_sum")
+                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer.writeheader()
+                    for index, value in enumerate(values):
+                        writer.writerow({"dataset": "c4", "corpus_sha256": "abc",
+                                         "sample_index": index, "n_tokens": 1,
+                                         "pruned_nll_sum": value})
+                nll_paths[experiment] = path
+            summary = os.path.join(root, "allocation_ranking_summary.csv")
+            with open(summary, "w", newline="", encoding="utf-8") as handle:
+                fields = ("experiment_name", "dataset", "per_example_nll_path")
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for experiment in ("ellipsoid", "activation"):
+                    writer.writerow({"experiment_name": experiment, "dataset": "c4",
+                                     "per_example_nll_path": nll_paths[experiment]})
+            source = {
+                "comparison_type": "ranking", "source_group": "target4_test",
+                "source_run_dir": root, "dataset": "c4",
+                "allocation_source": "rmsnorm_bound",
+                "competitor_ranking": "activation_score",
+                "ellipsoid_experiment": "ellipsoid",
+                "competitor_experiment": "activation",
+                "ellipsoid_minus_competitor_mean_nll": "-1",
+                "ci95_lower": "-1", "ci95_upper": "-1",
+                "n_documents": "4", "n_tokens": "4",
+                "bootstrap_resamples": "1000",
+            }
+            output = normalize_comparison(source)
+            output.pop("request_key")
+            identifiers = add_paired_inference(
+                [output], [source], source_root=root,
+                randomization_replicates=1000, randomization_seed=5,
+            )
+            self.assertEqual(output["comparison_scope"], "primary")
+            self.assertIn("holm_adjusted_p_value", output)
+            self.assertEqual(len(identifiers["c4"]), 4)
 
 
 if __name__ == "__main__":

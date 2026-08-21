@@ -15,8 +15,46 @@ if REPO_ROOT not in sys.path:
 from src.experiment_provenance import file_sha256
 
 
+def select_additional_target6_downnorm_spec(run_dir: str, model: str) -> dict:
+    path = os.path.join(run_dir, "allocation_ranking_summary.csv")
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = [row for row in csv.DictReader(handle) if (
+            int(round(float(row["requested_pct"]))) == 6
+            and row["allocation_source"] == "rmsnorm_bound"
+            and row["ranking_source"] == "down_norm"
+            and row["ranking_aggregation"] == "p95"
+        )]
+    if not rows:
+        raise ValueError(f"no target-6 RMSNorm-allocation/down-norm-ranking row in {path}")
+    plan_paths = {row["pruning_plan_path"] for row in rows}
+    if len(plan_paths) != 1:
+        raise ValueError(f"target-6 down-norm rows use different plans: {plan_paths}")
+    for field in ("actual_pct", "layer_channels", "expert_neurons"):
+        if len({row[field] for row in rows}) != 1:
+            raise ValueError(f"target-6 down-norm rows differ in {field}")
+    plan_path = next(iter(plan_paths))
+    if not os.path.isfile(plan_path):
+        raise FileNotFoundError(plan_path)
+    digest = file_sha256(plan_path)
+    row = rows[0]
+    return {
+        "label": "rmsnorm_alloc__downnorm_rank__p95__target6",
+        "model": model, "plan_path": plan_path,
+        "target_pct": float(row["requested_pct"]),
+        "actual_pct": float(row["actual_pct"]),
+        "removed_layer_channels": int(float(row["layer_channels"])),
+        "removed_expert_neurons": int(float(row["expert_neurons"])),
+        "allocation_source": "rmsnorm_bound", "ranking_source": "down_norm",
+        "expert_aggregation": "p95", "plan_sha256": digest,
+        "downstream_comparator_only": True,
+        "source_run_dir": run_dir,
+    }
+
+
 def select_checkpoint_specs(
-    rows: list[dict], model: str, *, include_target6_comparators: bool = False
+    rows: list[dict], model: str, *, include_target6_comparators: bool = False,
+    include_target6_downnorm_if_available: bool = False,
+    include_target2_primary: bool = False,
 ) -> list[dict]:
     specs = [{
         "label": "baseline_unpruned", "model": model, "plan_path": "",
@@ -25,12 +63,13 @@ def select_checkpoint_specs(
         "ranking_source": "none", "expert_aggregation": "none",
         "plan_sha256": "",
     }]
-    for target in (4, 6, 8):
+    targets = ((2,) if include_target2_primary else ()) + (4, 6, 8)
+    for target in targets:
         matches = []
         for row in rows:
             primary_source = (
                 row["source_group"] == "frozen_2_4_6"
-                if target in (4, 6)
+                if target in (2, 4, 6)
                 else "target8_rmsnorm_primary" in row["source_group"]
             )
             if (
@@ -52,7 +91,7 @@ def select_checkpoint_specs(
         digest = file_sha256(plan_path)
         if row.get("pruning_plan_sha256") and row["pruning_plan_sha256"] != digest:
             raise ValueError(f"target {target} plan hash changed: {plan_path}")
-        specs.append({
+        spec = {
             "label": f"rmsnorm_alloc__ellipsoid_rank__p95__target{target}",
             "model": model, "plan_path": plan_path,
             "target_pct": float(row["requested_pct"]),
@@ -63,9 +102,15 @@ def select_checkpoint_specs(
             "ranking_source": row["ranking_source"],
             "expert_aggregation": row["expert_aggregation"],
             "plan_sha256": digest,
-        })
+        }
+        if target == 2:
+            spec["additional_operating_point"] = True
+        specs.append(spec)
     if include_target6_comparators:
-        for ranking in ("rmsnorm_bound", "activation_score"):
+        rankings = ["rmsnorm_bound", "activation_score"]
+        if include_target6_downnorm_if_available:
+            rankings.append("down_norm")
+        for ranking in rankings:
             matches = [row for row in rows if (
                 int(round(float(row["requested_pct"]))) == 6
                 and row["allocation_source"] == "rmsnorm_bound"
@@ -73,6 +118,8 @@ def select_checkpoint_specs(
                 and row["expert_aggregation"] == "p95"
                 and row["source_group"] == "frozen_2_4_6"
             )]
+            if ranking == "down_norm" and not matches:
+                continue
             if len(matches) != 1:
                 raise ValueError(
                     f"target 6 comparator {ranking} has {len(matches)} rows"
@@ -82,8 +129,9 @@ def select_checkpoint_specs(
             digest = file_sha256(plan_path)
             if row.get("pruning_plan_sha256") and row["pruning_plan_sha256"] != digest:
                 raise ValueError(f"target 6 comparator plan hash changed: {plan_path}")
+            ranking_label = "downnorm" if ranking == "down_norm" else ranking
             specs.append({
-                "label": f"rmsnorm_alloc__{ranking}_rank__p95__target6",
+                "label": f"rmsnorm_alloc__{ranking_label}_rank__p95__target6",
                 "model": model, "plan_path": plan_path,
                 "target_pct": float(row["requested_pct"]),
                 "actual_pct": float(row["actual_pct"]),
@@ -105,17 +153,41 @@ def main() -> None:
     parser.add_argument("--checkpoint-root", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
     parser.add_argument("--include-target6-comparators", action="store_true")
+    parser.add_argument("--include-target6-downnorm-if-available",
+                        action="store_true")
+    parser.add_argument("--include-target2-primary", action="store_true")
+    parser.add_argument("--additional-target6-downnorm-run-dir")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if os.path.exists(args.output):
+    if not args.dry_run and os.path.exists(args.output):
         raise FileExistsError(f"refusing to overwrite manifest: {args.output}")
     with open(args.summary_csv, newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     specs = select_checkpoint_specs(
         rows, args.model,
         include_target6_comparators=args.include_target6_comparators,
+        include_target6_downnorm_if_available=(
+            args.include_target6_downnorm_if_available
+        ),
+        include_target2_primary=args.include_target2_primary,
     )
+    if args.additional_target6_downnorm_run_dir:
+        if any(spec.get("ranking_source") == "down_norm" and
+               int(round(float(spec["target_pct"]))) == 6 for spec in specs):
+            raise ValueError("target-6 down-norm comparator was selected twice")
+        specs.append(select_additional_target6_downnorm_spec(
+            args.additional_target6_downnorm_run_dir, args.model
+        ))
     for spec in specs:
         spec["checkpoint_dir"] = os.path.join(args.checkpoint_root, spec["label"])
+    if args.dry_run:
+        for spec in specs:
+            print(
+                f"[checkpoint-manifest] WOULD INCLUDE {spec['label']}: "
+                f"{spec['checkpoint_dir']}"
+            )
+        print(f"[checkpoint-manifest] DRY RUN: {len(specs)} checkpoints")
+        return
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(specs, handle, indent=2)

@@ -21,6 +21,7 @@ FIELDS = [
     "torch_version", "cuda_runtime_version", "transformers_version",
     "inference_engine", "reduced_intermediate_dimensions_executed",
     "runtime_moe_shapes_confirmed",
+    "operator_profiler_enabled", "operator_profiler_widths_confirmed",
     "checkpoint_storage_reduction_vs_baseline_pct",
     "load_time_reduction_vs_baseline_pct",
     "load_hbm_reduction_vs_baseline_pct",
@@ -60,6 +61,12 @@ def collect(run_dir: str | list[str]) -> tuple[list[dict], list[dict]]:
             evidence = payload.get("runtime_moe_execution_evidence", {})
             row["runtime_moe_shapes_confirmed"] = bool(
                 evidence.get("all_packed_moe_layers_executed", False)
+            )
+            operator = payload.get("operator_profile_evidence", {})
+            row["operator_profiler_enabled"] = bool(operator.get("enabled", False))
+            row["operator_profiler_widths_confirmed"] = bool(
+                operator.get("enabled", False)
+                and operator.get("all_expected_pruned_widths_observed", False)
             )
             rows.append(row)
     if not rows:

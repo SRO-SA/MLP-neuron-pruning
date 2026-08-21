@@ -106,6 +106,10 @@ PROFILE_EXPERIMENTS = {
         _cell(6, "down_norm", "rmsnorm_ellipsoid_bound",
               "downnorm_alloc__ellipsoid_rank"),
     ],
+    "target6_rmsnorm_downnorm_ranking_only": [
+        _cell(6, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank"),
+    ],
     "target6_downnorm_primary": [
         _cell(6, "down_norm", "rmsnorm_bound",
               "downnorm_alloc__rmsnorm_rank"),

@@ -64,6 +64,42 @@ def paired_bootstrap_nll_difference(
     }
 
 
+def paired_signflip_nll_p_value(
+    candidate_nll_sums: Sequence[float],
+    reference_nll_sums: Sequence[float],
+    token_counts: Sequence[int],
+    *,
+    n_resamples: int = 10_000,
+    seed: int = 1_000_045,
+) -> float:
+    """Two-sided document-paired randomization p-value for token dNLL."""
+    candidate = np.asarray(candidate_nll_sums, dtype=np.float64)
+    reference = np.asarray(reference_nll_sums, dtype=np.float64)
+    tokens = np.asarray(token_counts, dtype=np.int64)
+    if not (candidate.ndim == reference.ndim == tokens.ndim == 1):
+        raise ValueError("paired sign-flip inputs must be one-dimensional")
+    if not (len(candidate) == len(reference) == len(tokens)) or not len(tokens):
+        raise ValueError("paired sign-flip inputs must have equal non-zero length")
+    if not np.isfinite(candidate).all() or not np.isfinite(reference).all():
+        raise ValueError("paired sign-flip NLL sums must be finite")
+    if np.any(tokens <= 0) or n_resamples <= 0:
+        raise ValueError("token counts and n_resamples must be positive")
+    differences = candidate - reference
+    denominator = float(tokens.sum())
+    observed = float(differences.sum() / denominator)
+    rng = np.random.default_rng(seed)
+    exceed = 0
+    for start in range(0, n_resamples, 256):
+        stop = min(start + 256, n_resamples)
+        signs = rng.integers(
+            0, 2, size=(stop - start, len(tokens)), dtype=np.int8
+        ).astype(np.float64)
+        signs = signs * 2.0 - 1.0
+        draws = (signs * differences).sum(axis=1) / denominator
+        exceed += int(np.count_nonzero(np.abs(draws) >= abs(observed) - 1e-15))
+    return (exceed + 1.0) / (n_resamples + 1.0)
+
+
 def write_paired_nll_csv(
     path: str,
     *,

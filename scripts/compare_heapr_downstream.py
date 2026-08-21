@@ -8,6 +8,8 @@ import json
 import os
 import sys
 
+import numpy as np
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -16,6 +18,7 @@ from scripts.summarize_paper_v3_downstream import (
     TASK_METRICS, _metric_value, _sample_identity, _sample_value,
     paired_bootstrap_accuracy,
 )
+from src.statistical_audit import apply_multiplicity_adjustments
 
 
 def _extract(payload: dict) -> tuple[dict, dict, dict]:
@@ -59,6 +62,18 @@ def main() -> None:
             heapr_eval_protocol["apply_chat_template"],
             base_protocol["apply_chat_template"],
         ),
+        "tokenizer_class": (
+            heapr_eval_protocol.get("tokenizer_class"),
+            base_protocol.get("tokenizer_class"),
+        ),
+        "selected_tokenizer_mode": (
+            heapr_eval_protocol.get("selected_tokenizer_mode"),
+            base_protocol.get("selected_tokenizer_mode"),
+        ),
+        "fix_mistral_regex": (
+            heapr_eval_protocol.get("fix_mistral_regex"),
+            base_protocol.get("fix_mistral_regex"),
+        ),
     }
     mismatches = {key: value for key, value in checks.items() if value[0] != value[1]}
     expected_dtype = f"torch.{base_protocol['dtype']}"
@@ -88,8 +103,23 @@ def main() -> None:
             "heapr_minus_baseline": stat["difference"],
             "ci95_lower": stat["ci95_lower"], "ci95_upper": stat["ci95_upper"],
             "significant_95pct": stat["ci95_lower"] > 0 or stat["ci95_upper"] < 0,
+            "paired_randomization_p_value": stat["paired_randomization_p_value"],
+            "multiplicity_family": "heapr_vs_baseline_downstream",
             "n_examples": stat["n_examples"],
         })
+    macro = paired["macro_average"]
+    rows.append({
+        "task": "macro_average", "metric": "task_macro_average",
+        "baseline_accuracy": float(np.mean(list(base_values.values()))),
+        "heapr_accuracy": float(np.mean(list(heapr_values.values()))),
+        "heapr_minus_baseline": macro["difference"],
+        "ci95_lower": macro["ci95_lower"], "ci95_upper": macro["ci95_upper"],
+        "significant_95pct": macro["ci95_lower"] > 0 or macro["ci95_upper"] < 0,
+        "paired_randomization_p_value": macro["paired_randomization_p_value"],
+        "multiplicity_family": "heapr_vs_baseline_downstream",
+        "n_examples": macro["n_examples"],
+    })
+    apply_multiplicity_adjustments(rows)
     os.makedirs(args.output_dir)
     with open(os.path.join(args.output_dir, "heapr_downstream_paired.csv"), "x",
               newline="", encoding="utf-8") as handle:

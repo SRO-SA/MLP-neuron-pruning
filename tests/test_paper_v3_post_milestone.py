@@ -122,6 +122,7 @@ class PostMilestoneDryRunTests(unittest.TestCase):
                     "def main():\n"
                     "    model.eval()\n"
                     "    pruning_global(model, cali_data, config, args, logger)\n"
+                    "    from lm_eval.tasks import TaskManager\n"
                     "    from lm_eval.utils import make_table\n"
                     "    results = lm_eval.simple_evaluate(\n"
                     "        hflm, tasks=tasks, batch_size=\"auto\", max_batch_size=256\n"

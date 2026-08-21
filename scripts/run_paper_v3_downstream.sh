@@ -17,6 +17,7 @@ INCLUDE_OPTIONAL="${INCLUDE_OPTIONAL:-0}"
 TRUST_DATASET_CODE="${TRUST_DATASET_CODE:?set TRUST_DATASET_CODE=1 to authorize the pinned MathQA dataset script}"
 ONLY_TARGETS="${ONLY_TARGETS:-}"
 SKIP_SUMMARY="${SKIP_SUMMARY:-0}"
+RUN_KIND="${RUN_KIND:-all}"
 LM_EVAL_IDENTITY="${LM_EVAL_IDENTITY:?set the pinned lm-eval git commit or package version}"
 
 case "${TRUST_DATASET_CODE}" in
@@ -32,7 +33,17 @@ fi
 HARNESS_ID="${LM_EVAL_IDENTITY}"
 echo "[downstream] lm-eval identity: ${HARNESS_ID}"
 
-while IFS=$'\t' read -r label checkpoint target; do
+case "${RUN_KIND}" in
+  all|primary_only|comparator_only|additional_only) ;;
+  *) echo "[downstream] ERROR: RUN_KIND must be all, primary_only, comparator_only, or additional_only"; exit 1 ;;
+esac
+
+while IFS=$'\t' read -r label checkpoint target comparator additional; do
+  case "${RUN_KIND}" in
+    comparator_only) [ "${comparator}" = "True" ] || continue ;;
+    additional_only) [ "${additional}" = "True" ] || continue ;;
+    primary_only) [ "${comparator}" != "True" ] && [ "${additional}" != "True" ] || continue ;;
+  esac
   if [ -n "${ONLY_TARGETS}" ]; then
     target_int="${target%%.*}"
     case ",${ONLY_TARGETS}," in
@@ -58,7 +69,11 @@ while IFS=$'\t' read -r label checkpoint target; do
 done < <(python3 - "${MANIFEST}" <<'PY'
 import json, sys
 for row in json.load(open(sys.argv[1])):
-    print(f"{row['label']}\t{row['checkpoint_dir']}\t{row['target_pct']}")
+    print(
+        f"{row['label']}\t{row['checkpoint_dir']}\t{row['target_pct']}\t"
+        f"{row.get('downstream_comparator_only', False)}\t"
+        f"{row.get('additional_operating_point', False)}"
+    )
 PY
 )
 

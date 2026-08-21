@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -15,6 +16,9 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.task_config_fingerprint import FINGERPRINT_VERSION, task_config_sha256
+from src.statistical_audit import (
+    apply_multiplicity_adjustments, paired_signflip_statistics,
+)
 
 
 TASK_METRICS = {
@@ -70,6 +74,9 @@ def paired_bootstrap_accuracy(
             stop = min(start + 1000, n_resamples)
             indices = rng.integers(0, len(delta), size=(stop - start, len(delta)))
             draws[task][start:stop] = delta[indices].mean(axis=1)
+    randomization = paired_signflip_statistics(
+        first, second, n_resamples=n_resamples, seed=seed + 1_000_003,
+    )
     result = {}
     for task in first:
         result[task] = {
@@ -77,6 +84,7 @@ def paired_bootstrap_accuracy(
             "ci95_lower": float(np.quantile(draws[task], 0.025)),
             "ci95_upper": float(np.quantile(draws[task], 0.975)),
             "n_examples": len(first[task]),
+            "paired_randomization_p_value": randomization[task],
         }
     macro_draw = np.vstack([draws[task] for task in sorted(draws)]).mean(axis=0)
     result["macro_average"] = {
@@ -84,6 +92,7 @@ def paired_bootstrap_accuracy(
         "ci95_lower": float(np.quantile(macro_draw, 0.025)),
         "ci95_upper": float(np.quantile(macro_draw, 0.975)),
         "n_examples": sum(len(first[task]) for task in first),
+        "paired_randomization_p_value": randomization["macro_average"],
     }
     return result
 
@@ -111,8 +120,50 @@ def flatten_paired_comparison(
                 first_label if lower > 0 else second_label if upper < 0 else ""
             ),
             "n_examples": stat["n_examples"],
+            "paired_randomization_p_value": stat.get(
+                "paired_randomization_p_value", ""
+            ),
         })
     return rows
+
+
+def _comparison_is_primary(row: dict) -> bool:
+    """Pre-declared small confirmatory family for the downstream milestone."""
+    if row["task"] != "macro_average":
+        return False
+    if row["comparison_type"] == "target6_selector_attribution":
+        return True
+    return (
+        row["comparison_type"] == "checkpoint_vs_baseline"
+        and row["first_label"] ==
+        "rmsnorm_alloc__ellipsoid_rank__p95__target6"
+    )
+
+
+def _annotate_multiplicity(rows: list[dict]) -> None:
+    for row in rows:
+        primary = _comparison_is_primary(row)
+        row["comparison_scope"] = "primary" if primary else "exploratory"
+        row["multiplicity_family"] = (
+            "primary_macro" if primary else "exploratory_all_other"
+        )
+    apply_multiplicity_adjustments(rows)
+
+
+def _identities_manifest(loaded: dict, baseline_label: str) -> dict:
+    baseline = loaded[baseline_label]
+    result = {}
+    for task, identities in sorted(baseline["identities"].items()):
+        rows = [
+            {"doc_id": value[0], "doc_hash": value[1], "target_hash": value[2]}
+            for value in identities
+        ]
+        encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        result[task] = {
+            "count": len(rows), "sha256": hashlib.sha256(encoded).hexdigest(),
+            "identifiers": rows,
+        }
+    return result
 
 
 def load_run(path: str) -> dict:
@@ -186,37 +237,54 @@ def _write_latex(path: str, rows: list[dict]) -> None:
 
 def _write_paired_markdown(path: str, rows: list[dict]) -> None:
     with open(path, "x", encoding="utf-8") as handle:
-        handle.write("| Type | First | Second | Task | Accuracy difference | Paired 95% CI | Significant |\n")
-        handle.write("|---|---|---|---|---:|---|---|\n")
+        handle.write("| Scope | Type | First | Second | Task | Accuracy difference | Paired 95% CI | Randomization p | Holm p | BH p |\n")
+        handle.write("|---|---|---|---|---|---:|---|---:|---:|---:|\n")
         for row in rows:
             handle.write(
-                f"| {row['comparison_type']} | {row['first_label']} | "
+                f"| {row['comparison_scope']} | {row['comparison_type']} | "
+                f"{row['first_label']} | "
                 f"{row['second_label']} | {row['task']} | "
                 f"{float(row['accuracy_difference']):+.4f} | "
                 f"[{float(row['ci95_lower']):.4f}, {float(row['ci95_upper']):.4f}] | "
-                f"{row['significant_95pct']} |\n"
+                f"{float(row['paired_randomization_p_value']):.4g} | "
+                f"{float(row['holm_adjusted_p_value']):.4g} | "
+                f"{float(row['bh_adjusted_p_value']):.4g} |\n"
             )
 
 
 def _write_paired_latex(path: str, rows: list[dict]) -> None:
     with open(path, "x", encoding="utf-8") as handle:
-        handle.write("\\begin{tabular}{llllrrl}\n\\toprule\n")
-        handle.write("Type & First & Second & Task & $\\Delta$acc & 95\\% CI & Sig. \\\\\n\\midrule\n")
+        handle.write("\\begin{tabular}{lllllrrrr}\n\\toprule\n")
+        handle.write("Scope & Type & First & Second & Task & $\\Delta$acc & 95\\% CI & Holm $p$ & BH $p$ \\\\\n\\midrule\n")
         for row in rows:
             values = (
-                row["comparison_type"], row["first_label"], row["second_label"],
+                row["comparison_scope"], row["comparison_type"],
+                row["first_label"], row["second_label"],
                 row["task"], f"{float(row['accuracy_difference']):+.4f}",
                 f"[{float(row['ci95_lower']):.4f}, {float(row['ci95_upper']):.4f}]",
-                row["significant_95pct"],
+                f"{float(row['holm_adjusted_p_value']):.4g}",
+                f"{float(row['bh_adjusted_p_value']):.4g}",
             )
             handle.write(" & ".join(_latex(value) for value in values) + " \\\\\n")
         handle.write("\\bottomrule\n\\end{tabular}\n")
 
 
-def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
+def summarize(
+    specs: list[dict], run_dir: str | list[str], n_resamples: int,
+    *, bootstrap_seed: int = 42,
+) -> tuple:
+    run_dirs = [run_dir] if isinstance(run_dir, str) else run_dir
     loaded = {}
     for spec in specs:
-        path = os.path.join(run_dir, spec["label"], "lm_eval_results.json")
+        candidates = [os.path.join(directory, spec["label"], "lm_eval_results.json")
+                      for directory in run_dirs]
+        matches = [path for path in candidates if os.path.isfile(path)]
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"expected one result for {spec['label']} across {run_dirs}; "
+                f"found {matches}"
+            )
+        path = matches[0]
         loaded[spec["label"]] = load_run(path)
     baseline_label = "baseline_unpruned"
     baseline = loaded[baseline_label]
@@ -247,7 +315,7 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
                     raise ValueError(f"paired example identities differ: {label} {task}")
             paired = paired_bootstrap_accuracy(
                 run["samples"], baseline["samples"],
-                n_resamples=n_resamples, seed=42,
+                n_resamples=n_resamples, seed=bootstrap_seed,
             )
         for task in sorted(common_tasks):
             stat = paired.get(task, {})
@@ -292,7 +360,7 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
     ellipsoid = [spec for spec in target6 if spec.get("ranking_source") ==
                  "rmsnorm_ellipsoid_bound"]
     competitors = [spec for spec in target6 if spec.get("ranking_source") in
-                   ("activation_score", "rmsnorm_bound")]
+                   ("activation_score", "rmsnorm_bound", "down_norm")]
     if competitors:
         if len(ellipsoid) != 1:
             raise ValueError("target-6 selector attribution requires one ellipsoid checkpoint")
@@ -311,7 +379,7 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
                     )
             paired = paired_bootstrap_accuracy(
                 first["samples"], second["samples"],
-                n_resamples=n_resamples, seed=42,
+                n_resamples=n_resamples, seed=bootstrap_seed,
             )
             comparisons.append({
                 "label": first_label, "versus": second_label,
@@ -320,23 +388,60 @@ def summarize(specs: list[dict], run_dir: str, n_resamples: int) -> tuple:
             paired_rows.extend(flatten_paired_comparison(
                 first_label, second_label, "target6_selector_attribution", paired
             ))
-    return rows, comparisons, paired_rows, baseline["protocol"]
+    _annotate_multiplicity(paired_rows)
+    audit = {
+        "schema_version": 1,
+        "macro_interval_verified_task_stratified_paired_bootstrap": True,
+        "bootstrap": {
+            "seed": bootstrap_seed, "replicates": n_resamples,
+            "pairing_unit": "lm-eval example identity within task",
+            "stratification": "independent paired resampling within each task",
+            "macro_estimand": "equal-weight mean of task accuracy differences",
+            "confidence_interval": "percentile 2.5% and 97.5%",
+        },
+        "paired_randomization": {
+            "seed": bootstrap_seed + 1_000_003, "replicates": n_resamples,
+            "method": "two-sided paired sign-flip within task",
+        },
+        "multiple_testing": {
+            "primary_definition": (
+                "target-6 primary checkpoint versus baseline macro, and target-6 "
+                "ellipsoid versus matched selector comparator macros"
+            ),
+            "exploratory_definition": "all task-level and remaining macro comparisons",
+            "adjustments": ["Holm family-wise error", "Benjamini-Hochberg FDR"],
+            "adjusted_within": "multiplicity_family",
+        },
+        "task_versions": baseline["protocol"].get("task_versions", {}),
+        "example_identifiers": _identities_manifest(loaded, baseline_label),
+    }
+    return rows, comparisons, paired_rows, baseline["protocol"], audit
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-manifest", required=True)
-    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--run-dir", action="append", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--bootstrap-resamples", type=int, default=10000)
+    parser.add_argument("--bootstrap-seed", type=int, default=42)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if os.path.exists(args.output_dir):
+    if not args.dry_run and os.path.exists(args.output_dir):
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.checkpoint_manifest, encoding="utf-8") as handle:
         specs = json.load(handle)
-    rows, comparisons, paired_rows, protocol = summarize(
-        specs, args.run_dir, args.bootstrap_resamples
+    rows, comparisons, paired_rows, protocol, audit = summarize(
+        specs, args.run_dir, args.bootstrap_resamples,
+        bootstrap_seed=args.bootstrap_seed,
     )
+    if args.dry_run:
+        print(
+            f"[downstream-summary] DRY RUN: rows={len(rows)} "
+            f"paired_rows={len(paired_rows)} primary="
+            f"{sum(row['comparison_scope'] == 'primary' for row in paired_rows)}"
+        )
+        return
     os.makedirs(args.output_dir)
     csv_path = os.path.join(args.output_dir, "downstream_benchmark_table.csv")
     with open(csv_path, "x", newline="", encoding="utf-8") as handle:
@@ -346,7 +451,11 @@ def main() -> None:
               "x", encoding="utf-8") as handle:
         json.dump({"protocol": protocol, "rows": rows,
                    "paired_comparisons": comparisons,
-                   "paired_comparison_rows": paired_rows}, handle, indent=2)
+                   "paired_comparison_rows": paired_rows,
+                   "statistical_audit": audit}, handle, indent=2)
+    with open(os.path.join(args.output_dir, "downstream_statistical_audit.json"),
+              "x", encoding="utf-8") as handle:
+        json.dump(audit, handle, indent=2)
     paired_csv = os.path.join(args.output_dir, "downstream_paired_comparisons.csv")
     with open(paired_csv, "x", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(paired_rows[0]))

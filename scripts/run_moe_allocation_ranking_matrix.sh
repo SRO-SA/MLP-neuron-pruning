@@ -23,7 +23,7 @@ case "${PROFILE}" in
         N_EVAL="${N_EVAL:-512}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2}"
         ;;
-    target2_extended|target2_paper_freeze|target4|target4_rankings|target4_exact_budget|target4_aggregation_rmsnorm|target4_aggregation_downnorm|target6_rmsnorm_primary|target6_downnorm_primary|target6_exact_budget|target6_aggregation_rmsnorm|target6_aggregation_limited|target8_rmsnorm_primary)
+    target2_extended|target2_paper_freeze|target4|target4_rankings|target4_exact_budget|target4_aggregation_rmsnorm|target4_aggregation_downnorm|target6_rmsnorm_primary|target6_rmsnorm_downnorm_ranking_only|target6_downnorm_primary|target6_exact_budget|target6_aggregation_rmsnorm|target6_aggregation_limited|target8_rmsnorm_primary)
         N_EVAL="${N_EVAL:-1024}"
         EVAL_DATASETS="${EVAL_DATASETS:-wikitext2,c4}"
         ;;

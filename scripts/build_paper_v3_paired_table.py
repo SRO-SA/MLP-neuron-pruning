@@ -7,6 +7,17 @@ import csv
 import json
 import os
 import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from scripts.summarize_moe_allocation_ranking import (
+    _read_paired_rows, _validate_paired_documents,
+)
+from src.paired_bootstrap import paired_signflip_nll_p_value
+from src.statistical_audit import apply_multiplicity_adjustments
 
 
 COMPLETE_REQUESTS = [
@@ -43,7 +54,13 @@ FIELDS = [
     "first_method", "second_method", "difference_definition",
     "mean_dnll_first_minus_second", "ci95_lower", "ci95_upper",
     "significant_95pct", "favored_method_if_significant", "n_documents",
-    "n_tokens", "bootstrap_resamples", "source_group", "source_run_dir",
+    "n_tokens", "bootstrap_resamples", "bootstrap_seed",
+    "paired_randomization_replicates", "paired_randomization_seed",
+    "paired_randomization_p_value", "comparison_scope",
+    "multiplicity_family", "multiplicity_family_size",
+    "holm_adjusted_p_value", "bh_adjusted_p_value",
+    "holm_significant_0_05", "bh_significant_0_05",
+    "source_group", "source_run_dir",
 ]
 
 
@@ -125,9 +142,118 @@ def normalize_comparison(row: dict) -> dict:
         "n_documents": int(float(row["n_documents"])),
         "n_tokens": int(float(row["n_tokens"])),
         "bootstrap_resamples": int(float(row["bootstrap_resamples"])),
+        "bootstrap_seed": 42,
         "source_group": row.get("source_group", ""),
         "source_run_dir": row.get("source_run_dir", ""),
     }
+
+
+def _source_directory(row: dict, source_root: str) -> str:
+    explicit = row.get("source_run_dir", "")
+    if explicit and os.path.isdir(explicit):
+        return explicit
+    candidate = os.path.join(source_root, row["source_group"])
+    if os.path.isdir(candidate):
+        return candidate
+    raise FileNotFoundError(
+        f"cannot resolve raw source group {row['source_group']!r}; tried "
+        f"source_run_dir={explicit!r} and {candidate!r}"
+    )
+
+
+def _raw_experiment_names(source: dict) -> tuple[str, str]:
+    kind = source["comparison_type"]
+    if kind == "ranking":
+        return source["ellipsoid_experiment"], source["competitor_experiment"]
+    if kind == "aggregation":
+        return source["p95_experiment"], source["max_experiment"]
+    if kind == "allocation":
+        return source["rmsnorm_experiment"], source["downnorm_experiment"]
+    raise ValueError(kind)
+
+
+def _load_raw_pair(source: dict, source_root: str) -> tuple[list[dict], list[dict]]:
+    directory = _source_directory(source, source_root)
+    summary = os.path.join(directory, "allocation_ranking_summary.csv")
+    if not os.path.isfile(summary):
+        raise FileNotFoundError(
+            f"raw allocation summary required for paired p-values: {summary}"
+        )
+    with open(summary, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    first_name, second_name = _raw_experiment_names(source)
+    dataset = source["dataset"]
+    by_key = {(row["experiment_name"], row["dataset"]): row for row in rows}
+    selected = []
+    for name in (first_name, second_name):
+        matches = [row for (experiment, data), row in by_key.items()
+                   if experiment == name and data == dataset]
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected one raw row for {name}/{dataset} in {summary}; "
+                f"found {len(matches)}"
+            )
+        selected.append(_read_paired_rows(matches[0]["per_example_nll_path"]))
+    _validate_paired_documents(selected[0], selected[1], label="paired dNLL audit")
+    return selected[0], selected[1]
+
+
+def add_paired_inference(
+    output_rows: list[dict], source_rows: list[dict], *, source_root: str,
+    randomization_replicates: int, randomization_seed: int,
+) -> dict:
+    normalized = [normalize_comparison(row) for row in source_rows]
+    by_key = {(*row["request_key"], row["dataset"]): source
+              for row, source in zip(normalized, source_rows)}
+    identifiers = {}
+    for row in output_rows:
+        if row["comparison_type"] == "aggregation":
+            request_context, request_competitor = row["allocation_context"], "max"
+        elif row["comparison_type"] == "allocation":
+            request_context, request_competitor = "exact2256", "down_norm"
+        else:
+            request_context = row["allocation_context"]
+            request_competitor = row["second_method"]
+        request = (
+            int(row["target_pct"]), row["comparison_type"],
+            request_context, request_competitor,
+            row["dataset"],
+        )
+        source = by_key.get(request)
+        if source is None:
+            raise KeyError(f"cannot recover raw source for normalized row: {request}")
+        first_docs, second_docs = _load_raw_pair(source, source_root)
+        first_values = [float(item["pruned_nll_sum"]) for item in first_docs]
+        second_values = [float(item["pruned_nll_sum"]) for item in second_docs]
+        tokens = [int(item["n_tokens"]) for item in first_docs]
+        row["paired_randomization_replicates"] = randomization_replicates
+        row["paired_randomization_seed"] = randomization_seed
+        row["paired_randomization_p_value"] = paired_signflip_nll_p_value(
+            first_values, second_values, tokens,
+            n_resamples=randomization_replicates, seed=randomization_seed,
+        )
+        row["comparison_scope"] = (
+            "primary" if (*request[:4],) in PRIMARY_REQUESTS else "exploratory"
+        )
+        row["multiplicity_family"] = (
+            "primary_dnll" if row["comparison_scope"] == "primary"
+            else "exploratory_dnll"
+        )
+        corpus = {(item["dataset"], item["corpus_sha256"]) for item in first_docs}
+        if len(corpus) != 1:
+            raise ValueError("raw pair contains multiple corpora")
+        key = row["dataset"]
+        identity_rows = [{
+            "dataset": item["dataset"], "corpus_sha256": item["corpus_sha256"],
+            "sample_index": int(item["sample_index"]),
+            "n_tokens": int(item["n_tokens"]),
+        } for item in first_docs]
+        existing = identifiers.get(key)
+        if existing is not None and existing != identity_rows:
+            raise ValueError(f"paired example identities vary for {key}")
+        identifiers[key] = identity_rows
+    apply_multiplicity_adjustments(output_rows)
+    return identifiers
 
 
 def build_requested_table(
@@ -161,16 +287,17 @@ def _fmt(value: object) -> str:
 def _write_markdown(path: str, rows: list[dict]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(
-            "| Target | Dataset | Context | First | Second | dNLL | 95% CI | Significant | Favored |\n"
-            "|---:|---|---|---|---|---:|---|---|---|\n"
+            "| Scope | Target | Dataset | Context | First | Second | dNLL | 95% CI | Holm p | BH p | Favored |\n"
+            "|---|---:|---|---|---|---|---:|---|---:|---:|---|\n"
         )
         for row in rows:
             ci = f"[{_fmt(row['ci95_lower'])}, {_fmt(row['ci95_upper'])}]"
             handle.write(
-                f"| {row['target_pct']} | {row['dataset']} | "
+                f"| {row['comparison_scope']} | {row['target_pct']} | {row['dataset']} | "
                 f"{row['allocation_context']} | {row['first_method']} | "
                 f"{row['second_method']} | {_fmt(row['mean_dnll_first_minus_second'])} | "
-                f"{ci} | {'Yes' if row['significant_95pct'] else 'No'} | "
+                f"{ci} | {float(row['holm_adjusted_p_value']):.4g} | "
+                f"{float(row['bh_adjusted_p_value']):.4g} | "
                 f"{row['favored_method_if_significant'] or '—'} |\n"
             )
 
@@ -181,17 +308,18 @@ def _latex_escape(value: object) -> str:
 
 def _write_latex(path: str, rows: list[dict]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write("\\begin{tabular}{rllllrrll}\n\\toprule\n")
+        handle.write("\\begin{tabular}{lrllllrrrrl}\n\\toprule\n")
         handle.write(
-            "Target & Dataset & Context & First & Second & $\\Delta$NLL & 95\\% CI & Sig. & Favored \\\\\n\\midrule\n"
+            "Scope & Target & Dataset & Context & First & Second & $\\Delta$NLL & 95\\% CI & Holm $p$ & BH $p$ & Favored \\\\\n\\midrule\n"
         )
         for row in rows:
             values = [
-                row["target_pct"], row["dataset"], row["allocation_context"],
+                row["comparison_scope"], row["target_pct"], row["dataset"], row["allocation_context"],
                 row["first_method"], row["second_method"],
                 _fmt(row["mean_dnll_first_minus_second"]),
                 f"[{_fmt(row['ci95_lower'])}, {_fmt(row['ci95_upper'])}]",
-                "Yes" if row["significant_95pct"] else "No",
+                f"{float(row['holm_adjusted_p_value']):.4g}",
+                f"{float(row['bh_adjusted_p_value']):.4g}",
                 row["favored_method_if_significant"] or "--",
             ]
             handle.write(" & ".join(_latex_escape(value) for value in values) + " \\\\\n")
@@ -204,12 +332,29 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--profile", choices=("primary", "complete"),
                         default="complete")
+    parser.add_argument("--source-root", default="results/moe_allocation_ranking")
+    parser.add_argument("--randomization-replicates", type=int, default=10000)
+    parser.add_argument("--randomization-seed", type=int, default=1000045)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if os.path.exists(args.output_dir):
+    if not args.dry_run and os.path.exists(args.output_dir):
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.input, newline="", encoding="utf-8") as handle:
+        source_rows = list(csv.DictReader(handle))
         requests = PRIMARY_REQUESTS if args.profile == "primary" else COMPLETE_REQUESTS
-        rows = build_requested_table(list(csv.DictReader(handle)), requests=requests)
+        rows = build_requested_table(source_rows, requests=requests)
+    identifiers = add_paired_inference(
+        rows, source_rows, source_root=args.source_root,
+        randomization_replicates=args.randomization_replicates,
+        randomization_seed=args.randomization_seed,
+    )
+    if args.dry_run:
+        print(
+            f"[paired-table] DRY RUN: rows={len(rows)} datasets="
+            f"{sorted(identifiers)} primary="
+            f"{sum(row['comparison_scope'] == 'primary' for row in rows)}"
+        )
+        return
     os.makedirs(args.output_dir)
     csv_path = os.path.join(args.output_dir, "paper_v3_paired_dnll_table.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -218,7 +363,11 @@ def main() -> None:
         writer.writerows(rows)
     json_path = os.path.join(args.output_dir, "paper_v3_paired_dnll_table.json")
     with open(json_path, "w", encoding="utf-8") as handle:
-        json.dump(rows, handle, indent=2)
+        json.dump({"rows": rows, "example_identifiers": identifiers,
+                   "bootstrap_seed": 42,
+                   "randomization_seed": args.randomization_seed,
+                   "randomization_replicates": args.randomization_replicates},
+                  handle, indent=2)
     md_path = os.path.join(args.output_dir, "paper_v3_paired_dnll_table.md")
     tex_path = os.path.join(args.output_dir, "paper_v3_paired_dnll_table.tex")
     _write_markdown(md_path, rows)
