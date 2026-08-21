@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import os
 import sys
@@ -13,6 +14,55 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.experiment_provenance import file_sha256
+
+
+def _resolve_additional_derived_plan(run_dir: str, rows: list[dict]) -> str:
+    """Resolve the validated derived plan even if the summary omitted its path."""
+    recorded = {
+        row.get("pruning_plan_path", "")
+        for row in rows
+        if row.get("pruning_plan_path", "")
+    }
+    existing_recorded = {path for path in recorded if os.path.isfile(path)}
+    if len(existing_recorded) > 1:
+        raise ValueError(
+            f"target-6 down-norm rows use different existing plans: "
+            f"{existing_recorded}"
+        )
+    if len(existing_recorded) == 1:
+        plan_path = next(iter(existing_recorded))
+    else:
+        matches = glob.glob(os.path.join(
+            run_dir,
+            "rmsnorm_alloc__downnorm_rank",
+            "pruning_plans",
+            "*.json",
+        ))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                "expected exactly one derived target-6 down-norm plan under "
+                f"{run_dir}; found {matches} (summary paths={recorded})"
+            )
+        plan_path = matches[0]
+
+    with open(plan_path, encoding="utf-8") as handle:
+        plan = json.load(handle)
+    audit = plan.get("allocation_ranking")
+    if not audit:
+        raise ValueError(f"derived plan lacks allocation_ranking audit: {plan_path}")
+    expected = {
+        "experiment_name": "rmsnorm_alloc__downnorm_rank",
+        "allocation_source": "rmsnorm_bound",
+        "ranking_source": "down_norm",
+        "ranking_aggregation_mode": "p95",
+    }
+    for field, value in expected.items():
+        if audit.get(field) != value:
+            raise ValueError(
+                f"derived plan {field}={audit.get(field)!r}; expected {value!r}: "
+                f"{plan_path}"
+            )
+    return plan_path
 
 
 def select_additional_target6_downnorm_spec(run_dir: str, model: str) -> dict:
@@ -26,15 +76,10 @@ def select_additional_target6_downnorm_spec(run_dir: str, model: str) -> dict:
         )]
     if not rows:
         raise ValueError(f"no target-6 RMSNorm-allocation/down-norm-ranking row in {path}")
-    plan_paths = {row["pruning_plan_path"] for row in rows}
-    if len(plan_paths) != 1:
-        raise ValueError(f"target-6 down-norm rows use different plans: {plan_paths}")
     for field in ("actual_pct", "layer_channels", "expert_neurons"):
         if len({row[field] for row in rows}) != 1:
             raise ValueError(f"target-6 down-norm rows differ in {field}")
-    plan_path = next(iter(plan_paths))
-    if not os.path.isfile(plan_path):
-        raise FileNotFoundError(plan_path)
+    plan_path = _resolve_additional_derived_plan(run_dir, rows)
     digest = file_sha256(plan_path)
     row = rows[0]
     return {

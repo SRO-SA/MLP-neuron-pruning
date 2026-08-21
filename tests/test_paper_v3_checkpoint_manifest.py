@@ -10,6 +10,7 @@ from unittest.mock import patch
 from scripts.generate_paper_v3_checkpoint_manifest import (
     select_additional_target6_downnorm_spec, select_checkpoint_specs,
 )
+from src.experiment_provenance import file_sha256
 
 
 class PaperV3CheckpointManifestTests(unittest.TestCase):
@@ -82,7 +83,15 @@ class PaperV3CheckpointManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             plan = os.path.join(root, "plan.json")
             with open(plan, "w", encoding="utf-8") as handle:
-                json.dump({"layers": []}, handle)
+                json.dump({
+                    "layers": [],
+                    "allocation_ranking": {
+                        "experiment_name": "rmsnorm_alloc__downnorm_rank",
+                        "allocation_source": "rmsnorm_bound",
+                        "ranking_source": "down_norm",
+                        "ranking_aggregation_mode": "p95",
+                    },
+                }, handle)
             fields = (
                 "requested_pct", "allocation_source", "ranking_source",
                 "ranking_aggregation", "pruning_plan_path", "actual_pct",
@@ -103,6 +112,48 @@ class PaperV3CheckpointManifestTests(unittest.TestCase):
             spec = select_additional_target6_downnorm_spec(root, "toy/model")
             self.assertEqual(spec["removed_layer_channels"], 2288)
             self.assertEqual(spec["ranking_source"], "down_norm")
+
+    def test_additional_downnorm_run_recovers_omitted_summary_plan_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            plan_dir = os.path.join(
+                root, "rmsnorm_alloc__downnorm_rank", "pruning_plans"
+            )
+            os.makedirs(plan_dir)
+            plan = os.path.join(plan_dir, "derived.json")
+            with open(plan, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "layers": [],
+                    "allocation_ranking": {
+                        "experiment_name": "rmsnorm_alloc__downnorm_rank",
+                        "allocation_source": "rmsnorm_bound",
+                        "ranking_source": "down_norm",
+                        "ranking_aggregation_mode": "p95",
+                    },
+                }, handle)
+            fields = (
+                "requested_pct", "allocation_source", "ranking_source",
+                "ranking_aggregation", "pruning_plan_path", "actual_pct",
+                "layer_channels", "expert_neurons", "dataset",
+            )
+            summary = os.path.join(root, "allocation_ranking_summary.csv")
+            with open(summary, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for dataset in ("wikitext2", "c4"):
+                    writer.writerow({
+                        "requested_pct": 6,
+                        "allocation_source": "rmsnorm_bound",
+                        "ranking_source": "down_norm",
+                        "ranking_aggregation": "p95",
+                        "pruning_plan_path": "",
+                        "actual_pct": 6.2066,
+                        "layer_channels": 2288,
+                        "expert_neurons": 292864,
+                        "dataset": dataset,
+                    })
+            spec = select_additional_target6_downnorm_spec(root, "toy/model")
+            self.assertEqual(spec["plan_path"], plan)
+            self.assertEqual(spec["plan_sha256"], file_sha256(plan))
 
 
 if __name__ == "__main__":
