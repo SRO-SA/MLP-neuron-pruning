@@ -3,7 +3,10 @@ import os
 import tempfile
 import unittest
 
-from scripts.summarize_paper_v3_downstream import load_run
+from scripts.summarize_paper_v3_downstream import (
+    load_run, load_tokenizer_audit_registry, validate_tokenizer_audit_coverage,
+)
+from src.experiment_provenance import file_sha256
 from src.task_config_fingerprint import (
     FINGERPRINT_VERSION, stable_task_config, task_config_sha256,
 )
@@ -82,6 +85,62 @@ class TaskConfigFingerprintTests(unittest.TestCase):
             loaded["protocol"]["task_configs_process_raw_sha256"],
             "raw-process-digest",
         )
+
+    def test_multiple_tokenizer_audits_are_verified_per_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            registry_paths = []
+            file_hash = "tokenizer-files"
+            for index, label in enumerate(("baseline", "target2")):
+                path = os.path.join(root, f"audit{index}.json")
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump({
+                        "decision": {
+                            "audit_passed_for_downstream": True,
+                            "selected_tokenizer_mode": "current",
+                            "use_fix_mistral_regex_for_future_evaluation": False,
+                        },
+                        "sources": [{
+                            "label": label,
+                            "tokenizer_files_combined_sha256": file_hash,
+                        }],
+                    }, handle)
+                registry_paths.append(path)
+            registry = load_tokenizer_audit_registry(registry_paths)
+            loaded = {}
+            for label, path in zip(("baseline", "target2"), registry_paths):
+                loaded[label] = {"protocol": {
+                    "tokenizer_audit_sha256": file_sha256(path),
+                    "selected_tokenizer_mode": "current",
+                    "fix_mistral_regex": False,
+                    "tokenizer_files_combined_sha256": file_hash,
+                }}
+            coverage = validate_tokenizer_audit_coverage(loaded, registry)
+        self.assertEqual(set(coverage), {"baseline", "target2"})
+
+    def test_tokenizer_audit_must_cover_recorded_checkpoint_label(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "audit.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "decision": {
+                        "audit_passed_for_downstream": True,
+                        "selected_tokenizer_mode": "current",
+                        "use_fix_mistral_regex_for_future_evaluation": False,
+                    },
+                    "sources": [{
+                        "label": "baseline",
+                        "tokenizer_files_combined_sha256": "files",
+                    }],
+                }, handle)
+            registry = load_tokenizer_audit_registry([path])
+            loaded = {"target2": {"protocol": {
+                "tokenizer_audit_sha256": file_sha256(path),
+                "selected_tokenizer_mode": "current",
+                "fix_mistral_regex": False,
+                "tokenizer_files_combined_sha256": "files",
+            }}}
+            with self.assertRaisesRegex(ValueError, "does not cover checkpoint"):
+                validate_tokenizer_audit_coverage(loaded, registry)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.task_config_fingerprint import FINGERPRINT_VERSION, task_config_sha256
+from src.experiment_provenance import file_sha256
 from src.statistical_audit import (
     apply_multiplicity_adjustments, paired_signflip_statistics,
 )
@@ -201,6 +202,70 @@ def load_run(path: str) -> dict:
             "samples": samples, "identities": identities}
 
 
+def load_tokenizer_audit_registry(paths: list[str]) -> dict[str, dict]:
+    """Load passing tokenizer audits keyed by their exact file digest."""
+    registry = {}
+    for path in paths:
+        digest = file_sha256(path)
+        if digest in registry:
+            raise ValueError(f"duplicate tokenizer audit SHA-256: {path}")
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        decision = payload.get("decision", {})
+        if decision.get("audit_passed_for_downstream") is not True:
+            raise ValueError(f"tokenizer audit did not pass: {path}")
+        use_fix = decision.get("use_fix_mistral_regex_for_future_evaluation")
+        if not isinstance(use_fix, bool):
+            raise ValueError(f"tokenizer audit has no resolved policy: {path}")
+        registry[digest] = {
+            "path": os.path.realpath(path),
+            "payload": payload,
+            "selected_tokenizer_mode": "fixed" if use_fix else "current",
+            "fix_mistral_regex": use_fix,
+            "sources": {
+                source.get("label"): source
+                for source in payload.get("sources", [])
+                if source.get("label")
+            },
+        }
+    return registry
+
+
+def validate_tokenizer_audit_coverage(
+    loaded: dict[str, dict], registry: dict[str, dict],
+) -> dict:
+    """Verify each run against the exact tokenizer audit it recorded."""
+    used = {}
+    for label, run in loaded.items():
+        protocol = run["protocol"]
+        digest = protocol.get("tokenizer_audit_sha256", "")
+        audit = registry.get(digest)
+        if audit is None:
+            raise ValueError(
+                f"no supplied tokenizer audit matches {label}: sha256={digest!r}"
+            )
+        if protocol.get("selected_tokenizer_mode") != audit[
+            "selected_tokenizer_mode"
+        ]:
+            raise ValueError(f"tokenizer mode differs from audit for {label}")
+        if protocol.get("fix_mistral_regex") != audit["fix_mistral_regex"]:
+            raise ValueError(f"tokenizer regex policy differs from audit for {label}")
+        source = audit["sources"].get(label)
+        if source is None:
+            raise ValueError(f"tokenizer audit does not cover checkpoint {label}")
+        expected_files = source.get("tokenizer_files_combined_sha256")
+        if protocol.get("tokenizer_files_combined_sha256") != expected_files:
+            raise ValueError(f"tokenizer file hash differs from audit for {label}")
+        used[label] = {
+            "tokenizer_audit_sha256": digest,
+            "tokenizer_audit_path": audit["path"],
+            "selected_tokenizer_mode": audit["selected_tokenizer_mode"],
+            "fix_mistral_regex": audit["fix_mistral_regex"],
+            "tokenizer_files_combined_sha256": expected_files,
+        }
+    return used
+
+
 def _write_markdown(path: str, rows: list[dict]) -> None:
     with open(path, "x", encoding="utf-8") as handle:
         handle.write("| Checkpoint | Task | Metric | Accuracy | Delta vs baseline | Paired 95% CI | Significant |\n")
@@ -273,6 +338,7 @@ def _write_paired_latex(path: str, rows: list[dict]) -> None:
 def summarize(
     specs: list[dict], run_dir: str | list[str], n_resamples: int,
     *, bootstrap_seed: int = 42,
+    tokenizer_audits: dict[str, dict] | None = None,
 ) -> tuple:
     run_dirs = [run_dir] if isinstance(run_dir, str) else run_dir
     loaded = {}
@@ -287,6 +353,21 @@ def summarize(
             )
         path = matches[0]
         loaded[spec["label"]] = load_run(path)
+    audit_hashes = {
+        run["protocol"].get("tokenizer_audit_sha256", "")
+        for run in loaded.values()
+    }
+    if tokenizer_audits is None:
+        if len(audit_hashes) != 1:
+            raise ValueError(
+                "multiple tokenizer audits are present; supply each with "
+                "--tokenizer-audit"
+            )
+        tokenizer_coverage = {}
+    else:
+        tokenizer_coverage = validate_tokenizer_audit_coverage(
+            loaded, tokenizer_audits
+        )
     baseline_label = "baseline_unpruned"
     baseline = loaded[baseline_label]
     protocol_keys = (
@@ -294,7 +375,7 @@ def summarize(
         "seed_python", "seed_numpy", "seed_torch", "seed_fewshot",
         "apply_chat_template", "tokenizer_class", "source_model_revision",
         "tokenizer_revision", "selected_tokenizer_mode", "fix_mistral_regex",
-        "tokenizer_audit_sha256", "trust_dataset_code", "dataset_code_tasks",
+        "trust_dataset_code", "dataset_code_tasks",
         "tokenizer_files_combined_sha256", "task_configs_sha256",
         "task_configs_fingerprint",
     )
@@ -415,6 +496,8 @@ def summarize(
         },
         "task_versions": baseline["protocol"].get("task_versions", {}),
         "example_identifiers": _identities_manifest(loaded, baseline_label),
+        "tokenizer_audit_coverage": tokenizer_coverage,
+        "tokenizer_audit_sha256_values": sorted(audit_hashes),
     }
     return rows, comparisons, paired_rows, baseline["protocol"], audit
 
@@ -426,15 +509,24 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--bootstrap-resamples", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=42)
+    parser.add_argument(
+        "--tokenizer-audit", action="append", default=[],
+        help="Passing tokenizer audit JSON; repeat when cohorts use different audits",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not args.dry_run and os.path.exists(args.output_dir):
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.checkpoint_manifest, encoding="utf-8") as handle:
         specs = json.load(handle)
+    tokenizer_audits = (
+        load_tokenizer_audit_registry(args.tokenizer_audit)
+        if args.tokenizer_audit else None
+    )
     rows, comparisons, paired_rows, protocol, audit = summarize(
         specs, args.run_dir, args.bootstrap_resamples,
         bootstrap_seed=args.bootstrap_seed,
+        tokenizer_audits=tokenizer_audits,
     )
     if args.dry_run:
         print(
