@@ -179,8 +179,9 @@ def load_run(path: str) -> dict:
         if protocol.get("task_configs_sha256") != stable_config_hash:
             raise ValueError(f"stable task config hash mismatch: {path}")
     else:
-        protocol["task_configs_process_raw_sha256"] = protocol.get(
-            "task_configs_sha256", ""
+        protocol.setdefault(
+            "task_configs_process_raw_sha256",
+            protocol.get("task_configs_sha256", ""),
         )
     protocol["task_configs_sha256"] = stable_config_hash
     protocol["task_configs_fingerprint"] = FINGERPRINT_VERSION

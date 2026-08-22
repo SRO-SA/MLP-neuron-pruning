@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from typing import Any
 
 
-FINGERPRINT_VERSION = "stable-json-v1"
+FINGERPRINT_VERSION = "stable-json-v2"
 _REPR_ADDRESS = re.compile(r"(?<= at )0x[0-9a-fA-F]+(?=>)")
 
 
@@ -47,11 +47,12 @@ def stable_task_config(value: Any) -> Any:
             key=lambda item: json.dumps(item, sort_keys=True, default=str),
         )
     if callable(value):
-        module = getattr(value, "__module__", type(value).__module__)
-        name = getattr(value, "__qualname__", type(value).__qualname__)
-        return {"__callable__": f"{module}.{name}"}
-    kind = f"{type(value).__module__}.{type(value).__qualname__}"
-    return {"__type__": kind, "__repr__": _normalize_string(repr(value))}
+        # lm-eval persists callables with its JSON fallback as their repr.
+        # Normalize the live object to that same representation so hashing a
+        # runtime config and hashing the saved JSON config produce one digest.
+        return _normalize_string(repr(value))
+    # Match the persisted JSON fallback for opaque objects for the same reason.
+    return _normalize_string(repr(value))
 
 
 def task_config_sha256(value: Any) -> str:
