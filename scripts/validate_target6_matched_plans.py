@@ -108,6 +108,44 @@ def result_protocol(report: dict) -> dict:
     }
 
 
+def merge_compatible_protocols(protocols: dict[str, dict]) -> tuple[dict, dict]:
+    """Merge legacy/new reports, rejecting conflicting populated values.
+
+    Older frozen reports legitimately lack provenance fields introduced later.
+    Missing values are recorded as missing coverage; they are not evidence of a
+    mismatch.  Every value that is present in two or more reports must agree.
+    """
+    coverage = {}
+
+    def merge(values: dict[str, object], field_path: str):
+        populated = {
+            label: value for label, value in values.items()
+            if value is not None and value != ""
+        }
+        coverage[field_path] = sorted(populated)
+        if any(isinstance(value, dict) for value in populated.values()):
+            if not all(isinstance(value, dict) for value in populated.values()):
+                raise ValueError(f"protocol type mismatch at {field_path}: {populated}")
+            keys = sorted({key for value in populated.values() for key in value})
+            return {
+                key: merge(
+                    {label: value.get(key) for label, value in populated.items()},
+                    f"{field_path}.{key}" if field_path else key,
+                )
+                for key in keys
+            }
+        normalized = {
+            json.dumps(value, sort_keys=True, default=str): value
+            for value in populated.values()
+        }
+        if len(normalized) > 1:
+            raise ValueError(f"conflicting populated protocol values at {field_path}: {populated}")
+        return next(iter(normalized.values())) if normalized else ""
+
+    merged = merge(protocols, "")
+    return merged, coverage
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="append", default=[], required=True,
@@ -145,16 +183,25 @@ def main() -> None:
             label: result_protocol(json.loads(path.read_text(encoding="utf-8")))
             for label, path in result_paths.items()
         }
-        reference = protocols["ellipsoid"]
-        for label, protocol in protocols.items():
-            if protocol != reference:
-                differences = {
-                    key: (reference.get(key), protocol.get(key))
-                    for key in sorted(set(reference) | set(protocol))
-                    if reference.get(key) != protocol.get(key)
-                }
-                raise ValueError(f"{label}: evaluation protocol mismatch: {differences}")
-        validation["evaluation_protocol"] = reference
+        merged_protocol, protocol_coverage = merge_compatible_protocols(protocols)
+        required_dataset_fields = (
+            "n_eval", "max_seq_len", "batch_size", "num_texts",
+            "corpus_sha256", "preprocessing", "baseline_tokens",
+            "pruned_tokens", "token_count_match",
+        )
+        if set(merged_protocol.get("datasets", {})) != {"wikitext2", "c4"}:
+            raise ValueError("matched reports do not contain WikiText2 and C4")
+        for dataset, row in merged_protocol["datasets"].items():
+            missing = [field for field in required_dataset_fields if row.get(field) in (None, "")]
+            if missing:
+                raise ValueError(f"{dataset}: required evaluation metadata missing: {missing}")
+            if row["baseline_tokens"] != row["pruned_tokens"] or row["token_count_match"] is not True:
+                raise ValueError(f"{dataset}: baseline/pruned evaluation tokens differ")
+        validation["evaluation_protocol"] = merged_protocol
+        validation["evaluation_protocol_field_coverage"] = protocol_coverage
+        validation["legacy_missing_metadata_policy"] = (
+            "missing is unrecorded; every populated value must agree"
+        )
         validation["result_reports"] = {
             label: {"path": str(path), "sha256": file_sha256(str(path))}
             for label, path in result_paths.items()
@@ -175,15 +222,47 @@ def main() -> None:
                 raise ValueError(f"{label}: checkpoint reload/logit verification failed")
             shapes = row.get("shape_audit_after_reload")
             shape_signatures[label] = json.dumps(shapes, sort_keys=True)
+            all_file_hashes = row.get("checkpoint_file_sha256", {}) or {}
+            tokenizer_hashes = {
+                name: digest for name, digest in all_file_hashes.items()
+                if Path(name).name.startswith("tokenizer")
+                or Path(name).name in {
+                    "vocab.json", "merges.txt", "special_tokens_map.json",
+                    "added_tokens.json", "chat_template.jinja",
+                }
+            }
+            if not tokenizer_hashes:
+                raise ValueError(f"{label}: checkpoint tokenizer file hashes missing")
             checkpoint_rows[label] = {
                 "path": str(path), "sha256": file_sha256(str(path)),
                 "reload_success": row.get("successful_reload"),
                 "exact_logits": row.get("exact_logits_after_reload"),
                 "no_hidden_padding": row.get("no_hidden_original_width_padding"),
+                "base_model": row.get("base_model"),
+                "source_model_revision": row.get("source_model_revision"),
+                "tokenizer_revision": row.get("tokenizer_revision"),
+                "dtype": row.get("dtype"),
+                "tokenizer_file_sha256": tokenizer_hashes,
             }
         if len(set(shape_signatures.values())) != 1:
             raise ValueError("target-6 exported tensor shape paths differ")
+        checkpoint_identity, checkpoint_coverage = merge_compatible_protocols({
+            label: {
+                key: value for key, value in row.items()
+                if key in {
+                    "base_model", "source_model_revision", "tokenizer_revision",
+                    "dtype", "tokenizer_file_sha256",
+                }
+            }
+            for label, row in checkpoint_rows.items()
+        })
+        if checkpoint_identity.get("base_model") != "Qwen/Qwen3-30B-A3B":
+            raise ValueError(f"checkpoint base model mismatch: {checkpoint_identity}")
+        if not checkpoint_identity.get("source_model_revision"):
+            raise ValueError("frozen checkpoints do not record a model revision")
         validation["checkpoint_verification"] = checkpoint_rows
+        validation["checkpoint_model_tokenizer_identity"] = checkpoint_identity
+        validation["checkpoint_identity_field_coverage"] = checkpoint_coverage
 
     validation["comparison_scope"] = (
         "fixed RMSNorm allocation; only selected channel identities may differ"

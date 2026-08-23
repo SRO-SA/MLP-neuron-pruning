@@ -10,6 +10,7 @@ from unittest import mock
 import numpy as np
 
 from scripts.build_moe_certified_hybrid_frontier import main as build_frontier
+from scripts.validate_target6_matched_plans import merge_compatible_protocols
 
 
 def target6_plan(selector: str, *, down: bool = False) -> dict:
@@ -35,6 +36,24 @@ def target6_plan(selector: str, *, down: bool = False) -> dict:
 
 
 class CertifiedHybridMilestoneTests(unittest.TestCase):
+    def test_legacy_missing_protocol_metadata_is_not_a_mismatch(self) -> None:
+        merged, coverage = merge_compatible_protocols({
+            "legacy": {
+                "common": {"model": "model", "revision": ""},
+                "datasets": {"c4": {"corpus": "abc", "tokens": 10}},
+            },
+            "new": {
+                "common": {"model": "model", "revision": "revision-1"},
+                "datasets": {"c4": {"corpus": "abc", "tokens": 10}},
+            },
+        })
+        self.assertEqual(merged["common"]["revision"], "revision-1")
+        self.assertEqual(coverage["common.revision"], ["new"])
+        with self.assertRaisesRegex(ValueError, "conflicting populated"):
+            merge_compatible_protocols({
+                "left": {"corpus": "abc"}, "right": {"corpus": "xyz"},
+            })
+
     def test_frontier_dry_math_writes_five_fixed_budget_plans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

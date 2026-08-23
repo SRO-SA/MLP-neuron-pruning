@@ -12,10 +12,12 @@ T6_DOWN_RUN="${T6_DOWN_RUN:-results/moe_allocation_ranking/target6_rmsnorm_downn
 FROZEN_CHECKPOINT_ROOT="${FROZEN_CHECKPOINT_ROOT:-/paper_v3_checkpoints/20260820_060635}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 DRY_RUN="${DRY_RUN:-0}"
+RESUME="${RESUME:-0}"
 
 if [ -f "${VENV}/bin/activate" ]; then source "${VENV}/bin/activate"; fi
-if [ "${DRY_RUN}" != "1" ] && [ -e "${MILESTONE_ROOT}" ]; then
+if [ "${DRY_RUN}" != "1" ] && [ -e "${MILESTONE_ROOT}" ] && [ "${RESUME}" != "1" ]; then
   echo "[hybrid-prepare] ERROR: refusing to overwrite ${MILESTONE_ROOT}"
+  echo "[hybrid-prepare] Set RESUME=1 to verify and continue completed stages."
   exit 1
 fi
 
@@ -74,16 +76,57 @@ if [ "${DRY_RUN}" = "1" ]; then
 fi
 
 mkdir -p "${MILESTONE_ROOT}"
-python3 scripts/validate_target6_matched_plans.py "${validation_args[@]}"
+if [ -f "${VALIDATION}" ] && [ "${RESUME}" = "1" ]; then
+  python3 - "${VALIDATION}" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1], encoding="utf-8"))
+assert row.get("strict_gate_passed") is True
+assert row.get("total_removed_layer_channels") == 2288
+assert row.get("total_removed_expert_neurons") == 292864
+print("[hybrid-prepare] VERIFIED EXISTING matched-plan validation")
+PY
+else
+  python3 scripts/validate_target6_matched_plans.py "${validation_args[@]}"
+fi
 python3 -c "import torch; assert torch.cuda.is_available(); print('[hybrid-prepare] CUDA OK', torch.__version__)"
-python3 scripts/collect_moe_certificate_scores.py \
-  --model Qwen/Qwen3-30B-A3B --output-dir "${MILESTONE_ROOT}/scores"
-python3 scripts/build_moe_certified_hybrid_frontier.py \
-  --ellipsoid-plan "${ELLIPSOID_PLAN}" \
-  --down-norm-plan "${DOWN_PLAN}" \
-  --score-bundle "${MILESTONE_ROOT}/scores/all_expert_certificate_scores.npz" \
-  --score-manifest "${MILESTONE_ROOT}/scores/all_expert_certificate_scores.json" \
-  --matched-validation "${VALIDATION}" \
-  --output-dir "${MILESTONE_ROOT}/certification_frontier" \
-  --seed 42
+SCORE_NPZ="${MILESTONE_ROOT}/scores/all_expert_certificate_scores.npz"
+SCORE_JSON="${MILESTONE_ROOT}/scores/all_expert_certificate_scores.json"
+if [ -f "${SCORE_NPZ}" ] && [ -f "${SCORE_JSON}" ] && [ "${RESUME}" = "1" ]; then
+  python3 - "${SCORE_NPZ}" "${SCORE_JSON}" <<'PY'
+import hashlib, json, sys
+npz, manifest = sys.argv[1:]
+expected = json.load(open(manifest, encoding="utf-8"))["score_npz_sha256"]
+digest = hashlib.sha256(open(npz, "rb").read()).hexdigest()
+assert digest == expected, (digest, expected)
+print("[hybrid-prepare] VERIFIED EXISTING all-expert score bundle")
+PY
+elif [ -e "${MILESTONE_ROOT}/scores" ]; then
+  echo "[hybrid-prepare] ERROR: incomplete score directory requires inspection: ${MILESTONE_ROOT}/scores"
+  exit 1
+else
+  python3 scripts/collect_moe_certificate_scores.py \
+    --model Qwen/Qwen3-30B-A3B --output-dir "${MILESTONE_ROOT}/scores"
+fi
+
+FRONTIER_JSON="${MILESTONE_ROOT}/certification_frontier/hybrid_frontier.json"
+if [ -f "${FRONTIER_JSON}" ] && [ "${RESUME}" = "1" ]; then
+  python3 - "${FRONTIER_JSON}" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(row.get("plans", [])) == 5
+print("[hybrid-prepare] VERIFIED EXISTING five-plan frontier")
+PY
+elif [ -e "${MILESTONE_ROOT}/certification_frontier" ]; then
+  echo "[hybrid-prepare] ERROR: incomplete frontier directory requires inspection: ${MILESTONE_ROOT}/certification_frontier"
+  exit 1
+else
+  python3 scripts/build_moe_certified_hybrid_frontier.py \
+    --ellipsoid-plan "${ELLIPSOID_PLAN}" \
+    --down-norm-plan "${DOWN_PLAN}" \
+    --score-bundle "${SCORE_NPZ}" \
+    --score-manifest "${SCORE_JSON}" \
+    --matched-validation "${VALIDATION}" \
+    --output-dir "${MILESTONE_ROOT}/certification_frontier" \
+    --seed 42
+fi
 echo "[hybrid-prepare] COMPLETE ${MILESTONE_ROOT}"

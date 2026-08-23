@@ -32,7 +32,9 @@ test ! -e "$MILESTONE_ROOT"
 ```
 
 Keep these variables in the same shell. If reconnecting, restore the exact
-`MILESTONE_ID` instead of creating a new one.
+`MILESTONE_ID` instead of creating a new one. To resume a partially completed
+preparation stage, use the same root with `RESUME=1`; completed artifacts are
+hash-checked before being reused.
 
 ## 1. Matched-plan gate, all-expert scores, and hybrid plans
 
