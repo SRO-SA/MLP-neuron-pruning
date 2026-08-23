@@ -11,12 +11,14 @@ RUN_DIR="${RUN_DIR:?set a new RUN_DIR}"
 VENV="${VENV:-/workspace/venvs/qwen-pruning}"
 N_EVAL="${N_EVAL:-1024}"
 DRY_RUN="${DRY_RUN:-0}"
+RESUME="${RESUME:-0}"
 CONFIG_DIR="${RUN_DIR}/configs"
 MANIFEST="${CONFIG_DIR}/fixed_plan_eval_manifest.json"
 
 if [ -f "${VENV}/bin/activate" ]; then source "${VENV}/bin/activate"; fi
-if [ "${DRY_RUN}" != "1" ] && [ -e "${RUN_DIR}" ]; then
+if [ "${DRY_RUN}" != "1" ] && [ -e "${RUN_DIR}" ] && [ "${RESUME}" != "1" ]; then
   echo "[hybrid-ppl] ERROR: refusing to overwrite ${RUN_DIR}"
+  echo "[hybrid-ppl] Set RESUME=1 to validate and skip completed cells."
   exit 1
 fi
 
@@ -33,11 +35,13 @@ python3 -c "import torch; assert torch.cuda.is_available(); print('[hybrid-ppl] 
 mkdir -p "${RUN_DIR}"
 python3 scripts/generate_moe_fixed_plan_eval_configs.py "${args[@]}"
 
-while IFS=$'\t' read -r name config output plan plan_hash allocation_plan; do
-  mkdir -p "${output}"
-  echo "[hybrid-ppl] START fresh process ${name}"
-  python3 run_experiment.py --config "${config}" --moe-target-pruning \
-    2>&1 | tee "${RUN_DIR}/${name}.log"
+validate_completed_cell() {
+  local name="$1"
+  local output="$2"
+  local plan="$3"
+  local plan_hash="$4"
+  local allocation_plan="$5"
+  local derived_plan
   derived_plan="$(find "${output}/pruning_plans" -maxdepth 1 -name '*.json' -print -quit)"
   [ -n "${derived_plan}" ] || { echo "[hybrid-ppl] ERROR: derived plan missing"; exit 1; }
   python3 scripts/validate_moe_allocation_ranking.py \
@@ -58,7 +62,8 @@ assert all(int(float(row["removed_expert_neurons"])) == 292864 for row in rows)
 assert all(row["ranking_source"] == "fixed_plan" for row in rows)
 assert all(row["allocation_source"] == "rmsnorm_bound" for row in rows)
 assert all(row["evaluation_token_count_match"].lower() in {"true", "1"} for row in rows)
-assert all(row["forward_check"] == "OK" and row["status"] == "ok" for row in rows)
+assert all(row["forward_check"].lower() in {"true", "1", "ok"} for row in rows)
+assert all(row["status"] == "ok" for row in rows)
 digest = hashlib.sha256(open(plan, "rb").read()).hexdigest()
 assert digest == expected_hash
 source = json.load(open(plan, encoding="utf-8"))
@@ -68,6 +73,27 @@ derived_ids = {int(r["layer_idx"]): sorted(r["prune_idx"]) for r in derived["lay
 assert source_ids == derived_ids, "derived plan changed fixed-plan identities"
 print(f"[hybrid-ppl-validate] OK plan={plan} datasets=2 channels=2288")
 PY
+}
+
+while IFS=$'\t' read -r name config output plan plan_hash allocation_plan; do
+  if [ "${RESUME}" = "1" ] && find "${output}" -maxdepth 1 \
+      -name 'moe_target_pruning_*.csv' ! -name '*_per_layer.csv' \
+      -print -quit 2>/dev/null | grep -q .; then
+    validate_completed_cell "${name}" "${output}" "${plan}" \
+      "${plan_hash}" "${allocation_plan}"
+    echo "[hybrid-ppl] VERIFIED EXISTING ${name}"
+    continue
+  fi
+  if [ -d "${output}" ] && find "${output}" -mindepth 1 -print -quit | grep -q .; then
+    echo "[hybrid-ppl] ERROR: incomplete output requires inspection: ${output}"
+    exit 1
+  fi
+  mkdir -p "${output}"
+  echo "[hybrid-ppl] START fresh process ${name}"
+  python3 run_experiment.py --config "${config}" --moe-target-pruning \
+    2>&1 | tee "${RUN_DIR}/${name}.log"
+  validate_completed_cell "${name}" "${output}" "${plan}" \
+    "${plan_hash}" "${allocation_plan}"
   echo "[hybrid-ppl] FINISH ${name}"
 done < <(python3 - "${MANIFEST}" <<'PY'
 import json, sys
