@@ -47,6 +47,27 @@ CSV_FIELDS = (
     "collection", "n_examples", "token_id_mismatches", "decoded_mismatches",
 )
 
+PAPER_V3_FROZEN_LABELS = frozenset({
+    "baseline_unpruned",
+    "rmsnorm_alloc__ellipsoid_rank__p95__target4",
+    "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+    "rmsnorm_alloc__ellipsoid_rank__p95__target8",
+})
+
+PURE_DOWNNORM_CURVE_LABELS = frozenset({
+    "baseline_unpruned",
+    "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+    "rmsnorm_alloc__downnorm_rank__p95__target2",
+    "rmsnorm_alloc__downnorm_rank__p95__target4",
+    "rmsnorm_alloc__downnorm_rank__p95__target6",
+    "rmsnorm_alloc__downnorm_rank__p95__target8",
+})
+
+CHECKPOINT_COHORTS = (
+    ("pure_downnorm_curve", PURE_DOWNNORM_CURVE_LABELS),
+    ("paper_v3_frozen", PAPER_V3_FROZEN_LABELS),
+)
+
 
 class _Capture(logging.Handler):
     def __init__(self) -> None:
@@ -55,6 +76,18 @@ class _Capture(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.messages.append(record.getMessage())
+
+
+def validate_checkpoint_cohort(specs: list[dict]) -> str:
+    available = {spec["label"] for spec in specs}
+    for cohort, expected_labels in CHECKPOINT_COHORTS:
+        if expected_labels.issubset(available):
+            return cohort
+    missing = {
+        cohort: sorted(expected_labels - available)
+        for cohort, expected_labels in CHECKPOINT_COHORTS
+    }
+    raise ValueError(f"frozen checkpoint labels missing for supported cohorts: {missing}")
 
 
 def _version(distribution: str) -> str:
@@ -321,21 +354,14 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite {args.output_dir}")
     with open(args.checkpoint_manifest, encoding="utf-8") as handle:
         specs = json.load(handle)
-    expected_labels = {
-        "baseline_unpruned",
-        "rmsnorm_alloc__ellipsoid_rank__p95__target4",
-        "rmsnorm_alloc__ellipsoid_rank__p95__target6",
-        "rmsnorm_alloc__ellipsoid_rank__p95__target8",
-    }
-    available = {spec["label"] for spec in specs}
-    if not expected_labels.issubset(available):
-        raise ValueError(f"frozen checkpoint labels missing: {expected_labels - available}")
+    checkpoint_cohort = validate_checkpoint_cohort(specs)
     for spec in specs:
         if not os.path.isdir(spec["checkpoint_dir"]):
             raise FileNotFoundError(spec["checkpoint_dir"])
     if args.dry_run:
         print(
-            f"[tokenizer-audit] DRY RUN: model={args.model} checkpoints={len(specs)} "
+            f"[tokenizer-audit] DRY RUN: model={args.model} "
+            f"cohort={checkpoint_cohort} checkpoints={len(specs)} "
             f"datasets=wikitext2,c4 samples_each={args.samples_per_dataset} "
             f"output={args.output_dir}"
         )

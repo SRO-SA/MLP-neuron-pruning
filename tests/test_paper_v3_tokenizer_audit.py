@@ -1,7 +1,12 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from scripts.audit_paper_v3_tokenizers import (
-    build_decision, compare_records, encode_record,
+    build_decision, compare_records, encode_record, validate_checkpoint_cohort,
 )
 
 
@@ -19,6 +24,57 @@ class _ToyTokenizer:
 
 
 class PaperV3TokenizerAuditTests(unittest.TestCase):
+    def _run_dry_run(self, labels):
+        with tempfile.TemporaryDirectory() as root:
+            specs = []
+            for label in labels:
+                checkpoint_dir = os.path.join(root, label)
+                os.mkdir(checkpoint_dir)
+                specs.append({"label": label, "checkpoint_dir": checkpoint_dir})
+            manifest = os.path.join(root, "checkpoint_manifest.json")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump(specs, handle)
+            completed = subprocess.run(
+                [
+                    sys.executable, "scripts/audit_paper_v3_tokenizers.py",
+                    "--checkpoint-manifest", manifest,
+                    "--output-dir", os.path.join(root, "audit"),
+                    "--samples-per-dataset", "100", "--dry-run",
+                ],
+                check=False, capture_output=True, text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout
+
+    def test_dry_run_accepts_old_ellipsoid_cohort_without_loading_model(self):
+        output = self._run_dry_run([
+            "baseline_unpruned",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target4",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target8",
+        ])
+        self.assertIn("cohort=paper_v3_frozen", output)
+
+    def test_dry_run_accepts_downnorm_curve_cohort_without_loading_model(self):
+        output = self._run_dry_run([
+            "baseline_unpruned",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+            "rmsnorm_alloc__downnorm_rank__p95__target2",
+            "rmsnorm_alloc__downnorm_rank__p95__target4",
+            "rmsnorm_alloc__downnorm_rank__p95__target6",
+            "rmsnorm_alloc__downnorm_rank__p95__target8",
+        ])
+        self.assertIn("cohort=pure_downnorm_curve", output)
+
+    def test_incomplete_old_ellipsoid_cohort_is_still_rejected(self):
+        specs = [{"label": label} for label in (
+            "baseline_unpruned",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target4",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+        )]
+        with self.assertRaisesRegex(ValueError, "paper_v3_frozen"):
+            validate_checkpoint_cohort(specs)
+
     def test_equal_records_have_no_mismatch(self):
         examples = [{"collection": "canary", "sample_index": 0,
                      "text_sha256": "hash", "text": "abc"}]
