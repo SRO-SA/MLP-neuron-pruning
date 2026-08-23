@@ -24,6 +24,7 @@ from src.moe_pruning import (
     save_moe_bound_tightness_diagnostics,
 )
 from src.rmsnorm_geometry import (
+    compute_rmsnorm_ellipsoid_and_down_norm_from_weights,
     compute_observed_channel_contribution_max_from_weights,
     compute_rmsnorm_bound_triplet_from_weights,
     compute_rmsnorm_ellipsoid_bound_from_weights,
@@ -78,6 +79,23 @@ def _copy_expert_weights(
 
 
 class RMSNormEllipsoidMathTests(unittest.TestCase):
+    def test_joint_collector_matches_individual_ellipsoid_and_down_norm(self) -> None:
+        generator = torch.Generator().manual_seed(42)
+        gate = torch.randn(5, 4, generator=generator)
+        up = torch.randn(5, 4, generator=generator)
+        down = torch.randn(4, 5, generator=generator)
+        gamma = torch.rand(4, generator=generator) + 0.5
+        joint_ellipsoid, joint_down = (
+            compute_rmsnorm_ellipsoid_and_down_norm_from_weights(
+                gate, up, down, gamma
+            )
+        )
+        expected = compute_rmsnorm_ellipsoid_bound_from_weights(
+            gate, up, down, gamma
+        )
+        self.assertTrue(torch.allclose(joint_ellipsoid, expected))
+        self.assertTrue(torch.allclose(joint_down, down.float().norm(dim=0)))
+
     def test_limited_percentile_aggregations_match_torch_quantile(self) -> None:
         scores = torch.arange(20, dtype=torch.float32).reshape(5, 4)
         for name, quantile in (("p90", 0.90), ("p95", 0.95),

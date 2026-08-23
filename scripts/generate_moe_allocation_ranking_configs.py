@@ -154,6 +154,16 @@ PROFILE_EXPERIMENTS = {
         _cell(8, "down_norm", "rmsnorm_ellipsoid_bound",
               "downnorm_alloc__ellipsoid_rank"),
     ],
+    "pure_downnorm_rmsnorm_allocation_curve": [
+        _cell(2, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank__target2"),
+        _cell(4, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank__target4"),
+        _cell(6, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank__target6"),
+        _cell(8, "rmsnorm_bound", "down_norm",
+              "rmsnorm_alloc__downnorm_rank__target8"),
+    ],
 }
 
 

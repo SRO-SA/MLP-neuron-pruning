@@ -91,6 +91,39 @@ def compute_rmsnorm_ellipsoid_bound_from_weights(
     return scores
 
 
+def compute_rmsnorm_ellipsoid_and_down_norm_from_weights(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    gamma: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ellipsoid and down-column scores from one FP32 weight copy.
+
+    This helper is used by the set-certificate collector.  It deliberately
+    materializes only one expert's FP32 weights at a time and returns CPU
+    score vectors, never a model-wide FP32 weight copy.
+    """
+    gate32, up32, down32, gamma32, d_ff, d_model = _validated_float32_inputs(
+        gate, up, down, gamma
+    )
+    weighted_gate = gate32 * gamma32.unsqueeze(0)
+    weighted_up = up32 * gamma32.unsqueeze(0)
+    down_norms = down32.norm(dim=0)
+    ellipsoid = (
+        (float(d_model) / 2.0)
+        * (
+            weighted_gate.norm(dim=1) * weighted_up.norm(dim=1)
+            + (weighted_gate * weighted_up).sum(dim=1).abs()
+        )
+        * down_norms
+    )
+    if tuple(ellipsoid.shape) != (d_ff,) or tuple(down_norms.shape) != (d_ff,):
+        raise AssertionError("ellipsoid/down-norm score shapes are invalid")
+    if not torch.isfinite(ellipsoid).all() or not torch.isfinite(down_norms).all():
+        raise FloatingPointError("ellipsoid/down-norm computation is non-finite")
+    return ellipsoid, down_norms
+
+
 def compute_rmsnorm_bound_triplet_from_weights(
     gate: torch.Tensor,
     up: torch.Tensor,

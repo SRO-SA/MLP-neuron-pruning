@@ -134,6 +134,8 @@ def _comparison_is_primary(row: dict) -> bool:
         return False
     if row["comparison_type"] == "target6_selector_attribution":
         return True
+    if row["comparison_type"] == "certified_hybrid_attribution":
+        return True
     return (
         row["comparison_type"] == "checkpoint_vs_baseline"
         and row["first_label"] ==
@@ -470,6 +472,39 @@ def summarize(
             paired_rows.extend(flatten_paired_comparison(
                 first_label, second_label, "target6_selector_attribution", paired
             ))
+    # Explicit, predeclared hybrid references.  The manifest controls this
+    # family so the analysis cannot choose comparisons after seeing accuracy.
+    for spec in specs:
+        references = list(spec.get("paired_reference_labels", []))
+        if not references:
+            continue
+        first_label = spec["label"]
+        first = loaded[first_label]
+        for second_label in references:
+            if second_label not in loaded:
+                raise ValueError(
+                    f"hybrid paired reference is absent: {first_label} vs {second_label}"
+                )
+            second = loaded[second_label]
+            if set(first["samples"]) != set(second["samples"]):
+                raise ValueError(f"hybrid task sets differ: {first_label} {second_label}")
+            for task in first["samples"]:
+                if first["identities"][task] != second["identities"][task]:
+                    raise ValueError(
+                        f"hybrid paired identities differ: {task} "
+                        f"{first_label} {second_label}"
+                    )
+            paired = paired_bootstrap_accuracy(
+                first["samples"], second["samples"],
+                n_resamples=n_resamples, seed=bootstrap_seed,
+            )
+            comparisons.append({
+                "label": first_label, "versus": second_label,
+                "comparison_type": "certified_hybrid_attribution", "paired": paired,
+            })
+            paired_rows.extend(flatten_paired_comparison(
+                first_label, second_label, "certified_hybrid_attribution", paired
+            ))
     _annotate_multiplicity(paired_rows)
     audit = {
         "schema_version": 1,
@@ -487,8 +522,9 @@ def summarize(
         },
         "multiple_testing": {
             "primary_definition": (
-                "target-6 primary checkpoint versus baseline macro, and target-6 "
-                "ellipsoid versus matched selector comparator macros"
+                "target-6 primary checkpoint versus baseline macro; target-6 "
+                "ellipsoid versus matched selector comparator macros; and "
+                "predeclared certified-hybrid versus endpoint macros"
             ),
             "exploratory_definition": "all task-level and remaining macro comparisons",
             "adjustments": ["Holm family-wise error", "Benjamini-Hochberg FDR"],
