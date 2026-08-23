@@ -23,7 +23,11 @@ from src.heterogeneous_moe_checkpoint import (
     load_heterogeneous_checkpoint,
 )
 from src.tokenizer_policy import resolve_tokenizer_policy
-from src.system_evidence import shape_integers
+from src.system_evidence import (
+    shape_integers,
+    validate_packed_moe_shapes,
+    validate_unpacked_moe_shapes,
+)
 
 
 def _dtype(name: str):
@@ -129,7 +133,7 @@ def benchmark_case(model, tokenizer, *, batch: int, prompt_len: int,
 
 
 def collect_moe_execution_evidence(model, tokenizer) -> dict:
-    """Run one untimed forward and record the packed tensors actually invoked."""
+    """Run one untimed forward and record packed or unpacked expert execution."""
     records: dict[int, dict] = {}
     handles = []
     for layer_idx, layer in enumerate(find_decoder_layers(model)):
@@ -137,48 +141,114 @@ def collect_moe_execution_evidence(model, tokenizer) -> dict:
         experts = getattr(mlp, "experts", None)
         gate_up = getattr(experts, "gate_up_proj", None)
         down = getattr(experts, "down_proj", None)
-        if not isinstance(gate_up, torch.Tensor) or not isinstance(down, torch.Tensor):
+        if isinstance(gate_up, torch.Tensor) and isinstance(down, torch.Tensor):
+            layout = validate_packed_moe_shapes(gate_up.shape, down.shape)
+            record = {
+                "layer_idx": layer_idx, "module_class": type(experts).__name__,
+                "layout": "packed", "call_count": 0,
+                "expert_count": layout["expert_count"],
+                "gate_up_proj_shape": list(gate_up.shape),
+                "down_proj_shape": list(down.shape),
+                "intermediate_width": layout["intermediate_width"],
+                "device": str(gate_up.device), "input_hidden_shapes": [],
+                "routing_count_summaries": [],
+            }
+            records[layer_idx] = record
+
+            def packed_pre_hook(_module, inputs, *, target=record):
+                target["call_count"] += 1
+                tensor_inputs = [
+                    value for value in inputs if isinstance(value, torch.Tensor)
+                ]
+                if tensor_inputs:
+                    shape = list(tensor_inputs[0].shape)
+                    if shape not in target["input_hidden_shapes"]:
+                        target["input_hidden_shapes"].append(shape)
+                route = next((
+                    value for value in tensor_inputs[1:] if value.dtype in (
+                        torch.int8, torch.int16, torch.int32, torch.int64,
+                    )
+                ), None)
+                if route is not None:
+                    counts = torch.bincount(
+                        route.reshape(-1).long(),
+                        minlength=target["gate_up_proj_shape"][0],
+                    ).detach().cpu()
+                    positive = counts[counts > 0].float()
+                    target["routing_count_summaries"].append({
+                        "routed_assignments": int(counts.sum()),
+                        "active_experts": int((counts > 0).sum()),
+                        "tokens_per_active_expert_min": (
+                            int(positive.min()) if positive.numel() else 0
+                        ),
+                        "tokens_per_active_expert_median": (
+                            float(positive.median()) if positive.numel() else 0.0
+                        ),
+                        "tokens_per_active_expert_max": (
+                            int(positive.max()) if positive.numel() else 0
+                        ),
+                    })
+
+            handles.append(experts.register_forward_pre_hook(packed_pre_hook))
             continue
-        width = int(down.shape[2])
+
+        try:
+            expert_modules = list(experts)
+        except TypeError:
+            expert_modules = []
+        expert_shapes = []
+        for expert in expert_modules:
+            weights = {
+                name: getattr(getattr(expert, f"{name}_proj", None), "weight", None)
+                for name in ("gate", "up", "down")
+            }
+            if not all(
+                isinstance(weight, torch.Tensor) for weight in weights.values()
+            ):
+                expert_shapes = []
+                break
+            expert_shapes.append({
+                name: list(weight.shape) for name, weight in weights.items()
+            })
+        if not expert_shapes:
+            continue
+        layout = validate_unpacked_moe_shapes(expert_shapes)
+        first_gate = expert_modules[0].gate_proj.weight
         record = {
             "layer_idx": layer_idx, "module_class": type(experts).__name__,
-            "call_count": 0, "gate_up_proj_shape": list(gate_up.shape),
-            "down_proj_shape": list(down.shape), "intermediate_width": width,
-            "device": str(gate_up.device), "input_hidden_shapes": [],
-            "routing_count_summaries": [],
+            "expert_module_class": type(expert_modules[0]).__name__,
+            "layout": "unpacked", "call_count": 0,
+            "expert_count": layout["expert_count"],
+            "executed_expert_indices": [],
+            "gate_proj_shape_per_expert": layout["gate_proj_shape"],
+            "up_proj_shape_per_expert": layout["up_proj_shape"],
+            "down_proj_shape_per_expert": layout["down_proj_shape"],
+            "intermediate_width": layout["intermediate_width"],
+            "device": str(first_gate.device), "input_hidden_shapes": [],
         }
         records[layer_idx] = record
 
-        def pre_hook(_module, inputs, *, target=record):
-            target["call_count"] += 1
-            tensor_inputs = [value for value in inputs if isinstance(value, torch.Tensor)]
-            if tensor_inputs:
-                target["input_hidden_shapes"].append(list(tensor_inputs[0].shape))
-            route = next((value for value in tensor_inputs[1:] if value.dtype in (
-                torch.int8, torch.int16, torch.int32, torch.int64,
-            )), None)
-            if route is not None:
-                counts = torch.bincount(
-                    route.reshape(-1).long(), minlength=target["gate_up_proj_shape"][0]
-                ).detach().cpu()
-                positive = counts[counts > 0].float()
-                target["routing_count_summaries"].append({
-                    "routed_assignments": int(counts.sum()),
-                    "active_experts": int((counts > 0).sum()),
-                    "tokens_per_active_expert_min": (
-                        int(positive.min()) if positive.numel() else 0
-                    ),
-                    "tokens_per_active_expert_median": (
-                        float(positive.median()) if positive.numel() else 0.0
-                    ),
-                    "tokens_per_active_expert_max": (
-                        int(positive.max()) if positive.numel() else 0
-                    ),
-                })
+        for expert_idx, expert in enumerate(expert_modules):
+            def unpacked_pre_hook(
+                _module, inputs, *, target=record, target_expert_idx=expert_idx,
+            ):
+                target["call_count"] += 1
+                if target_expert_idx not in target["executed_expert_indices"]:
+                    target["executed_expert_indices"].append(target_expert_idx)
+                tensor_input = next((
+                    value for value in inputs if isinstance(value, torch.Tensor)
+                ), None)
+                if tensor_input is not None:
+                    shape = list(tensor_input.shape)
+                    if shape not in target["input_hidden_shapes"]:
+                        target["input_hidden_shapes"].append(shape)
 
-        handles.append(experts.register_forward_pre_hook(pre_hook))
+            handles.append(expert.register_forward_pre_hook(unpacked_pre_hook))
     if not records:
-        raise RuntimeError("no packed MoE expert modules found for runtime evidence")
+        raise RuntimeError(
+            "no supported packed or unpacked MoE expert modules found for "
+            "runtime evidence"
+        )
     device = model.get_input_embeddings().weight.device
     inputs = _exact_inputs(tokenizer, batch=1, length=128, device=device)
     try:
@@ -191,24 +261,52 @@ def collect_moe_execution_evidence(model, tokenizer) -> dict:
     for record in records.values():
         if record["call_count"] <= 0:
             raise AssertionError(
-                f"packed MoE layer {record['layer_idx']} was not executed"
+                f"MoE layer {record['layer_idx']} was not executed"
             )
-        experts, doubled_width, hidden = record["gate_up_proj_shape"]
-        down_experts, down_hidden, width = record["down_proj_shape"]
-        if experts != down_experts or hidden != down_hidden or doubled_width != 2 * width:
-            raise AssertionError(f"incompatible packed expert shapes: {record}")
-        record["inferred_executed_gemm_dimensions"] = {
-            "gate_up": {"M": "routed tokens per expert", "K": hidden,
-                        "N": doubled_width},
-            "down": {"M": "routed tokens per expert", "K": width,
-                     "N": hidden},
-        }
+        if record["layout"] == "packed":
+            layout = validate_packed_moe_shapes(
+                record["gate_up_proj_shape"], record["down_proj_shape"]
+            )
+            record["inferred_executed_gemm_dimensions"] = {
+                "gate_up": {
+                    "M": "routed tokens per expert", "K": layout["hidden_size"],
+                    "N": 2 * layout["intermediate_width"],
+                },
+                "down": {
+                    "M": "routed tokens per expert",
+                    "K": layout["intermediate_width"], "N": layout["hidden_size"],
+                },
+            }
+        else:
+            record["executed_expert_indices"].sort()
+            record["executed_expert_count"] = len(record["executed_expert_indices"])
+            if record["executed_expert_count"] <= 0:
+                raise AssertionError(
+                    f"unpacked MoE layer {record['layer_idx']} routed no experts"
+                )
+            width = record["intermediate_width"]
+            hidden = record["gate_proj_shape_per_expert"][1]
+            record["inferred_executed_gemm_dimensions"] = {
+                "gate": {"M": "routed tokens", "K": hidden, "N": width},
+                "up": {"M": "routed tokens", "K": hidden, "N": width},
+                "down": {"M": "routed tokens", "K": width, "N": hidden},
+            }
+    all_executed = all(row["call_count"] > 0 for row in records.values())
+    layout_counts = {
+        layout: sum(row["layout"] == layout for row in records.values())
+        for layout in ("packed", "unpacked")
+    }
     return {
-        "evidence_type": "runtime forward-pre-hook on executed packed expert module",
-        "probe_batch_size": 1, "probe_prompt_length_tokens": 128,
-        "all_packed_moe_layers_executed": all(
-            row["call_count"] > 0 for row in records.values()
+        "evidence_type": (
+            "runtime forward-pre-hooks on executed packed or unpacked expert modules"
         ),
+        "probe_batch_size": 1, "probe_prompt_length_tokens": 128,
+        "all_moe_layers_executed": all_executed,
+        # Retained for backward compatibility with already-frozen systems tables.
+        "all_packed_moe_layers_executed": (
+            all_executed and layout_counts["unpacked"] == 0
+        ),
+        "layout_counts": layout_counts,
         "layers": [records[key] for key in sorted(records)],
     }
 
@@ -341,7 +439,11 @@ def main() -> None:
         ))
     )
     if expected_widths and not runtime_widths_match:
-        raise AssertionError("runtime packed-MoE widths differ from pruning plan")
+        raise AssertionError("runtime MoE widths differ from pruning plan")
+    all_moe_layers_executed = execution_evidence.get(
+        "all_moe_layers_executed",
+        execution_evidence.get("all_packed_moe_layers_executed", False),
+    )
     operator_profile = {
         "enabled": False,
         "reason": "Pass --profile-gemm-shapes for a CUDA operator trace.",
@@ -408,10 +510,8 @@ def main() -> None:
             bool(shape_audit) and all(row["actual_width"] == row["expected_width"]
                                       for row in shape_audit)
             and runtime_widths_match
-            and execution_evidence["all_packed_moe_layers_executed"]
-        ) if os.path.isfile(plan_path) else execution_evidence[
-            "all_packed_moe_layers_executed"
-        ],
+            and all_moe_layers_executed
+        ) if os.path.isfile(plan_path) else all_moe_layers_executed,
         "tokenizer_policy": tokenizer_policy,
         "shape_audit": shape_audit,
         "runtime_moe_execution_evidence": execution_evidence,

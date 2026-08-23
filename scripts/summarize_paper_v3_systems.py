@@ -60,7 +60,10 @@ def collect(run_dir: str | list[str]) -> tuple[list[dict], list[dict]]:
             row["checkpoint_storage_gib_binary"] = storage / (1024 ** 3)
             evidence = payload.get("runtime_moe_execution_evidence", {})
             row["runtime_moe_shapes_confirmed"] = bool(
-                evidence.get("all_packed_moe_layers_executed", False)
+                evidence.get(
+                    "all_moe_layers_executed",
+                    evidence.get("all_packed_moe_layers_executed", False),
+                )
             )
             operator = payload.get("operator_profile_evidence", {})
             row["operator_profiler_enabled"] = bool(operator.get("enabled", False))

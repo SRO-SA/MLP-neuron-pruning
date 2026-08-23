@@ -5,7 +5,11 @@ import unittest
 
 from scripts.audit_paper_v3_plan_nesting import audit_pair, selected_by_layer
 from scripts.build_paper_v3_pareto_table import _dominates
-from src.system_evidence import shape_integers
+from src.system_evidence import (
+    shape_integers,
+    validate_packed_moe_shapes,
+    validate_unpacked_moe_shapes,
+)
 from src.paired_bootstrap import paired_signflip_nll_p_value
 from src.statistical_audit import (
     apply_multiplicity_adjustments,
@@ -82,6 +86,29 @@ class StatisticalAuditTests(unittest.TestCase):
     def test_profiler_shape_extraction_is_nested(self):
         self.assertEqual(shape_integers([[2, 768], [128, [704]]]),
                          {2, 128, 704, 768})
+
+    def test_packed_moe_execution_shapes(self):
+        layout = validate_packed_moe_shapes([128, 1536, 2048], [128, 2048, 768])
+        self.assertEqual(layout["layout"], "packed")
+        self.assertEqual(layout["expert_count"], 128)
+        self.assertEqual(layout["intermediate_width"], 768)
+
+    def test_unpacked_moe_execution_shapes(self):
+        shapes = [
+            {"gate": [752, 2048], "up": [752, 2048], "down": [2048, 752]}
+            for _ in range(4)
+        ]
+        layout = validate_unpacked_moe_shapes(shapes)
+        self.assertEqual(layout["layout"], "unpacked")
+        self.assertEqual(layout["expert_count"], 4)
+        self.assertEqual(layout["intermediate_width"], 752)
+
+    def test_unpacked_moe_execution_shapes_reject_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "heterogeneous experts"):
+            validate_unpacked_moe_shapes([
+                {"gate": [752, 2048], "up": [752, 2048], "down": [2048, 752]},
+                {"gate": [736, 2048], "up": [736, 2048], "down": [2048, 736]},
+            ])
 
 
 if __name__ == "__main__":
