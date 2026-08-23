@@ -68,10 +68,14 @@ def main() -> None:
                 "selection_sha256": item["selection_sha256"],
                 "certificate_objective_pareto_optimal": item["certificate_objective_pareto_optimal"],
             })
-    if len(rows) != 10:
-        raise ValueError(f"expected 10 PPL rows, got {len(rows)}")
+    expected_rows = 2 * len(manifest)
+    if len(rows) != expected_rows:
+        raise ValueError(f"expected {expected_rows} PPL rows, got {len(rows)}")
     if args.dry_run:
-        print("[hybrid-ppl-summary] DRY RUN: 10 validated rows")
+        print(
+            f"[hybrid-ppl-summary] DRY RUN: {expected_rows} validated rows "
+            f"for {len(manifest)} distinct candidates"
+        )
         return
     output_dir = Path(args.output_dir)
     if output_dir.exists():

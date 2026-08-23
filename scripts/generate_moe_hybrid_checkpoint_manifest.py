@@ -25,8 +25,20 @@ def main() -> None:
     parser.add_argument("--existing-checkpoint-manifest", required=True)
     parser.add_argument("--new-checkpoint-root", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--max-intermediate-checkpoints", type=int, default=2)
+    parser.add_argument(
+        "--minimum-objective-gap-closure", type=float, default=0.10,
+        help=(
+            "Predeclared minimum fraction of the ellipsoid-to-down-norm "
+            "objective gap closed by an intermediate candidate."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.max_intermediate_checkpoints < 0 or args.max_intermediate_checkpoints > 2:
+        raise ValueError("max-intermediate-checkpoints must be between 0 and 2")
+    if not 0.0 <= args.minimum_objective_gap_closure <= 1.0:
+        raise ValueError("minimum-objective-gap-closure must be in [0, 1]")
     frontier = json.loads(Path(args.frontier_manifest).read_text(encoding="utf-8"))
     existing = json.loads(Path(args.existing_checkpoint_manifest).read_text(encoding="utf-8"))
     by_label = {row["label"]: row for row in existing}
@@ -54,6 +66,54 @@ def main() -> None:
         ): endpoint_labels[name]
         for name, plan in reference_plans.items()
     }
+    frontier_by_name = {row["plan"]: row for row in frontier["plans"]}
+    ellipsoid_row = frontier_by_name["ellipsoid_slack0"]
+    down_row = frontier_by_name["pure_down_norm"]
+    ellipsoid_objective = float(ellipsoid_row["normalized_down_norm_objective"])
+    down_objective = float(down_row["normalized_down_norm_objective"])
+    objective_gap = ellipsoid_objective - down_objective
+    if objective_gap <= 0:
+        raise ValueError("pure down-norm does not improve the recorded objective")
+    down_certificate = float(down_row["strict_certificate"])
+    eligible_by_selection = {}
+    for row in frontier["plans"]:
+        if row["plan"] in endpoint_labels:
+            continue
+        gap_closure = (
+            ellipsoid_objective - float(row["normalized_down_norm_objective"])
+        ) / objective_gap
+        eligible = (
+            row.get("certificate_objective_pareto_optimal") is True
+            and float(row["strict_certificate"]) < down_certificate
+            and gap_closure >= args.minimum_objective_gap_closure
+        )
+        if not eligible:
+            continue
+        previous = eligible_by_selection.get(row["selection_sha256"])
+        if previous is None or (
+            float(row["normalized_down_norm_objective"]),
+            float(row["strict_certificate"]),
+            float(row["certificate_slack"]),
+            row["plan"],
+        ) < (
+            float(previous["normalized_down_norm_objective"]),
+            float(previous["strict_certificate"]),
+            float(previous["certificate_slack"]),
+            previous["plan"],
+        ):
+            eligible_by_selection[row["selection_sha256"]] = {
+                **row, "objective_gap_closure": gap_closure,
+            }
+    selected_intermediates = sorted(
+        eligible_by_selection.values(),
+        key=lambda row: (
+            float(row["normalized_down_norm_objective"]),
+            float(row["strict_certificate"]),
+            float(row["certificate_slack"]),
+            row["plan"],
+        ),
+    )[:args.max_intermediate_checkpoints]
+    selected_intermediate_names = {row["plan"] for row in selected_intermediates}
     seen_selections = set(endpoint_signature_to_label)
     reuse_rows = []
     for row in frontier["plans"]:
@@ -81,6 +141,17 @@ def main() -> None:
                 "reason": "identical selected channel identities",
             })
             continue
+        if name not in selected_intermediate_names:
+            reuse_rows.append({
+                "frontier_plan": name,
+                "reused_checkpoint_label": "",
+                "reason": (
+                    "not selected by bounded downstream gate: requires Pareto, "
+                    "certificate strictly below pure down-norm, material objective "
+                    "improvement, and top-two deterministic rank"
+                ),
+            })
+            continue
         seen_selections.add(signature)
         label = f"certified_hybrid__{name}__target6"
         plan_path = str(row["plan_path"])
@@ -101,6 +172,11 @@ def main() -> None:
             "certificate_slack": row["certificate_slack"],
             "selection_sha256": row["selection_sha256"],
             "paired_reference_labels": [required[1], required[2]],
+            "objective_gap_closure": next(
+                candidate["objective_gap_closure"]
+                for candidate in selected_intermediates
+                if candidate["plan"] == name
+            ),
         }
         specs.append(spec)
     output = Path(args.output)
@@ -108,6 +184,10 @@ def main() -> None:
         for spec in specs:
             print(f"[hybrid-checkpoint-manifest] WOULD INCLUDE {spec['label']}: {spec['checkpoint_dir']}")
         print(f"[hybrid-checkpoint-manifest] DRY RUN checkpoints={len(specs)} reuse={reuse_rows}")
+        print(
+            "[hybrid-checkpoint-manifest] bounded intermediates="
+            f"{sorted(selected_intermediate_names)}"
+        )
         return
     if output.exists():
         raise FileExistsError(output)
@@ -115,6 +195,15 @@ def main() -> None:
     output.write_text(json.dumps(specs, indent=2), encoding="utf-8")
     reuse_path = output.with_name(output.stem + "_selection_reuse.json")
     reuse_path.write_text(json.dumps(reuse_rows, indent=2), encoding="utf-8")
+    selection_path = output.with_name(output.stem + "_downstream_selection.json")
+    selection_path.write_text(json.dumps({
+        "schema_version": 1,
+        "maximum_intermediate_checkpoints": args.max_intermediate_checkpoints,
+        "minimum_objective_gap_closure": args.minimum_objective_gap_closure,
+        "pure_down_norm_strict_certificate": down_certificate,
+        "selected_intermediates": selected_intermediates,
+        "selection_uses_downstream_results": False,
+    }, indent=2), encoding="utf-8")
     print(f"[hybrid-checkpoint-manifest] OK checkpoints={len(specs)} reuse={len(reuse_rows)} output={output}")
 
 

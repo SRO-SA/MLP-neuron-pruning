@@ -92,6 +92,12 @@ def main() -> None:
         config_dir.mkdir(parents=True, exist_ok=True)
     manifest = []
     for row in plan_rows:
+        if row.get("evaluate_ppl") is False:
+            print(
+                f"[fixed-plan-config] SKIP duplicate/non-Pareto {row['plan']}: "
+                f"representative={row.get('evaluation_representative', '')}"
+            )
+            continue
         name = str(row["plan"])
         plan_path = Path(row["plan_path"])
         if not plan_path.is_file():
@@ -146,6 +152,8 @@ def main() -> None:
         manifest_path = config_dir / "fixed_plan_eval_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"[fixed-plan-config] OK configs={len(manifest)} manifest={manifest_path}")
+    elif not manifest:
+        raise ValueError("frontier contains no distinct Pareto PPL candidates")
 
 
 if __name__ == "__main__":

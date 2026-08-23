@@ -23,7 +23,7 @@ from src.moe_set_certification import (
 )
 
 
-SLACKS = (0.00, 0.05, 0.10, 0.25)
+SLACKS = (0.00, 0.0025, 0.005, 0.01, 0.015, 0.02, 0.021436)
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -36,7 +36,27 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def plan_name(rho: float) -> str:
-    return "ellipsoid_slack0" if rho == 0 else f"downnorm_refinement_slack{int(rho * 100)}"
+    if rho == 0:
+        return "ellipsoid_slack0"
+    percent = f"{rho * 100:.4f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"downnorm_refinement_slack{percent}"
+
+
+def selection_overlap(left: dict[int, set[int]], right: dict[int, set[int]]) -> dict:
+    """Summarize matched-budget channel identity overlap."""
+    if set(left) != set(right):
+        raise ValueError("selection layer sets differ")
+    intersection = sum(len(left[layer] & right[layer]) for layer in left)
+    union = sum(len(left[layer] | right[layer]) for layer in left)
+    left_total = sum(len(values) for values in left.values())
+    right_total = sum(len(values) for values in right.values())
+    if left_total != right_total:
+        raise ValueError("selection budgets differ")
+    return {
+        "selected_channel_intersection": intersection,
+        "selected_channel_replacements": left_total - intersection,
+        "selected_channel_jaccard": intersection / union if union else 1.0,
+    }
 
 
 def main() -> None:
@@ -72,7 +92,8 @@ def main() -> None:
     )
     if args.dry_run:
         print(
-            f"[hybrid-frontier] DRY RUN plans=5 slacks={SLACKS} "
+            f"[hybrid-frontier] DRY RUN plans={len(SLACKS) + 1} "
+            f"slacks={SLACKS} "
             f"output={output_dir}"
         )
         return
@@ -145,6 +166,12 @@ def main() -> None:
     frontier_rows = []
     plan_manifest = []
     selections = {}
+    ellipsoid_selected = {
+        key: set(value) for key, value in selected_by_layer(ellipsoid_plan).items()
+    }
+    down_selected = {
+        key: set(value) for key, value in selected_by_layer(down_plan).items()
+    }
     for rho in SLACKS:
         name = plan_name(rho)
         if rho == 0.0:
@@ -206,6 +233,8 @@ def main() -> None:
             json.dumps(selection_signature, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         selections[name] = selection_hash
+        overlap_ellipsoid = selection_overlap(selected, ellipsoid_selected)
+        overlap_down = selection_overlap(selected, down_selected)
         row = {
             "plan": name,
             "certificate_slack": rho,
@@ -223,6 +252,10 @@ def main() -> None:
             "plan_path": str(plan_path),
             "plan_sha256": file_sha256(str(plan_path)),
             "unconstrained_endpoint": False,
+            **{f"vs_ellipsoid_{key}": value
+               for key, value in overlap_ellipsoid.items()},
+            **{f"vs_down_norm_{key}": value
+               for key, value in overlap_down.items()},
         }
         frontier_rows.append(row)
         plan_manifest.append(row.copy())
@@ -264,6 +297,10 @@ def main() -> None:
         "plan_path": str(pure_path),
         "plan_sha256": file_sha256(str(pure_path)),
         "unconstrained_endpoint": True,
+        **{f"vs_ellipsoid_{key}": value for key, value in
+           selection_overlap(pure_selected, ellipsoid_selected).items()},
+        **{f"vs_down_norm_{key}": value for key, value in
+           selection_overlap(pure_selected, down_selected).items()},
     }
     frontier_rows.append(pure_row)
     plan_manifest.append(pure_row.copy())
@@ -281,11 +318,34 @@ def main() -> None:
         )
         row["certificate_objective_pareto_optimal"] = not dominated
         plan_manifest[index]["certificate_objective_pareto_optimal"] = not dominated
-    distinct = len(set(selections.values()) | {selection_hash})
+    distinct = len({row["selection_sha256"] for row in frontier_rows})
     duplicate_groups = {}
     for row in frontier_rows:
         duplicate_groups.setdefault(row["selection_sha256"], []).append(row["plan"])
     duplicates = [values for values in duplicate_groups.values() if len(values) > 1]
+
+    # PPL is run once per genuinely distinct certificate/objective-Pareto
+    # selection. Prefer the named endpoints as representatives when a bounded
+    # slack reaches exactly the same selection.
+    representative_by_selection = {}
+    for row in sorted(
+        frontier_rows,
+        key=lambda value: (
+            0 if value["plan"] in {"ellipsoid_slack0", "pure_down_norm"} else 1,
+            float(value["certificate_slack"])
+            if value["certificate_slack"] != "unconstrained" else float("inf"),
+            value["plan"],
+        ),
+    ):
+        if not row["certificate_objective_pareto_optimal"]:
+            continue
+        representative_by_selection.setdefault(row["selection_sha256"], row["plan"])
+    for index, row in enumerate(frontier_rows):
+        representative = representative_by_selection.get(row["selection_sha256"], "")
+        row["evaluation_representative"] = representative
+        row["evaluate_ppl"] = row["plan"] == representative
+        plan_manifest[index]["evaluation_representative"] = representative
+        plan_manifest[index]["evaluate_ppl"] = row["evaluate_ppl"]
 
     write_csv(output_dir / "hybrid_frontier.csv", frontier_rows)
     frontier_json = {
@@ -296,6 +356,9 @@ def main() -> None:
         "distinct_selection_count": distinct,
         "identical_selection_groups": duplicates,
         "thresholds_were_not_adapted": True,
+        "ppl_evaluation_plan_count": sum(
+            bool(row["evaluate_ppl"]) for row in plan_manifest
+        ),
         "source_plans": report_json["source_plans"],
         "matched_plan_validation": {
             "path": str(paths[4]),
@@ -307,8 +370,8 @@ def main() -> None:
         json.dumps(frontier_json, indent=2), encoding="utf-8"
     )
     frontier_md = [
-        "| Plan | Slack | Strict certificate | Certificate change | Down-norm objective | Swaps | Distinct selection | Pareto |",
-        "|---|---:|---:|---:|---:|---:|---|---|",
+        "| Plan | Slack | Strict certificate | Certificate change | Down-norm objective | Replacements vs ellipsoid | Jaccard vs ellipsoid | Replacements vs down-norm | Jaccard vs down-norm | Swaps | Selection | Pareto | PPL representative |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
     ]
     frontier_tex = [
         "\\begin{tabular}{lrrrrrr}",
@@ -319,8 +382,14 @@ def main() -> None:
         frontier_md.append(
             f"| {row['plan']} | {row['certificate_slack']} | {row['strict_certificate']:.7g} | "
             f"{row['certificate_change_vs_ellipsoid_pct']:+.3f}% | "
-            f"{row['normalized_down_norm_objective']:.7g} | {row['accepted_swaps']} | "
-            f"`{row['selection_sha256'][:12]}` | {row['certificate_objective_pareto_optimal']} |"
+            f"{row['normalized_down_norm_objective']:.7g} | "
+            f"{row['vs_ellipsoid_selected_channel_replacements']} | "
+            f"{row['vs_ellipsoid_selected_channel_jaccard']:.5f} | "
+            f"{row['vs_down_norm_selected_channel_replacements']} | "
+            f"{row['vs_down_norm_selected_channel_jaccard']:.5f} | "
+            f"{row['accepted_swaps']} | `{row['selection_sha256'][:12]}` | "
+            f"{row['certificate_objective_pareto_optimal']} | "
+            f"{row['evaluation_representative']} |"
         )
         plan_tex = row["plan"].replace("_", "\\_")
         frontier_tex.append(
@@ -337,7 +406,7 @@ def main() -> None:
         "\n".join(frontier_tex) + "\n", encoding="utf-8"
     )
     print(
-        f"[hybrid-frontier] OK plans=5 distinct={distinct} "
+        f"[hybrid-frontier] OK plans={len(frontier_rows)} distinct={distinct} "
         f"duplicates={duplicates} output={output_dir}"
     )
 

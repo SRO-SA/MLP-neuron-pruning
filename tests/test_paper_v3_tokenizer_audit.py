@@ -66,6 +66,15 @@ class PaperV3TokenizerAuditTests(unittest.TestCase):
         ])
         self.assertIn("cohort=pure_downnorm_curve", output)
 
+    def test_dry_run_accepts_bounded_certified_hybrid_cohort(self):
+        output = self._run_dry_run([
+            "baseline_unpruned",
+            "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+            "rmsnorm_alloc__downnorm_rank__p95__target6",
+            "certified_hybrid__downnorm_refinement_slack1__target6",
+        ])
+        self.assertIn("cohort=certified_hybrid_fine", output)
+
     def test_incomplete_old_ellipsoid_cohort_is_still_rejected(self):
         specs = [{"label": label} for label in (
             "baseline_unpruned",

@@ -10,6 +10,9 @@ from scripts.summarize_paper_v3_downstream import (
     flatten_paired_comparison, paired_bootstrap_accuracy,
 )
 from scripts.summarize_paper_v3_systems import collect as collect_systems
+from scripts.summarize_paper_v3_systems import (
+    _case_uncertainty, _relative_bootstrap_intervals,
+)
 
 
 class PostMilestoneDryRunTests(unittest.TestCase):
@@ -71,13 +74,18 @@ class PostMilestoneDryRunTests(unittest.TestCase):
                         "decode_latency_per_token_median_ms": latency,
                         "decode_latency_per_token_stdev_ms": 0.1,
                         "decode_tokens_per_second_median": throughput,
+                        "prefill_latency_samples_ms": [latency] * 10,
+                        "decode_latency_per_token_samples_ms": [latency] * 20,
+                        "decode_tokens_per_repetition": 2,
                         "warmup_repetitions": 3, "timed_repetitions": 10,
                     }],
                 }
                 with open(os.path.join(directory, "systems.json"), "w",
                           encoding="utf-8") as handle:
                     json.dump(payload, handle)
-            rows, _ = collect_systems(root)
+            rows, _ = collect_systems(
+                root, bootstrap_resamples=100, bootstrap_seed=42
+            )
             target = next(row for row in rows if row["label"] == "target6")
             self.assertAlmostEqual(
                 target["prefill_latency_reduction_vs_baseline_pct"], 10.0
@@ -85,6 +93,38 @@ class PostMilestoneDryRunTests(unittest.TestCase):
             self.assertAlmostEqual(
                 target["prefill_throughput_gain_vs_baseline_pct"], 10.0
             )
+            self.assertEqual(target["decode_latency_sample_count"], 10)
+            self.assertEqual(target["decode_step_sample_count"], 20)
+            self.assertNotEqual(
+                target["decode_throughput_gain_ci95_lower_pct"], ""
+            )
+
+    def test_systems_bootstrap_uncertainty_is_deterministic(self):
+        case = {
+            "batch_size": 1, "prompt_length_tokens": 128,
+            "prefill_latency_samples_ms": [10, 11, 12, 13, 14],
+            "decode_latency_per_token_samples_ms": [2, 2.1, 2.2, 2.3, 2.4],
+            "timed_repetitions": 5, "decode_tokens_per_repetition": 1,
+        }
+        first = _case_uncertainty(case, resamples=1000, seed=42)
+        second = _case_uncertainty(case, resamples=1000, seed=42)
+        self.assertEqual(first, second)
+        self.assertLessEqual(
+            first["prefill_latency_median_ci95_lower_ms"], 12
+        )
+        self.assertGreaterEqual(
+            first["prefill_latency_median_ci95_upper_ms"], 12
+        )
+        self.assertEqual(first["decode_latency_sample_count"], 5)
+        self.assertEqual(first["decode_step_sample_count"], 5)
+        relative = _relative_bootstrap_intervals(
+            {"prefill": [10, 11, 12, 13], "decode": [2, 2.1, 2.2, 2.3]},
+            {"prefill": [8, 9, 10, 11], "decode": [1.8, 1.9, 2.0, 2.1]},
+            resamples=1000, seed=7,
+        )
+        self.assertGreater(
+            relative["prefill_throughput_gain_ci95_upper_pct"], 0
+        )
 
     def test_release_index_hashes_without_editing_source(self):
         with tempfile.TemporaryDirectory() as root:

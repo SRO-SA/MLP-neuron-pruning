@@ -505,6 +505,50 @@ def summarize(
             paired_rows.extend(flatten_paired_comparison(
                 first_label, second_label, "certified_hybrid_attribution", paired
             ))
+
+    # The compression-curve checkpoints share examples and protocol, so audit
+    # adjacent budgets directly. These are exploratory comparisons because the
+    # 2%-versus-4% question was raised after observing the point estimates.
+    curve_by_target = {}
+    for spec in specs:
+        if (
+            spec.get("allocation_source") == "rmsnorm_bound"
+            and spec.get("ranking_source") == "down_norm"
+        ):
+            target = int(round(float(spec["target_pct"])))
+            if target in curve_by_target:
+                raise ValueError(f"duplicate pure down-norm target {target}")
+            curve_by_target[target] = spec
+    if len(curve_by_target) > 1:
+        targets = sorted(curve_by_target)
+        for lower_target, upper_target in zip(targets, targets[1:]):
+            lower_label = curve_by_target[lower_target]["label"]
+            upper_label = curve_by_target[upper_target]["label"]
+            lower = loaded[lower_label]
+            upper = loaded[upper_label]
+            if set(lower["samples"]) != set(upper["samples"]):
+                raise ValueError(
+                    f"adjacent-budget task sets differ: {lower_label} {upper_label}"
+                )
+            for task in lower["samples"]:
+                if lower["identities"][task] != upper["identities"][task]:
+                    raise ValueError(
+                        f"adjacent-budget paired identities differ: {task} "
+                        f"{lower_label} {upper_label}"
+                    )
+            paired = paired_bootstrap_accuracy(
+                upper["samples"], lower["samples"],
+                n_resamples=n_resamples, seed=bootstrap_seed,
+            )
+            comparisons.append({
+                "label": upper_label, "versus": lower_label,
+                "comparison_type": "compression_curve_adjacent_budget",
+                "paired": paired,
+            })
+            paired_rows.extend(flatten_paired_comparison(
+                upper_label, lower_label,
+                "compression_curve_adjacent_budget", paired,
+            ))
     _annotate_multiplicity(paired_rows)
     audit = {
         "schema_version": 1,
@@ -531,6 +575,10 @@ def summarize(
             "adjusted_within": "multiplicity_family",
         },
         "task_versions": baseline["protocol"].get("task_versions", {}),
+        "compression_curve_adjacent_budget_comparisons": (
+            "exploratory; difference is higher target minus immediately lower "
+            "target; the 2%-versus-4% question followed inspection of point estimates"
+        ),
         "example_identifiers": _identities_manifest(loaded, baseline_label),
         "tokenizer_audit_coverage": tokenizer_coverage,
         "tokenizer_audit_sha256_values": sorted(audit_hashes),

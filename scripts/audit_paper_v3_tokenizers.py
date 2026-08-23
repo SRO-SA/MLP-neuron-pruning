@@ -63,9 +63,16 @@ PURE_DOWNNORM_CURVE_LABELS = frozenset({
     "rmsnorm_alloc__downnorm_rank__p95__target8",
 })
 
+CERTIFIED_HYBRID_FINE_LABELS = frozenset({
+    "baseline_unpruned",
+    "rmsnorm_alloc__ellipsoid_rank__p95__target6",
+    "rmsnorm_alloc__downnorm_rank__p95__target6",
+})
+
 CHECKPOINT_COHORTS = (
     ("pure_downnorm_curve", PURE_DOWNNORM_CURVE_LABELS),
     ("paper_v3_frozen", PAPER_V3_FROZEN_LABELS),
+    ("certified_hybrid_fine", CERTIFIED_HYBRID_FINE_LABELS),
 )
 
 
