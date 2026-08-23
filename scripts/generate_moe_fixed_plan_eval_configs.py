@@ -15,6 +15,52 @@ from scripts.generate_moe_selector_baseline_configs import _build_config, _write
 from src.experiment_provenance import file_sha256
 
 
+def resolve_rmsnorm_allocation_plan(payload: dict, manifest_path: Path) -> Path:
+    """Resolve the frozen RMSNorm-ranked plan that supplies only layer counts.
+
+    The ellipsoid source plan has the correct fixed allocation vector, but its
+    plan-level selector is ``rmsnorm_ellipsoid_bound``.  Replay validation
+    deliberately requires a source plan whose selector matches the declared
+    allocation source, so use the matched RMSNorm plan instead.  Older frontier
+    manifests did not embed this reference; for those, read the immutable
+    matched-plan validation report next to the frontier directory.
+    """
+    allocation_ref = payload.get("allocation_plan")
+    if allocation_ref is None:
+        validation_ref = payload.get("matched_plan_validation")
+        if validation_ref is None:
+            validation_path = manifest_path.parent.parent / "matched_plan_validation.json"
+            validation_sha256 = None
+        else:
+            validation_path = Path(validation_ref["path"])
+            validation_sha256 = validation_ref.get("sha256")
+        if not validation_path.is_file():
+            raise FileNotFoundError(
+                f"matched-plan validation report not found: {validation_path}"
+            )
+        if validation_sha256 and file_sha256(str(validation_path)) != validation_sha256:
+            raise ValueError("matched-plan validation report hash changed")
+        validation = json.loads(validation_path.read_text(encoding="utf-8"))
+        if validation.get("strict_gate_passed") is not True:
+            raise ValueError("matched-plan validation gate did not pass")
+        allocation_ref = validation.get("plans", {}).get("rmsnorm_bound")
+    if not isinstance(allocation_ref, dict):
+        raise ValueError("frozen rmsnorm_bound allocation plan reference is missing")
+
+    allocation_plan = Path(allocation_ref["path"])
+    if not allocation_plan.is_file():
+        raise FileNotFoundError(allocation_plan)
+    if file_sha256(str(allocation_plan)) != allocation_ref["sha256"]:
+        raise ValueError("frozen rmsnorm_bound allocation plan hash changed")
+    allocation_payload = json.loads(allocation_plan.read_text(encoding="utf-8"))
+    if allocation_payload.get("selector") != "rmsnorm_bound":
+        raise ValueError(
+            "allocation plan selector must be 'rmsnorm_bound'; got "
+            f"{allocation_payload.get('selector')!r}"
+        )
+    return allocation_plan
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan-manifest", required=True)
@@ -32,11 +78,11 @@ def main() -> None:
         raise FileNotFoundError(source)
     payload = json.loads(source.read_text(encoding="utf-8"))
     plan_rows = payload.get("plans", payload if isinstance(payload, list) else [])
-    allocation_plan = Path(payload["source_plans"]["ellipsoid"]["path"])
-    if not allocation_plan.is_file():
-        raise FileNotFoundError(allocation_plan)
-    if file_sha256(str(allocation_plan)) != payload["source_plans"]["ellipsoid"]["sha256"]:
-        raise ValueError("frozen RMSNorm allocation plan hash changed")
+    allocation_plan = resolve_rmsnorm_allocation_plan(payload, source)
+    print(
+        "[fixed-plan-config] allocation_source=rmsnorm_bound "
+        f"allocation_plan={allocation_plan}"
+    )
     datasets = [value.strip() for value in args.eval_datasets.split(",") if value.strip()]
     if datasets != ["wikitext2", "c4"]:
         raise ValueError("milestone protocol requires eval-datasets=wikitext2,c4")

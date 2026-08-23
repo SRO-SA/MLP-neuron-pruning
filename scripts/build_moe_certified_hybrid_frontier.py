@@ -297,6 +297,11 @@ def main() -> None:
         "identical_selection_groups": duplicates,
         "thresholds_were_not_adapted": True,
         "source_plans": report_json["source_plans"],
+        "matched_plan_validation": {
+            "path": str(paths[4]),
+            "sha256": file_sha256(str(paths[4])),
+        },
+        "allocation_plan": validation["plans"]["rmsnorm_bound"],
     }
     (output_dir / "hybrid_frontier.json").write_text(
         json.dumps(frontier_json, indent=2), encoding="utf-8"

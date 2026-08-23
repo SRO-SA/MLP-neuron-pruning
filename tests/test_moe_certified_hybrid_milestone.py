@@ -10,7 +10,9 @@ from unittest import mock
 import numpy as np
 
 from scripts.build_moe_certified_hybrid_frontier import main as build_frontier
+from scripts.generate_moe_fixed_plan_eval_configs import resolve_rmsnorm_allocation_plan
 from scripts.validate_target6_matched_plans import merge_compatible_protocols
+from src.experiment_provenance import file_sha256
 
 
 def target6_plan(selector: str, *, down: bool = False) -> dict:
@@ -36,6 +38,43 @@ def target6_plan(selector: str, *, down: bool = False) -> dict:
 
 
 class CertifiedHybridMilestoneTests(unittest.TestCase):
+    def test_fixed_plan_eval_uses_true_rmsnorm_allocation_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frontier_dir = root / "certification_frontier"
+            frontier_dir.mkdir()
+            ellipsoid_path = root / "ellipsoid.json"
+            rmsnorm_path = root / "rmsnorm.json"
+            ellipsoid_path.write_text(json.dumps(
+                target6_plan("rmsnorm_ellipsoid_bound")
+            ))
+            rmsnorm_path.write_text(json.dumps(target6_plan("rmsnorm_bound")))
+            validation_path = root / "matched_plan_validation.json"
+            validation_path.write_text(json.dumps({
+                "strict_gate_passed": True,
+                "plans": {
+                    "rmsnorm_bound": {
+                        "path": str(rmsnorm_path),
+                        "sha256": file_sha256(str(rmsnorm_path)),
+                    }
+                },
+            }))
+            frontier_path = frontier_dir / "hybrid_frontier.json"
+            payload = {
+                "source_plans": {
+                    "ellipsoid": {
+                        "path": str(ellipsoid_path),
+                        "sha256": file_sha256(str(ellipsoid_path)),
+                    }
+                }
+            }
+            frontier_path.write_text(json.dumps(payload))
+
+            resolved = resolve_rmsnorm_allocation_plan(payload, frontier_path)
+
+            self.assertEqual(resolved, rmsnorm_path)
+            self.assertNotEqual(resolved, ellipsoid_path)
+
     def test_legacy_missing_protocol_metadata_is_not_a_mismatch(self) -> None:
         merged, coverage = merge_compatible_protocols({
             "legacy": {
@@ -59,8 +98,10 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
             root = Path(tmp)
             ellipsoid_path = root / "ellipsoid.json"
             down_path = root / "down.json"
+            rmsnorm_path = root / "rmsnorm.json"
             ellipsoid_path.write_text(json.dumps(target6_plan("rmsnorm_ellipsoid_bound")))
             down_path.write_text(json.dumps(target6_plan("down_norm", down=True)))
+            rmsnorm_path.write_text(json.dumps(target6_plan("rmsnorm_bound")))
             arrays = {}
             rng = np.random.default_rng(42)
             for layer in range(48):
@@ -73,7 +114,15 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
             score_manifest = root / "scores.json"
             score_manifest.write_text("{}")
             validation = root / "validation.json"
-            validation.write_text(json.dumps({"strict_gate_passed": True}))
+            validation.write_text(json.dumps({
+                "strict_gate_passed": True,
+                "plans": {
+                    "rmsnorm_bound": {
+                        "path": str(rmsnorm_path),
+                        "sha256": file_sha256(str(rmsnorm_path)),
+                    }
+                },
+            }))
             output = root / "frontier"
             argv = [
                 "build", "--ellipsoid-plan", str(ellipsoid_path),
