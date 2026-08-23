@@ -11,6 +11,7 @@ import numpy as np
 
 from scripts.build_moe_certified_hybrid_frontier import main as build_frontier
 from scripts.generate_moe_fixed_plan_eval_configs import resolve_rmsnorm_allocation_plan
+from scripts.select_moe_certified_hybrid_outcome import successful_plan_sort_key
 from scripts.validate_target6_matched_plans import merge_compatible_protocols
 from src.experiment_provenance import file_sha256
 
@@ -38,6 +39,24 @@ def target6_plan(selector: str, *, down: bool = False) -> dict:
 
 
 class CertifiedHybridMilestoneTests(unittest.TestCase):
+    def test_success_tie_break_prefers_smallest_certificate_slack(self) -> None:
+        common = {
+            "macro_accuracy": 0.65796,
+            "strict_certificate": 102.1436,
+        }
+        rows = [
+            {**common, "plan": "downnorm_refinement_slack25",
+             "certificate_slack": 0.25},
+            {**common, "plan": "downnorm_refinement_slack10",
+             "certificate_slack": 0.10},
+            {**common, "plan": "downnorm_refinement_slack5",
+             "certificate_slack": 0.05},
+        ]
+
+        selected = sorted(rows, key=successful_plan_sort_key)[0]
+
+        self.assertEqual(selected["plan"], "downnorm_refinement_slack5")
+
     def test_fixed_plan_eval_uses_true_rmsnorm_allocation_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

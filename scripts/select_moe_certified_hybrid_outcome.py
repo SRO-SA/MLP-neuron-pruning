@@ -12,6 +12,16 @@ ELLIPSOID_LABEL = "rmsnorm_alloc__ellipsoid_rank__p95__target6"
 DOWN_LABEL = "rmsnorm_alloc__downnorm_rank__p95__target6"
 
 
+def successful_plan_sort_key(row: dict) -> tuple:
+    """Prefer quality, certificate strength, then the smallest allowed slack."""
+    return (
+        -float(row["macro_accuracy"]),
+        float(row["strict_certificate"]),
+        float(row["certificate_slack"]),
+        str(row["plan"]),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frontier", required=True)
@@ -62,6 +72,7 @@ def main() -> None:
         )
         item = {
             "plan": name, "checkpoint_label": label,
+            "certificate_slack": float(row["certificate_slack"]),
             "macro_accuracy": accuracy,
             "difference_vs_ellipsoid": accuracy - macro[ELLIPSOID_LABEL],
             "difference_vs_down_norm": accuracy - macro[DOWN_LABEL],
@@ -75,8 +86,9 @@ def main() -> None:
             successes.append(item)
     if successes:
         outcome = "The certified hybrid successfully recovers practical accuracy."
-        chosen = sorted(successes, key=lambda row: (-row["macro_accuracy"], row["strict_certificate"], row["plan"]))[0]
+        chosen = sorted(successes, key=successful_plan_sort_key)[0]
         selected_label = chosen["checkpoint_label"]
+        selected_frontier_plan = chosen["plan"]
     else:
         partial = any(
             min(macro[ELLIPSOID_LABEL], macro[DOWN_LABEL]) < row["macro_accuracy"]
@@ -89,6 +101,9 @@ def main() -> None:
             "The hybrid fails, and the project proceeds as a diagnostic/certification paper."
         )
         selected_label = DOWN_LABEL if macro[DOWN_LABEL] > macro[ELLIPSOID_LABEL] else ELLIPSOID_LABEL
+        selected_frontier_plan = (
+            "pure_down_norm" if selected_label == DOWN_LABEL else "ellipsoid_slack0"
+        )
     if selected_label not in spec_by_label:
         raise ValueError(f"selected checkpoint absent from manifest: {selected_label}")
     baseline = spec_by_label["baseline_unpruned"]
@@ -106,6 +121,7 @@ def main() -> None:
         "pure_ellipsoid_macro_accuracy": macro[ELLIPSOID_LABEL],
         "pure_down_norm_macro_accuracy": macro[DOWN_LABEL],
         "constrained_plans": rows,
+        "selected_frontier_plan": selected_frontier_plan,
         "selected_target6_checkpoint_label": selected_label,
         "selected_target6_checkpoint_dir": spec_by_label[selected_label]["checkpoint_dir"],
     }
