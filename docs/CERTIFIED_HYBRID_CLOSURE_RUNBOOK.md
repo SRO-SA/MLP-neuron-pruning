@@ -19,7 +19,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 
 MILESTONE_ROOT="results/moe_certified_hybrid_milestone/20260823_015217"
 FINE_FRONTIER="$MILESTONE_ROOT/certification_frontier_fine_v1"
-FINE_PPL="$MILESTONE_ROOT/hybrid_ppl_fine_v1"
+FINE_PPL="$MILESTONE_ROOT/hybrid_ppl_fine_v2"
 FINE_CHECKPOINT_MANIFEST="$MILESTONE_ROOT/hybrid_checkpoint_manifest_fine_v1.json"
 FINE_CHECKPOINT_ROOT="/paper_v3_checkpoints/20260823_015217_certified_hybrid_fine_v1"
 FINE_TOKENIZER_AUDIT_DIR="$MILESTONE_ROOT/hybrid_tokenizer_audit_fine_v1"
@@ -28,7 +28,9 @@ FINE_DOWNSTREAM_TABLES="$MILESTONE_ROOT/hybrid_downstream_fine_v1/paper_tables"
 DOWNSTREAM_CURVE_V2="$MILESTONE_ROOT/pure_downnorm_curve/downstream_paper_tables_v2"
 DOWNNORM_TABLES_V2="$MILESTONE_ROOT/pure_downnorm_curve/paper_tables_v2"
 SYSTEMS_TABLES_V2="$MILESTONE_ROOT/systems_v2/paper_tables_with_uncertainty"
-FINAL_PACKET="$MILESTONE_ROOT/final_paper_packet_v1"
+FINE_CHECKPOINT_TABLES="$MILESTONE_ROOT/hybrid_checkpoint_tables_fine_v1"
+FINE_TOKENIZER_AUDIT="$FINE_TOKENIZER_AUDIT_DIR/tokenizer_audit.json"
+FINAL_PACKET="$MILESTONE_ROOT/final_paper_packet_v2"
 
 EXISTING_HYBRID_MANIFEST="$MILESTONE_ROOT/hybrid_checkpoint_manifest.json"
 PRIMARY_DOWNSTREAM="results/paper_v3_post_freeze/20260820_postfreeze_v1/downstream_primary_batch8_v1"
@@ -246,6 +248,8 @@ python3 scripts/build_moe_certified_hybrid_final_packet.py \
   --downnorm-curve-dir "$DOWNNORM_TABLES_V2" \
   --downstream-dir "$FINE_DOWNSTREAM_TABLES" \
   --checkpoint-dir "$MILESTONE_ROOT/pure_downnorm_curve/checkpoint_tables" \
+  --hybrid-checkpoint-dir "$FINE_CHECKPOINT_TABLES" \
+  --hybrid-tokenizer-audit "$FINE_TOKENIZER_AUDIT" \
   --systems-dir "$SYSTEMS_TABLES_V2" \
   --matched-validation "$MILESTONE_ROOT/matched_plan_validation.json" \
   --output-dir "$FINAL_PACKET" --dry-run
@@ -256,10 +260,16 @@ python3 scripts/build_moe_certified_hybrid_final_packet.py \
   --downnorm-curve-dir "$DOWNNORM_TABLES_V2" \
   --downstream-dir "$FINE_DOWNSTREAM_TABLES" \
   --checkpoint-dir "$MILESTONE_ROOT/pure_downnorm_curve/checkpoint_tables" \
+  --hybrid-checkpoint-dir "$FINE_CHECKPOINT_TABLES" \
+  --hybrid-tokenizer-audit "$FINE_TOKENIZER_AUDIT" \
   --systems-dir "$SYSTEMS_TABLES_V2" \
   --matched-validation "$MILESTONE_ROOT/matched_plan_validation.json" \
   --output-dir "$FINAL_PACKET"
 ```
 
-`FINAL_PACKET_MANIFEST.json` hashes every copied artifact and declares that
-experimentation has stopped. Continue directly with paper writing.
+`FINAL_PACKET_MANIFEST.json` hashes every copied or generated artifact and
+declares that experimentation has stopped. The packet designates RMSNorm-bound
+global allocation plus certificate-constrained down-norm refinement with 0.25%
+ellipsoid-certificate slack as the final proposed method. Pure ellipsoid and
+pure down-norm remain the endpoint methods. Continue directly with paper
+writing.

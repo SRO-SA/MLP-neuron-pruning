@@ -57,8 +57,10 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
             frontier_plans = directories["certificate_frontier"] / "plans"
             frontier_plans.mkdir()
             ellipsoid_plan = frontier_plans / "ellipsoid_slack0.json"
+            hybrid_plan = frontier_plans / "downnorm_refinement_slack0p25.json"
             downnorm_plan = frontier_plans / "pure_down_norm.json"
             ellipsoid_plan.write_text("{}", encoding="utf-8")
+            hybrid_plan.write_text("{}", encoding="utf-8")
             downnorm_plan.write_text("{}", encoding="utf-8")
             (directories["certificate_frontier"] / "hybrid_frontier.json").write_text(
                 json.dumps({
@@ -72,6 +74,13 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                             "certificate_slack": 0.0,
                             "plan_path": str(ellipsoid_plan),
                             "plan_sha256": file_sha256(str(ellipsoid_plan)),
+                        },
+                        {
+                            "plan": "downnorm_refinement_slack0p25",
+                            "certificate_change_vs_ellipsoid_pct": 0.24921,
+                            "certificate_slack": 0.0025,
+                            "plan_path": str(hybrid_plan),
+                            "plan_sha256": file_sha256(str(hybrid_plan)),
                         },
                         {
                             "plan": "pure_down_norm",
@@ -96,8 +105,51 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                         "task": "macro_average", "accuracy": 0.64990,
                     },
                     {
+                        "label": (
+                            "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                        ),
+                        "task": "macro_average", "accuracy": 0.65885,
+                    },
+                    {
                         "label": "rmsnorm_alloc__downnorm_rank__p95__target6",
                         "task": "macro_average", "accuracy": 0.65796,
+                    },
+                ])
+            with (
+                directories["downstream"] / "downstream_paired_comparisons.csv"
+            ).open("w", newline="", encoding="utf-8") as handle:
+                import csv
+                fields = [
+                    "comparison_type", "first_label", "second_label", "task",
+                    "accuracy_difference", "ci95_lower", "ci95_upper",
+                    "holm_adjusted_p_value", "holm_significant_0_05",
+                ]
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows([
+                    {
+                        "comparison_type": "certified_hybrid_attribution",
+                        "first_label": (
+                            "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                        ),
+                        "second_label": (
+                            "rmsnorm_alloc__ellipsoid_rank__p95__target6"
+                        ),
+                        "task": "macro_average", "accuracy_difference": 0.00895,
+                        "ci95_lower": 0.00276, "ci95_upper": 0.01528,
+                        "holm_adjusted_p_value": 0.022998,
+                        "holm_significant_0_05": True,
+                    },
+                    {
+                        "comparison_type": "certified_hybrid_attribution",
+                        "first_label": (
+                            "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                        ),
+                        "second_label": "rmsnorm_alloc__downnorm_rank__p95__target6",
+                        "task": "macro_average", "accuracy_difference": 0.00089,
+                        "ci95_lower": -0.00286, "ci95_upper": 0.00479,
+                        "holm_adjusted_p_value": 0.85831,
+                        "holm_significant_0_05": False,
                     },
                 ])
             checkpoint_labels = [
@@ -114,6 +166,70 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                 writer = csv.DictWriter(handle, fieldnames=["label"])
                 writer.writeheader()
                 writer.writerows({"label": label} for label in checkpoint_labels)
+            hybrid_checkpoint_dir = root / "hybrid_checkpoint"
+            hybrid_checkpoint_dir.mkdir()
+            hybrid_verification = {
+                "label": (
+                    "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                ),
+                "plan_sha256": file_sha256(str(hybrid_plan)),
+                "removed_layer_channels": 2288,
+                "removed_expert_neurons": 292864,
+                "successful_reload": True,
+                "exact_logits_after_reload": True,
+                "max_logit_difference": 0.0,
+                "no_hidden_original_width_padding": True,
+                "parameters_reloaded": {"total": 28732600000, "moe_experts": 27000000000},
+                "serialized_weight_bytes": 57467865048,
+                "checkpoint_payload_bytes_excluding_verification_manifest": 57468000000,
+                "source_model_revision": "model-revision",
+                "tokenizer_revision": "tokenizer-revision",
+            }
+            (hybrid_checkpoint_dir / "checkpoint_verification.json").write_text(
+                json.dumps(hybrid_verification), encoding="utf-8"
+            )
+            hybrid_tables = root / "hybrid_checkpoint_tables"
+            hybrid_tables.mkdir()
+            for name in SOURCE_PATTERNS["checkpoints"]:
+                (hybrid_tables / name).write_text("placeholder", encoding="utf-8")
+            hybrid_row = {
+                "label": (
+                    "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                ),
+                "target_pct": 6.0, "actual_pct": 6.206597,
+                "removed_layer_channels": 2288,
+                "removed_expert_neurons": 292864,
+                "total_parameters": 28732600000,
+                "moe_expert_parameters": 27000000000,
+                "serialized_weight_bytes": 57467865048,
+                "checkpoint_payload_bytes": 57468000000,
+                "successful_reload": True,
+                "exact_logits_after_reload": True,
+                "max_logit_difference": 0.0,
+                "no_hidden_original_width_padding": True,
+                "plan_sha256": file_sha256(str(hybrid_plan)),
+                "checkpoint_dir": str(hybrid_checkpoint_dir),
+            }
+            with (hybrid_tables / "checkpoint_table.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                import csv
+                writer = csv.DictWriter(handle, fieldnames=list(hybrid_row))
+                writer.writeheader(); writer.writerow(hybrid_row)
+            tokenizer_audit = root / "hybrid_tokenizer_audit.json"
+            tokenizer_audit.write_text(json.dumps({
+                "decision": {
+                    "audit_passed_for_downstream": True,
+                    "selected_tokenizer_mode": "current",
+                    "use_fix_mistral_regex_for_future_evaluation": False,
+                },
+                "sources": [{
+                    "label": (
+                        "certified_hybrid__downnorm_refinement_slack0p25__target6"
+                    ),
+                    "tokenizer_files_combined_sha256": "tokenizer-files-sha256",
+                }],
+            }), encoding="utf-8")
             system_rows = []
             for label in (
                 "baseline_unpruned",
@@ -161,6 +277,8 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
             ):
                 argv.extend((option, str(directories[group])))
             argv.extend((
+                "--hybrid-checkpoint-dir", str(hybrid_tables),
+                "--hybrid-tokenizer-audit", str(tokenizer_audit),
                 "--matched-validation", str(validation),
                 "--output-dir", str(root / "packet"),
             ))
@@ -175,8 +293,46 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                 (root / "packet" / "exact_experimental_settings.json").read_text()
             )
             self.assertEqual(
-                settings["certified_hybrid_decision"]["outcome"], "failure"
+                settings["certified_hybrid_decision"]["outcome"], "success"
             )
+            self.assertIn(
+                "0.25% ellipsoid-certificate slack",
+                settings["frozen_paper_claims"]["proposed_method"],
+            )
+            self.assertTrue(
+                settings["final_hybrid_checkpoint"]["exact_logits_after_reload"]
+            )
+            self.assertTrue((root / "packet" / "code_provenance.json").is_file())
+            self.assertTrue(
+                (root / "packet" / "dependency_environment_lock.txt").is_file()
+            )
+            provenance = json.loads(
+                (root / "packet" / "code_provenance.json").read_text()
+            )
+            patch_path = root / "packet" / "code_provenance.patch"
+            if provenance["tracked_worktree_clean"]:
+                self.assertEqual(provenance["dirty_patch_sha256"], "")
+                self.assertFalse(patch_path.exists())
+            else:
+                self.assertEqual(
+                    provenance["dirty_patch_sha256"], file_sha256(str(patch_path))
+                )
+            combined_checkpoints = json.loads(
+                (root / "packet" / "checkpoints" / "checkpoint_table.json").read_text()
+            )
+            final_checkpoint = next(
+                row for row in combined_checkpoints
+                if row["label"] ==
+                "certified_hybrid__downnorm_refinement_slack0p25__target6"
+            )
+            self.assertEqual(
+                final_checkpoint["tokenizer_files_combined_sha256"],
+                "tokenizer-files-sha256",
+            )
+            self.assertNotEqual(final_checkpoint["tokenizer_audit_sha256"], "")
+            conclusion = (root / "packet" / "final_conclusion.md").read_text()
+            self.assertIn("matches down-norm accuracy within uncertainty", conclusion)
+            self.assertIn("not claimed to outperform pure down-norm", conclusion)
 
     def test_hybrid_success_rule_is_frozen_and_machine_readable(self) -> None:
         frontier = {
