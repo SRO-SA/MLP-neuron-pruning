@@ -99,7 +99,10 @@ Duplicate or dominated selections are skipped before any model is loaded.
 
 Selection is based only on the certificate/objective frontier. A candidate
 must be Pareto-optimal, close at least 10% of the ellipsoid-to-down-norm
-objective gap, and retain a strict certificate below pure down-norm.
+objective gap, and retain a strict certificate below pure down-norm. Of the
+eligible selections, the bounded gate chooses the strongest-certificate point
+and the distinct best-down-norm-objective point. It never consults PPL or
+downstream outcomes.
 
 ```bash
 python3 scripts/generate_moe_hybrid_checkpoint_manifest.py \

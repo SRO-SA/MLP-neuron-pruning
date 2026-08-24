@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and summarize the five-plan certified-hybrid PPL gate."""
+"""Validate and summarize the distinct certified-hybrid PPL candidates."""
 from __future__ import annotations
 
 import argparse
@@ -106,7 +106,7 @@ def main() -> None:
         )
     tex.append("\\end{tabular}")
     (output_dir / "hybrid_ppl_pareto.tex").write_text("\n".join(tex) + "\n", encoding="utf-8")
-    print(f"[hybrid-ppl-summary] OK rows=10 output={output_dir}")
+    print(f"[hybrid-ppl-summary] OK rows={len(rows)} output={output_dir}")
 
 
 if __name__ == "__main__":

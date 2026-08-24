@@ -65,6 +65,13 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
+def _certificate_ratio(row: dict) -> float:
+    """Return strict-certificate ratio from the persisted frontier schema."""
+    if "certificate_ratio_vs_ellipsoid" in row:
+        return float(row["certificate_ratio_vs_ellipsoid"])
+    return 1.0 + float(row["certificate_change_vs_ellipsoid_pct"]) / 100.0
+
+
 def copy_group(
     source: Path, output: Path, group: str, names: tuple[str, ...],
 ) -> list[Path]:
@@ -92,9 +99,7 @@ def hybrid_outcome(frontier: dict, downstream_rows: list[dict]) -> dict:
     if ellipsoid_label not in macro or downnorm_label not in macro:
         raise ValueError("downstream table lacks target-6 ellipsoid/down-norm endpoints")
     frontier_by_name = {row["plan"]: row for row in frontier["plans"]}
-    down_certificate_ratio = float(
-        frontier_by_name["pure_down_norm"]["certificate_ratio_vs_ellipsoid"]
-    )
+    down_certificate_ratio = _certificate_ratio(frontier_by_name["pure_down_norm"])
     candidates = []
     for label, accuracy in macro.items():
         prefix, suffix = "certified_hybrid__", "__target6"
@@ -104,7 +109,7 @@ def hybrid_outcome(frontier: dict, downstream_rows: list[dict]) -> dict:
         if plan_name not in frontier_by_name:
             raise ValueError(f"downstream hybrid missing from frontier: {plan_name}")
         row = frontier_by_name[plan_name]
-        certificate_ratio = float(row["certificate_ratio_vs_ellipsoid"])
+        certificate_ratio = _certificate_ratio(row)
         certificate_improvement_vs_downnorm = (
             down_certificate_ratio - certificate_ratio
         )

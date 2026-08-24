@@ -68,14 +68,14 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                     "plans": [
                         {
                             "plan": "ellipsoid_slack0",
-                            "certificate_ratio_vs_ellipsoid": 1.0,
+                            "certificate_change_vs_ellipsoid_pct": 0.0,
                             "certificate_slack": 0.0,
                             "plan_path": str(ellipsoid_plan),
                             "plan_sha256": file_sha256(str(ellipsoid_plan)),
                         },
                         {
                             "plan": "pure_down_norm",
-                            "certificate_ratio_vs_ellipsoid": 1.021436,
+                            "certificate_change_vs_ellipsoid_pct": 2.1436,
                             "certificate_slack": "unconstrained",
                             "plan_path": str(downnorm_plan),
                             "plan_sha256": file_sha256(str(downnorm_plan)),
@@ -181,12 +181,12 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
     def test_hybrid_success_rule_is_frozen_and_machine_readable(self) -> None:
         frontier = {
             "plans": [
-                {"plan": "ellipsoid_slack0", "certificate_ratio_vs_ellipsoid": 1.0,
+                {"plan": "ellipsoid_slack0", "certificate_change_vs_ellipsoid_pct": 0.0,
                  "certificate_slack": 0.0},
                 {"plan": "downnorm_refinement_slack1",
-                 "certificate_ratio_vs_ellipsoid": 1.010,
+                 "certificate_change_vs_ellipsoid_pct": 1.0,
                  "certificate_slack": 0.01},
-                {"plan": "pure_down_norm", "certificate_ratio_vs_ellipsoid": 1.021436,
+                {"plan": "pure_down_norm", "certificate_change_vs_ellipsoid_pct": 2.1436,
                  "certificate_slack": "unconstrained"},
             ]
         }
@@ -300,6 +300,18 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
                 row for row in manifest if row["label"].startswith("certified_hybrid__")
             ]
             self.assertEqual(len(intermediate_specs), 2)
+            self.assertEqual(
+                {row["label"] for row in intermediate_specs},
+                {
+                    "certified_hybrid__intermediate_0__target6",
+                    "certified_hybrid__intermediate_2__target6",
+                },
+            )
+            selection = json.loads(
+                (root / "manifest_downstream_selection.json").read_text()
+            )
+            self.assertFalse(selection["selection_uses_downstream_results"])
+            self.assertIn("strongest-certificate", selection["selection_policy"])
 
     def test_success_tie_break_prefers_smallest_certificate_slack(self) -> None:
         common = {

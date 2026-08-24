@@ -104,15 +104,38 @@ def main() -> None:
             eligible_by_selection[row["selection_sha256"]] = {
                 **row, "objective_gap_closure": gap_closure,
             }
-    selected_intermediates = sorted(
-        eligible_by_selection.values(),
-        key=lambda row: (
-            float(row["normalized_down_norm_objective"]),
-            float(row["strict_certificate"]),
-            float(row["certificate_slack"]),
-            row["plan"],
-        ),
-    )[:args.max_intermediate_checkpoints]
+    eligible_rows = list(eligible_by_selection.values())
+    selected_intermediates = []
+    if eligible_rows and args.max_intermediate_checkpoints:
+        # Cover both ends of the eligible certificate/objective frontier without
+        # consulting PPL or downstream results: first retain the strongest
+        # certificate, then add the best down-norm objective if it is distinct.
+        strongest_certificate = min(
+            eligible_rows,
+            key=lambda row: (
+                float(row["strict_certificate"]),
+                float(row["normalized_down_norm_objective"]),
+                float(row["certificate_slack"]),
+                row["plan"],
+            ),
+        )
+        selected_intermediates.append(strongest_certificate)
+        if args.max_intermediate_checkpoints > 1:
+            remaining = [
+                row for row in eligible_rows
+                if row["selection_sha256"]
+                != strongest_certificate["selection_sha256"]
+            ]
+            if remaining:
+                selected_intermediates.append(min(
+                    remaining,
+                    key=lambda row: (
+                        float(row["normalized_down_norm_objective"]),
+                        float(row["strict_certificate"]),
+                        float(row["certificate_slack"]),
+                        row["plan"],
+                    ),
+                ))
     selected_intermediate_names = {row["plan"] for row in selected_intermediates}
     seen_selections = set(endpoint_signature_to_label)
     reuse_rows = []
@@ -148,7 +171,8 @@ def main() -> None:
                 "reason": (
                     "not selected by bounded downstream gate: requires Pareto, "
                     "certificate strictly below pure down-norm, material objective "
-                    "improvement, and top-two deterministic rank"
+                    "improvement, and the predeclared strongest-certificate / "
+                    "best-objective coverage rule"
                 ),
             })
             continue
@@ -200,6 +224,11 @@ def main() -> None:
         "schema_version": 1,
         "maximum_intermediate_checkpoints": args.max_intermediate_checkpoints,
         "minimum_objective_gap_closure": args.minimum_objective_gap_closure,
+        "selection_policy": (
+            "one eligible strongest-certificate candidate plus one distinct "
+            "eligible best-down-norm-objective candidate; no PPL or downstream "
+            "outcomes used"
+        ),
         "pure_down_norm_strict_certificate": down_certificate,
         "selected_intermediates": selected_intermediates,
         "selection_uses_downstream_results": False,
