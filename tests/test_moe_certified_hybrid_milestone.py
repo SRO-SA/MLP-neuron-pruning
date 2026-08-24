@@ -16,7 +16,7 @@ from scripts.build_moe_certified_hybrid_final_packet import (
 from scripts.generate_moe_hybrid_checkpoint_manifest import main as checkpoint_manifest
 from scripts.generate_moe_fixed_plan_eval_configs import resolve_rmsnorm_allocation_plan
 from scripts.select_moe_certified_hybrid_outcome import successful_plan_sort_key
-from scripts.summarize_pure_downnorm_curve import audit_nesting
+from scripts.summarize_pure_downnorm_curve import audit_nesting, curve_plan_paths
 from scripts.validate_target6_matched_plans import merge_compatible_protocols
 from src.experiment_provenance import file_sha256
 
@@ -225,6 +225,24 @@ class CertifiedHybridMilestoneTests(unittest.TestCase):
             self.assertFalse(rows[0]["fully_nested"])
             self.assertEqual(rows[0]["lower_channels_missing_from_upper"], 1)
             self.assertIn("independently optimized", rows[0]["interpretation"])
+
+    def test_curve_plan_paths_use_hashed_checkpoint_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            specs = []
+            expected = {}
+            for target in (2, 4, 6, 8):
+                path = root / f"target{target}.json"
+                path.write_text(json.dumps({"target": target}))
+                expected[target] = str(path)
+                specs.append({
+                    "label": f"rmsnorm_alloc__downnorm_rank__p95__target{target}",
+                    "plan_path": str(path),
+                    "plan_sha256": file_sha256(str(path)),
+                })
+            manifest = root / "checkpoint_manifest.json"
+            manifest.write_text(json.dumps(specs))
+            self.assertEqual(curve_plan_paths(manifest), expected)
 
     def test_checkpoint_gate_exports_at_most_two_intermediates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

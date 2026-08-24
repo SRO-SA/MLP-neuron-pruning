@@ -14,11 +14,35 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.moe_set_certification import selected_by_layer
+from src.experiment_provenance import file_sha256
 
 
 def read_csv(path: str | Path) -> list[dict]:
     with Path(path).open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def curve_plan_paths(checkpoint_manifest: str | Path) -> dict[int, str]:
+    """Resolve authoritative curve plans from the frozen export manifest."""
+    specs = json.loads(Path(checkpoint_manifest).read_text(encoding="utf-8"))
+    result = {}
+    for target in (2, 4, 6, 8):
+        label = f"rmsnorm_alloc__downnorm_rank__p95__target{target}"
+        matches = [row for row in specs if row.get("label") == label]
+        if len(matches) != 1:
+            raise ValueError(
+                f"target {target}: expected one checkpoint-manifest plan, "
+                f"found {len(matches)}"
+            )
+        spec = matches[0]
+        path = Path(spec["plan_path"])
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        expected_hash = spec.get("plan_sha256")
+        if expected_hash and file_sha256(str(path)) != expected_hash:
+            raise ValueError(f"target {target}: checkpoint-manifest plan hash changed")
+        result[target] = str(path)
+    return result
 
 
 def audit_nesting(plan_paths: dict[int, str]) -> list[dict]:
@@ -104,6 +128,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ppl-summary", required=True)
     parser.add_argument("--downstream-table", required=True)
+    parser.add_argument("--checkpoint-manifest", required=True)
     parser.add_argument("--budget-audit", required=True)
     parser.add_argument("--paired-comparisons", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -115,7 +140,7 @@ def main() -> None:
         Path(args.budget_audit).read_text(encoding="utf-8")
     )}
     rows = []
-    plan_paths = {}
+    plan_paths = curve_plan_paths(args.checkpoint_manifest)
     for target in (2, 4, 6, 8):
         label = f"rmsnorm_alloc__downnorm_rank__p95__target{target}"
         ppl_rows = [row for row in ppl if (
@@ -128,10 +153,6 @@ def main() -> None:
         if set(by_dataset) != {"wikitext2", "c4"} or len(macro) != 1:
             raise ValueError(f"target {target}: incomplete PPL/downstream evidence")
         row0 = by_dataset["wikitext2"]
-        plan_values = {row.get("pruning_plan_path", "") for row in ppl_rows}
-        if len(plan_values) != 1 or not next(iter(plan_values)):
-            raise ValueError(f"target {target}: pruning plan path is ambiguous")
-        plan_paths[target] = next(iter(plan_values))
         rows.append({
             "target_pct": target,
             "actual_pct": row0["actual_pct"],

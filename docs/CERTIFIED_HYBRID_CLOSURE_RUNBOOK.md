@@ -211,6 +211,7 @@ python3 scripts/summarize_paper_v3_downstream.py \
 python3 scripts/summarize_pure_downnorm_curve.py \
   --ppl-summary "$MILESTONE_ROOT/pure_downnorm_curve/ppl/allocation_ranking_summary.csv" \
   --downstream-table "$DOWNSTREAM_CURVE_V2/downstream_benchmark_table.csv" \
+  --checkpoint-manifest "$DOWN_CURVE_MANIFEST" \
   --paired-comparisons "$DOWNSTREAM_CURVE_V2/downstream_paired_comparisons.csv" \
   --budget-audit "${DOWN_CURVE_MANIFEST%.json}_budget_audit.json" \
   --output-dir "$DOWNNORM_TABLES_V2"
