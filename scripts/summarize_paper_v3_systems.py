@@ -304,22 +304,33 @@ def collect(
     return rows, raw
 
 
+def _relative_ci_text(
+    row: dict, point_field: str, lower_field: str, upper_field: str, *,
+    suffix: str = "", empty: str = "—", separator: str = ", ",
+) -> str:
+    values = (row.get(point_field), row.get(lower_field), row.get(upper_field))
+    if any(value in ("", None) for value in values):
+        return empty
+    return (
+        f"{float(values[0]):+.2f}{suffix} "
+        f"[{float(values[1]):+.2f}{separator}{float(values[2]):+.2f}]"
+    )
+
+
 def _md(path: str, rows: list[dict]) -> None:
     with open(path, "x", encoding="utf-8") as handle:
         handle.write("| Checkpoint | B | Prompt | Load HBM GiB | Peak HBM GiB | Prefill median ms [95% CI] | Prefill mean ± SD ms | Prefill tok/s [95% CI] | Prefill gain [95% CI] | Decode median ms [95% CI] | Decode mean ± SD ms | Decode tok/s [95% CI] | Decode gain [95% CI] |\n")
         handle.write("|---|---:|---:|---:|---:|---|---|---|---|---|---|---|---|\n")
         for r in rows:
-            prefill_gain = r["prefill_throughput_gain_vs_baseline_pct"]
-            decode_gain = r["decode_throughput_gain_vs_baseline_pct"]
-            prefill_gain_text = "—" if prefill_gain == "" else (
-                f"{float(prefill_gain):+.2f}% "
-                f"[{float(r['prefill_throughput_gain_ci95_lower_pct']):+.2f}, "
-                f"{float(r['prefill_throughput_gain_ci95_upper_pct']):+.2f}]"
+            prefill_gain_text = _relative_ci_text(
+                r, "prefill_throughput_gain_vs_baseline_pct",
+                "prefill_throughput_gain_ci95_lower_pct",
+                "prefill_throughput_gain_ci95_upper_pct", suffix="%",
             )
-            decode_gain_text = "—" if decode_gain == "" else (
-                f"{float(decode_gain):+.2f}% "
-                f"[{float(r['decode_throughput_gain_ci95_lower_pct']):+.2f}, "
-                f"{float(r['decode_throughput_gain_ci95_upper_pct']):+.2f}]"
+            decode_gain_text = _relative_ci_text(
+                r, "decode_throughput_gain_vs_baseline_pct",
+                "decode_throughput_gain_ci95_lower_pct",
+                "decode_throughput_gain_ci95_upper_pct", suffix="%",
             )
             handle.write(
                 f"| {r['label']} | {r['batch_size']} | {r['prompt_length_tokens']} | "
@@ -352,8 +363,6 @@ def _tex(path: str, rows: list[dict]) -> None:
         handle.write("\\begin{tabular}{lrrrrrrrr}\n\\toprule\n")
         handle.write("Checkpoint & B & Prompt & Load GiB & Peak GiB & Prefill median [CI] & Decode median [CI] & Prefill gain [CI] & Decode gain [CI] \\\\\n\\midrule\n")
         for r in rows:
-            prefill_gain = r["prefill_throughput_gain_vs_baseline_pct"]
-            decode_gain = r["decode_throughput_gain_vs_baseline_pct"]
             values = [
                 esc(r["label"]), r["batch_size"], r["prompt_length_tokens"],
                 f"{float(r['after_load_allocated_gib_total']):.2f}",
@@ -364,14 +373,18 @@ def _tex(path: str, rows: list[dict]) -> None:
                 f"{float(r['decode_run_latency_median_ms']):.2f} "
                 f"[{float(r['decode_latency_per_token_median_ci95_lower_ms']):.2f},"
                 f"{float(r['decode_latency_per_token_median_ci95_upper_ms']):.2f}]",
-                "--" if prefill_gain == "" else
-                f"{float(prefill_gain):+.2f} "
-                f"[{float(r['prefill_throughput_gain_ci95_lower_pct']):+.2f},"
-                f"{float(r['prefill_throughput_gain_ci95_upper_pct']):+.2f}]",
-                "--" if decode_gain == "" else
-                f"{float(decode_gain):+.2f} "
-                f"[{float(r['decode_throughput_gain_ci95_lower_pct']):+.2f},"
-                f"{float(r['decode_throughput_gain_ci95_upper_pct']):+.2f}]",
+                _relative_ci_text(
+                    r, "prefill_throughput_gain_vs_baseline_pct",
+                    "prefill_throughput_gain_ci95_lower_pct",
+                    "prefill_throughput_gain_ci95_upper_pct",
+                    empty="--", separator=",",
+                ),
+                _relative_ci_text(
+                    r, "decode_throughput_gain_vs_baseline_pct",
+                    "decode_throughput_gain_ci95_lower_pct",
+                    "decode_throughput_gain_ci95_upper_pct",
+                    empty="--", separator=",",
+                ),
             ]
             handle.write(" & ".join(map(str, values)) + " \\\\\n")
         handle.write("\\bottomrule\n\\end{tabular}\n")

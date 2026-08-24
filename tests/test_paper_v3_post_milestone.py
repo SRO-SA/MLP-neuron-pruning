@@ -11,7 +11,7 @@ from scripts.summarize_paper_v3_downstream import (
 )
 from scripts.summarize_paper_v3_systems import collect as collect_systems
 from scripts.summarize_paper_v3_systems import (
-    _case_uncertainty, _relative_bootstrap_intervals,
+    _case_uncertainty, _relative_bootstrap_intervals, _relative_ci_text,
 )
 
 
@@ -124,6 +124,20 @@ class PostMilestoneDryRunTests(unittest.TestCase):
         )
         self.assertGreater(
             relative["prefill_throughput_gain_ci95_upper_pct"], 0
+        )
+
+    def test_systems_relative_ci_formatter_handles_baseline_without_interval(self):
+        fields = (
+            "prefill_throughput_gain_vs_baseline_pct",
+            "prefill_throughput_gain_ci95_lower_pct",
+            "prefill_throughput_gain_ci95_upper_pct",
+        )
+        baseline = dict(zip(fields, (0.0, "", "")))
+        target = dict(zip(fields, (3.25, 1.0, 5.5)))
+        self.assertEqual(_relative_ci_text(baseline, *fields), "—")
+        self.assertEqual(
+            _relative_ci_text(target, *fields, suffix="%"),
+            "+3.25% [+1.00, +5.50]",
         )
 
     def test_release_index_hashes_without_editing_source(self):
